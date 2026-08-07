@@ -1,0 +1,11 @@
+{
+  "name": "Delphi-nghttp2",
+  "description": "Server + client bindings for libnghttp2 in Object Pascal (Delphi + FPC). Low-level HTTP/2 transport primitives — session state, HPACK, streams, callbacks — packaged as a standalone library.",
+  "version": "0.1.0-dev.1",
+  "homepage": "https://github.com/freitasjca/Delphi-nghttp2",
+  "license": "MIT",
+  "mainsrc": "src/",
+  "browsingpath": "src/",
+  "projects": [],
+  "dependencies": {}
+}
