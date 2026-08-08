@@ -68,6 +68,7 @@ type
     FResponseBodyPos:   NativeInt;
     FResponseStream:    TStream;                 // set by SendStream — WEAK
     FResponseSubmitted: Boolean;
+    FTrailerSubmitted:  Boolean;   // FIX-TRAILER-ORDER (2026-08-08) — guards single-shot submit_trailer call from within read_callback
     procedure DoSubmitResponse;
     procedure DoSubmitTrailers;
   public
@@ -201,7 +202,10 @@ begin
     if LRemaining <= 0 then
     begin
       if LHasTrailers then
-        data_flags^ := NGHTTP2_DATA_FLAG_EOF or NGHTTP2_DATA_FLAG_NO_END_STREAM
+      begin
+        data_flags^ := NGHTTP2_DATA_FLAG_EOF or NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        LState.DoSubmitTrailers;   // FIX-TRAILER-ORDER — submit AFTER EOF signal
+      end
       else
         data_flags^ := NGHTTP2_DATA_FLAG_EOF;
       Exit(0);
@@ -222,7 +226,10 @@ begin
     if LRemaining <= 0 then
     begin
       if LHasTrailers then
-        data_flags^ := NGHTTP2_DATA_FLAG_EOF or NGHTTP2_DATA_FLAG_NO_END_STREAM
+      begin
+        data_flags^ := NGHTTP2_DATA_FLAG_EOF or NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        LState.DoSubmitTrailers;   // FIX-TRAILER-ORDER — submit AFTER EOF signal
+      end
       else
         data_flags^ := NGHTTP2_DATA_FLAG_EOF;
       Exit(0);
@@ -319,6 +326,7 @@ begin
   FResponseBodyPos   := 0;
   FResponseStream    := nil;
   FResponseSubmitted := False;
+  FTrailerSubmitted  := False;
 end;
 
 destructor TNghttp2StreamState.Destroy;
@@ -496,12 +504,20 @@ begin
   // nghttp2 also copies the data_provider struct (docs: "safe to reuse or
   // free the memory used by data_prd after this function returns").
 
-  { M2b: HTTP/2 trailers.  If AddTrailer was called before Send/SendStream,
-    queue the trailer HEADERS frame now — nghttp2 emits it AFTER the data
-    provider signals EOF with NGHTTP2_DATA_FLAG_NO_END_STREAM (see the
-    ReadResponseBodyCallback EOF branches). }
-  if (FResponseTrailers <> nil) and (FResponseTrailers.Count > 0) then
-    DoSubmitTrailers;
+  { FIX-TRAILER-ORDER (2026-08-08) — DO NOT call DoSubmitTrailers here.
+
+    nghttp2_submit_trailer has a strict precondition: the data provider's
+    read_callback MUST have already returned EOF|NO_END_STREAM before
+    submit_trailer is called. Calling it here — immediately after
+    submit_response and BEFORE the read_callback has ever fired — leaves
+    the stream in a state where libnghttp2 silently skips the DATA phase
+    entirely and emits initial HEADERS → trailer HEADERS(END_STREAM)
+    with no body between them. Client sees empty body + valid trailers
+    (grpcurl reports "EOF"; TNghttp2Client sees length-0 body).
+
+    Correct sequence: submit_response here → callback fires and returns
+    EOF|NO_END_STREAM → callback itself calls DoSubmitTrailers (guarded
+    by FTrailerSubmitted). See ReadResponseBodyCallback EOF branches. }
 end;
 
 procedure TNghttp2StreamState.DoSubmitTrailers;
@@ -510,6 +526,10 @@ var
   LNameBufs, LValueBufs: array of RawByteString;
   I, LCount:            Integer;
 begin
+  { Idempotent — read_callback may fire multiple times; only submit once. }
+  if FTrailerSubmitted then Exit;
+  FTrailerSubmitted := True;
+
   LCount := FResponseTrailers.Count;
   SetLength(LNvs,       LCount);
   SetLength(LNameBufs,  LCount);
