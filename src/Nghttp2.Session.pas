@@ -16,25 +16,68 @@ unit Nghttp2.Session;
 //       queues DATA frames for the next ExtractOutgoing round
 //    5) session.WantRead / WantWrite gate the loop; both False → close
 //
-//  Concurrency model in v1: one thread per connection (the server owns it).
-//  Streams multiplex within that one thread — Horse pipeline dispatch is
-//  synchronous per stream. Applications needing per-stream parallelism can
-//  offload to the WorkerPool from inside their route handler.
+//  Concurrency model — two modes, chosen by the server via AsyncMode:
+//
+//  Synchronous (AsyncMode=False, the historical default): OnRequest runs
+//  inline inside FeedIncoming and calls nghttp2_submit_response before
+//  returning. One request at a time per connection.
+//
+//  Async (AsyncMode=True): OnRequest hands the stream to a worker pool and
+//  returns immediately, so many streams on one connection execute in
+//  parallel. This is constrained by a hard libnghttp2 rule
+//  (doc/programmers-guide.rst): nghttp2_session_send / _mem_send / _recv /
+//  _mem_recv must NEVER be called from inside a callback or from a second
+//  thread — "it will lead to the crash". Only the nghttp2_submit_* family is
+//  safe to call while holding the session, and even that must be serialised.
+//
+//  So in async mode nothing but the connection thread ever touches the
+//  native session. A worker stages its response on the stream object and
+//  enqueues the stream here; the connection thread drains that queue between
+//  recv calls, calls nghttp2_submit_response for each, then pumps the wire.
+//
+//  Two consequences fall out of workers outliving the callback:
+//
+//  (1) Stream lifetime. on_stream_close can fire (client RST_STREAM, dead
+//      connection) while a worker still holds the stream, so stream state is
+//      reference-counted — see TNghttp2StreamState below.
+//
+//  (2) Loop liveness. The pump must not tear the connection down while work
+//      is outstanding, and must wake to flush responses even when the client
+//      has gone quiet. BeginAsyncDispatch/EndAsyncDispatch track that via
+//      PendingDispatch, which the server's pump consults.
 // ============================================================================
 
 interface
 
 uses
 {$IF DEFINED(FPC)}
-  SysUtils, Classes, Generics.Collections,
+  SysUtils, Classes, SyncObjs, DateUtils, Generics.Collections,
 {$ELSE}
-  System.SysUtils, System.Classes, System.Generics.Collections,
+  System.SysUtils, System.Classes, System.SyncObjs, System.DateUtils,
+  System.Generics.Collections,
 {$ENDIF}
   Nghttp2.Native,
   Nghttp2.Types;
 
+const
+  { Minimum spacing between the two shutdown GOAWAYs, standing in for one
+    round trip. Generous for a LAN or loopback and still imperceptible next
+    to any real drain; only an idle connection ever waits the full amount.
+    Measuring the round trip with PING/ACK would remove the guess. }
+  GOAWAY_GRACE_MS = 100;
+
 type
   TNghttp2Session = class;   // forward
+
+  { Internal counterpart to INghttp2Stream. Exists so the deferred-response
+    queue can hold a reference that both keeps the stream alive and reaches
+    its submit entry point, with no interface-to-class downcast (which has no
+    portable spelling across Delphi and FPC). Not part of the public stream
+    contract — implemented by TNghttp2StreamState only. }
+  INghttp2StreamInternal = interface
+    ['{2B7F4C1D-9E30-4A55-B6C8-7D1E0F3A9B24}']
+    procedure SubmitStagedResponse;
+  end;
 
   // ─── Connection info (peer + local port) ────────────────────────────────
   TNghttp2ConnectionState = class(TInterfacedObject, INghttp2Connection)
@@ -49,12 +92,20 @@ type
   end;
 
   // ─── One HTTP/2 stream (request + accumulated body + staged response) ──
-  //     TInterfacedPersistent (not TInterfacedObject) — refcount is disabled
-  //     so the owning Session's TObjectDictionary can free us on stream close
-  //     without racing with any INghttp2Stream interface references still
-  //     held by the request bridge (they all live inside one synchronous
-  //     dispatch call stack).
-  TNghttp2StreamState = class(TInterfacedPersistent, INghttp2Stream)
+  //     TInterfacedObject with live reference counting. It was
+  //     TInterfacedPersistent (refcount disabled, freed by the session's
+  //     TObjectDictionary) back when dispatch was strictly synchronous and
+  //     every interface reference provably lived inside one call stack.
+  //     Async dispatch breaks that: a worker thread holds this stream across
+  //     recv iterations, and on_stream_close can fire in the meantime — a
+  //     client RST_STREAM or a dropped connection closes streams that never
+  //     got a response. Under the old ownership the dictionary would free the
+  //     stream out from under the running worker.
+  //
+  //     With refcounting the session's dictionary, the deferred-response
+  //     queue, and the worker each hold a reference; the last one out frees.
+  //     on_stream_close therefore drops a reference rather than destroying.
+  TNghttp2StreamState = class(TInterfacedObject, INghttp2Stream, INghttp2StreamInternal)
   private
     FStreamId:          Int32;
     FSession:           TNghttp2Session;         // weak — session owns us
@@ -68,6 +119,11 @@ type
     FResponseBodyPos:   NativeInt;
     FResponseStream:    TStream;                 // set by SendStream — WEAK
     FResponseSubmitted: Boolean;
+    // Set the moment Send/SendStream stages a response, which in async mode
+    // is well before FResponseSubmitted — submission happens later, on the
+    // connection thread. Guards everything that must not change after the
+    // response is composed; FResponseSubmitted alone would stop guarding it.
+    FResponseStaged:    Boolean;
     FTrailerSubmitted:  Boolean;   // FIX-TRAILER-ORDER (2026-08-08) — guards single-shot submit_trailer call from within read_callback
     procedure DoSubmitResponse;
     procedure DoSubmitTrailers;
@@ -100,6 +156,13 @@ type
 
     // ─── HTTP/2 trailer (M2b) — see INghttp2Stream contract ───────────────
     procedure AddTrailer(const AName, AValue: string);
+
+    // ─── Async dispatch handshake — see INghttp2Stream contract ───────────
+    procedure BeginAsyncDispatch;
+    procedure EndAsyncDispatch;
+
+    { INghttp2StreamInternal }
+    procedure SubmitStagedResponse;
   end;
 
   // ─── Session — owns the nghttp2_session and the stream table ────────────
@@ -108,19 +171,130 @@ type
   // ExecutePipelineTrampoline in Horse.Provider.Nghttp2.pas.
   TNghttp2OnRequestProc = procedure(const AStream: INghttp2Stream);
 
+  { Notifies a driver that a worker has just staged a response.
+
+    A method pointer, NOT an anonymous method — FPC without FUNCTIONREFERENCES
+    compiles no anonymous procs, and this has to work on both compilers. A
+    plain `procedure of object` is ordinary Object Pascal and does.
+
+    Exists because FResponseReady only reaches a driver that WAITS on it. The
+    thread pump does; an event loop is parked in epoll_wait and cannot, so it
+    needs to be poked through its own wake descriptor instead. Without this
+    an event-loop driver holds every reply until its poll interval expires —
+    measured at 2.8x the thread driver on the 94-check suite, which is the
+    same defect the thread pump had before FResponseReady existed. }
+  TNghttp2WakeProc = procedure of object;
+
   TNghttp2Session = class
   private
     FNativeSession: Pnghttp2_session;
     FCallbacks:     Pnghttp2_session_callbacks;
-    FStreams:       TObjectDictionary<Int32, TNghttp2StreamState>;
+    // Raw lookup for the callbacks — non-owning; FStreamRefs owns.
+    FStreams:       TDictionary<Int32, TNghttp2StreamState>;
+    // Parallel table holding the reference that keeps each stream alive.
+    // Split from FStreams so every existing callback lookup stays untouched.
+    FStreamRefs:    TDictionary<Int32, INghttp2StreamInternal>;
     FConnection:    INghttp2Connection;
     FOnRequest:     TNghttp2OnRequestProc;
+    FMaxConcurrentStreams: Integer;
+
+    // ─── Async-mode state (all no-ops while FAsyncMode is False) ──────────
+    FAsyncMode:       Boolean;
+    FPendingQueue:    TQueue<INghttp2StreamInternal>;
+    FQueueLock:       TCriticalSection;
+    // Signalled by a worker the instant it stages a response. Without it the
+    // pump would only notice on its next poll tick, and since the client is
+    // typically waiting on that very response it sends nothing meanwhile —
+    // so the reply would sit for the whole poll interval. Auto-reset, and
+    // the signal latches, so a worker finishing mid-wait is never missed.
+    FResponseReady:   TEvent;
+    // Optional second signal, for a driver that cannot wait on the event
+    // above. Called on the WORKER's thread, so an implementation must be
+    // thread-safe and must not block — the engine's is a single write() to
+    // an eventfd.
+    FOnWorkStaged:    TNghttp2WakeProc;
+    // Streams handed to a worker and not yet finished. The server's pump
+    // keeps the connection alive and keeps polling while this is > 0.
+    FPendingDispatch: Integer;   // TInterlocked-managed
+    FShutdownNoticeSent: Boolean;
+    FShutdownNoticeAt:   TDateTime;
+    FFinalGoawaySent:    Boolean;
+    // Holds references to the streams drained on the previous pass, so a
+    // stream stays alive across the caller's subsequent ExtractOutgoing
+    // loop — that is when its data-provider read_callback actually runs.
+    FDrained:         TList<INghttp2StreamInternal>;
 
     procedure BuildCallbacks;
     procedure SendInitialSettings;
+    // Called by TNghttp2StreamState.Send/SendStream. Submits inline in
+    // synchronous mode; enqueues for the connection thread in async mode.
+    procedure SubmitOrDefer(const AStream: TNghttp2StreamState);
   public
-    constructor Create(const AConnection: INghttp2Connection);
+    constructor Create(const AConnection: INghttp2Connection;
+      AMaxConcurrentStreams: Integer = 100);
     destructor  Destroy; override;
+
+    // Submits every response staged by a worker since the last call. MUST be
+    // called only from the connection thread, and only outside FeedIncoming /
+    // ExtractOutgoing — nghttp2_submit_response is safe to call while holding
+    // the session but not re-entrantly from within the pump.
+    // Returns True if at least one response was submitted.
+    function DrainPendingResponses: Boolean;
+
+    // True when a worker has staged a response that DrainPendingResponses has
+    // not submitted yet. The pump must consult this before any blocking wait:
+    // a worker can stage its response and retire its dispatch count in the
+    // window between the pump's last drain and its next wait, and a pump that
+    // then blocked on the socket would hold the reply for a full poll tick.
+    function HasPendingResponses: Boolean;
+
+    // Blocks until a worker stages a response or ATimeoutMS elapses.
+    procedure WaitForResponse(ATimeoutMS: Integer);
+
+    // Streams currently owned by a worker thread.
+    function PendingDispatch: Integer;
+
+    { DRAIN-DIAG-2. The cutoff SubmitFinalGoaway is about to name — nghttp2's
+      "highest stream I actually processed". Exposed read-only so a driver can
+      LOG it rather than infer it.
+
+      Worth observing because it decides, on the wire, which requests the peer
+      must replay: a client receiving a final GOAWAY abandons every stream
+      ABOVE this number. A value of 0 says "I processed nothing", so a peer
+      with one open stream correctly gives up on it — indistinguishable at the
+      client from a severed reply. build-fpc.sh stage 8 has reported this as
+      13 on some runs and 0 on others for the SAME single-request test, while
+      passing both times, because it asserts only that two GOAWAY frames
+      appeared and never that the cutoff covers the streams in flight. }
+    function LastProcStreamId: Integer;
+
+    { Graceful-shutdown notice: GOAWAY carrying last_stream_id = 2^31-1 and
+      NO_ERROR. Tells the peer to stop opening new streams while leaving every
+      stream already in flight to finish normally — the standard HTTP/2
+      shutdown signal (RFC 9113 §6.8).
+
+      Without it a drain cannot converge against a closed-loop client: h2load
+      and any connection-pooling client keep issuing new requests as responses
+      come back, so "wait until nothing is outstanding" never becomes true and
+      the drain runs to its deadline.
+
+      Idempotent — the pump calls it on every iteration while draining. }
+    procedure SubmitShutdownNotice;
+
+    { Stage two of the same sequence: GOAWAY carrying the real last_stream_id,
+      sent once the pump is finished and immediately before the connection
+      closes. Without it the peer only ever sees the open-ended notice and
+      then a dead socket, leaving it unable to distinguish a request the
+      server processed from one it must replay elsewhere.
+
+      Spaced at least GOAWAY_GRACE_MS after the notice — see the body — and
+      idempotent. Only enqueues, so the caller must flush; it deliberately
+      does NOT terminate the session, which would discard responses already
+      submitted for open streams. }
+    procedure SubmitFinalGoaway;
+
+    // Set by the server before the pump starts; see the unit header.
+    property AsyncMode: Boolean read FAsyncMode write FAsyncMode;
 
     // Byte pump — used by the server's per-connection thread
     function  FeedIncoming(const AData: PByte; ALen: NativeUInt): NativeInt;
@@ -133,6 +307,18 @@ type
 
     property NativeSession: Pnghttp2_session   read FNativeSession;
     property OnRequest:     TNghttp2OnRequestProc read FOnRequest write FOnRequest;
+
+    { Set by a driver that cannot wait on FResponseReady. Fires on the
+      worker's thread the moment a response is staged. Leave unset for the
+      thread pump, which waits on the event directly.
+
+      Assigned through a method rather than a property setter because a
+      `procedure of object` is TWO pointers — code and data — so a plain
+      assignment is not atomic and a worker reading it mid-write can see a
+      torn value: a valid code pointer against a stale instance. Both the
+      write and the read happen under FQueueLock. Pass nil to detach, which
+      a driver MUST do before it can be freed. }
+    procedure SetWakeProc(const AProc: TNghttp2WakeProc);
 
     // Called by the cdecl trampolines below — these are the real handlers
     function DoBeginHeaders(const AFrame: Pnghttp2_frame): Integer;
@@ -326,6 +512,7 @@ begin
   FResponseBodyPos   := 0;
   FResponseStream    := nil;
   FResponseSubmitted := False;
+  FResponseStaged    := False;
   FTrailerSubmitted  := False;
 end;
 
@@ -345,7 +532,7 @@ end;
 
 procedure TNghttp2StreamState.AddTrailer(const AName, AValue: string);
 begin
-  if FResponseSubmitted then
+  if FResponseStaged then
     raise Exception.Create('AddTrailer: trailers must be added BEFORE Send/SendStream');
   if FResponseTrailers = nil then
     FResponseTrailers := TStringList.Create;
@@ -428,20 +615,44 @@ begin
   FStatus := AValue;
 end;
 
+// First response wins. A second Send used to overwrite the staged body while
+// DoSubmitResponse quietly ignored the repeat, so the wire could carry the
+// first response's headers over the second's body; deferred submission would
+// widen that into a cross-thread race and a duplicate queue entry.
 procedure TNghttp2StreamState.Send(const AData: TBytes);
 begin
+  if FResponseStaged then Exit;
   FResponseBody.Clear;
   if Length(AData) > 0 then
     FResponseBody.WriteBuffer(AData[0], Length(AData));
   FResponseStream := nil;
-  DoSubmitResponse;
+  FResponseStaged := True;
+  FSession.SubmitOrDefer(Self);
 end;
 
 procedure TNghttp2StreamState.SendStream(const ASource: TStream);
 begin
+  if FResponseStaged then Exit;
   FResponseBody.Clear;
   FResponseStream := ASource;
+  FResponseStaged := True;
+  FSession.SubmitOrDefer(Self);
+end;
+
+procedure TNghttp2StreamState.SubmitStagedResponse;
+begin
+  // Connection thread only — reached from TNghttp2Session.DrainPendingResponses.
   DoSubmitResponse;
+end;
+
+procedure TNghttp2StreamState.BeginAsyncDispatch;
+begin
+  TInterlocked.Increment(FSession.FPendingDispatch);
+end;
+
+procedure TNghttp2StreamState.EndAsyncDispatch;
+begin
+  TInterlocked.Decrement(FSession.FPendingDispatch);
 end;
 
 procedure TNghttp2StreamState.DoSubmitResponse;
@@ -555,13 +766,29 @@ end;
 // TNghttp2Session
 // ============================================================================
 
-constructor TNghttp2Session.Create(const AConnection: INghttp2Connection);
+constructor TNghttp2Session.Create(const AConnection: INghttp2Connection;
+  AMaxConcurrentStreams: Integer);
 var
   LRc: Integer;
 begin
   inherited Create;
   FConnection := AConnection;
-  FStreams    := TObjectDictionary<Int32, TNghttp2StreamState>.Create([doOwnsValues]);
+  // Non-owning: FStreamRefs holds the reference that governs lifetime.
+  FStreams      := TDictionary<Int32, TNghttp2StreamState>.Create;
+  FStreamRefs   := TDictionary<Int32, INghttp2StreamInternal>.Create;
+  FPendingQueue := TQueue<INghttp2StreamInternal>.Create;
+  FDrained      := TList<INghttp2StreamInternal>.Create;
+  FQueueLock    := TCriticalSection.Create;
+  FResponseReady := TEvent.Create(nil, {ManualReset=}False, {InitialState=}False, '');
+  FAsyncMode    := False;
+  FPendingDispatch := 0;
+  FShutdownNoticeSent := False;
+  FShutdownNoticeAt   := 0;
+  FFinalGoawaySent    := False;
+  if AMaxConcurrentStreams > 0 then
+    FMaxConcurrentStreams := AMaxConcurrentStreams
+  else
+    FMaxConcurrentStreams := 100;
 
   BuildCallbacks;
 
@@ -580,8 +807,192 @@ begin
     nghttp2_session_del(FNativeSession);
   if FCallbacks <> nil then
     nghttp2_session_callbacks_del(FCallbacks);
+  // Release order matters: FStreams is a bare lookup table, so every
+  // reference-holding container must go first. Any stream a worker still
+  // holds survives all of these and frees when that worker lets go.
+  FDrained.Free;
+  FPendingQueue.Free;
+  FStreamRefs.Free;
   FStreams.Free;
+  FResponseReady.Free;
+  FQueueLock.Free;
   inherited;
+end;
+
+function TNghttp2Session.HasPendingResponses: Boolean;
+begin
+  if not FAsyncMode then Exit(False);
+  FQueueLock.Enter;
+  try
+    Result := FPendingQueue.Count > 0;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+procedure TNghttp2Session.WaitForResponse(ATimeoutMS: Integer);
+begin
+  FResponseReady.WaitFor(ATimeoutMS);
+end;
+
+function TNghttp2Session.PendingDispatch: Integer;
+begin
+  Result := TInterlocked.CompareExchange(FPendingDispatch, 0, 0);
+end;
+
+procedure TNghttp2Session.SubmitShutdownNotice;
+const
+  // 2^31-1: "I will still process every stream you have already opened."
+  // A real last_stream_id here would reset streams above it; this value
+  // is the notice, not the cutoff.
+  LAST_STREAM_ID_MAX = Int32($7FFFFFFF);
+begin
+  // Connection thread only, and only between pump calls — submit_* is safe
+  // there, unlike the send/recv family.
+  if FShutdownNoticeSent then Exit;
+  FShutdownNoticeSent := True;
+  FShutdownNoticeAt   := Now;
+  nghttp2_submit_goaway(FNativeSession, NGHTTP2_FLAG_NONE,
+    LAST_STREAM_ID_MAX, NGHTTP2_NO_ERROR, nil, 0);
+end;
+
+function TNghttp2Session.LastProcStreamId: Integer;
+begin
+  // Same call SubmitFinalGoaway makes, so what a driver logs is exactly what
+  // goes on the wire — not a re-derivation that could disagree with it.
+  Result := nghttp2_session_get_last_proc_stream_id(FNativeSession);
+end;
+
+procedure TNghttp2Session.SubmitFinalGoaway;
+var
+  LElapsed: Integer;
+begin
+  if FFinalGoawaySent then Exit;
+  FFinalGoawaySent := True;
+
+  { Space the two GOAWAYs. The notice says "stop opening streams" without
+    naming a cutoff; this one names it. A peer that opened a stream in the
+    window between deciding to and receiving the notice needs that stream to
+    fall at or below the final last_stream_id, or it cannot tell a request
+    that was processed from one it must replay — the entire reason RFC 9113
+    describes two frames rather than one.
+
+    In practice the drain supplies far more than a round trip, because it
+    waits for in-flight work. The wait below only matters for the degenerate
+    case: an idle connection, where the drain completes at once and both
+    frames would otherwise be emitted back to back. Connections do this
+    concurrently, so it costs the shutdown one grace period in total, not one
+    per connection.
+
+    A PING/ACK exchange would measure the real round trip instead of assuming
+    one. That is the more precise design and the natural next step if this
+    ever needs to serve high-latency links. }
+  if FShutdownNoticeSent then
+  begin
+    LElapsed := MilliSecondsBetween(Now, FShutdownNoticeAt);
+    if LElapsed < GOAWAY_GRACE_MS then
+      Sleep(GOAWAY_GRACE_MS - LElapsed);
+  end;
+
+  { submit_goaway, NOT terminate_session.
+
+    terminate_session looks like the natural fit — it derives last_stream_id
+    itself — but it does what its name says: it ends the session, discarding
+    frames already submitted for open streams. Calling it here, right after
+    the final response was queued, threw that response away. A frame trace
+    showed the two GOAWAYs arriving correctly and the reply never arriving at
+    all, with the client reporting `processed=0`.
+
+    submit_goaway only enqueues a frame, so it lines up behind the response
+    instead of replacing it. The stream ID comes from
+    get_last_proc_stream_id, which is the same number terminate_session would
+    have used — the highest stream actually processed. }
+  nghttp2_submit_goaway(FNativeSession, NGHTTP2_FLAG_NONE,
+    nghttp2_session_get_last_proc_stream_id(FNativeSession),
+    NGHTTP2_NO_ERROR, nil, 0);
+end;
+
+procedure TNghttp2Session.SubmitOrDefer(const AStream: TNghttp2StreamState);
+var
+  LWake: TNghttp2WakeProc;
+begin
+  if not FAsyncMode then
+  begin
+    // Historical path, byte-for-byte unchanged: the caller is the connection
+    // thread inside a callback, and nghttp2_submit_response is documented as
+    // safe there.
+    AStream.DoSubmitResponse;
+    Exit;
+  end;
+
+  // Async: the caller is (usually) a worker thread, which must not touch the
+  // native session at all. Park the staged response for the connection
+  // thread. Enqueuing as an interface also pins the stream until submitted,
+  // which matters when the client RSTs the stream mid-handler.
+  LWake := nil;
+  FQueueLock.Enter;
+  try
+    FPendingQueue.Enqueue(AStream as INghttp2StreamInternal);
+    // Copied under the lock so it cannot tear against SetWakeProc; invoked
+    // outside it so a driver's wake (a syscall) never runs with the queue
+    // lock held, where it would block every other worker staging a response.
+    LWake := FOnWorkStaged;
+  finally
+    FQueueLock.Leave;
+  end;
+
+  { Wake the driver now rather than letting it sit out its poll interval. The
+    client that sent this request is waiting on the answer, so it is sending
+    nothing that would wake anyone on its own.
+
+    Both signals fire, because the two drivers listen differently: the thread
+    pump waits on the event, an event loop waits in epoll_wait and can only be
+    reached through its own descriptor. Signalling the event alone is exactly
+    what left the epoll engine flushing replies a poll interval late. }
+  FResponseReady.SetEvent;
+  if Assigned(LWake) then
+    LWake;
+end;
+
+procedure TNghttp2Session.SetWakeProc(const AProc: TNghttp2WakeProc);
+begin
+  FQueueLock.Enter;
+  try
+    FOnWorkStaged := AProc;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+function TNghttp2Session.DrainPendingResponses: Boolean;
+var
+  LItem: INghttp2StreamInternal;
+begin
+  Result := False;
+  if not FAsyncMode then Exit;
+
+  // Streams drained on the previous pass have had their DATA frames pulled by
+  // now (the caller ran ExtractOutgoing to completion after that drain), so
+  // it is safe to drop those references here.
+  FDrained.Clear;
+
+  while True do
+  begin
+    FQueueLock.Enter;
+    try
+      if FPendingQueue.Count = 0 then Break;
+      LItem := FPendingQueue.Dequeue;
+    finally
+      FQueueLock.Leave;
+    end;
+
+    // Outside the lock: submit touches the native session, and a handler
+    // must never be able to deadlock the queue behind it.
+    FDrained.Add(LItem);
+    LItem.SubmitStagedResponse;
+    LItem := nil;
+    Result := True;
+  end;
 end;
 
 procedure TNghttp2Session.BuildCallbacks;
@@ -607,8 +1018,11 @@ begin
   // Advertise reasonable server defaults. Everything else uses nghttp2 defaults:
   //   HEADER_TABLE_SIZE=4096, ENABLE_PUSH=0 (server ignores anyway),
   //   INITIAL_WINDOW_SIZE=65535, MAX_FRAME_SIZE=16384.
+  // Clients self-limit to this many in-flight streams per connection, which
+  // is the cheapest backpressure available: it throttles at the protocol
+  // layer, before a request ever reaches the worker pool.
   LIv[0].settings_id := NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
-  LIv[0].value       := 100;
+  LIv[0].value       := FMaxConcurrentStreams;
   nghttp2_submit_settings(FNativeSession, NGHTTP2_FLAG_NONE, @LIv[0], 1);
 end;
 
@@ -651,6 +1065,9 @@ begin
   if FStreams.ContainsKey(AFrame^.hd.stream_id) then Exit(0);
 
   LState := TNghttp2StreamState.Create(Self, AFrame^.hd.stream_id, FConnection);
+  // FStreamRefs takes the owning reference (bumping refcount from 0 to 1);
+  // FStreams keeps the bare pointer the other callbacks look up.
+  FStreamRefs.Add(AFrame^.hd.stream_id, LState as INghttp2StreamInternal);
   FStreams.Add(AFrame^.hd.stream_id, LState);
   Result := 0;
 end;
@@ -700,10 +1117,15 @@ end;
 
 function TNghttp2Session.DoStreamClose(AStreamId: Int32; AErrorCode: UInt32): Integer;
 begin
-  // Remove from FStreams — the TObjectDictionary owns and frees the state.
-  // This is safe here because dispatch happens on the same thread as recv,
-  // and this callback fires only after the stream has fully drained both ways.
+  // Drops the session's reference rather than destroying the stream. In
+  // synchronous mode that is the only reference and the stream dies here,
+  // exactly as before. In async mode this callback can fire while a worker is
+  // still running (client RST_STREAM, connection reset), and then the worker's
+  // own reference keeps the object alive until it finishes — the response it
+  // eventually stages is submitted against a closed stream and harmlessly
+  // rejected by nghttp2.
   FStreams.Remove(AStreamId);
+  FStreamRefs.Remove(AStreamId);
   Result := 0;
 end;
 

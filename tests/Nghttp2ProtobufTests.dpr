@@ -26,6 +26,13 @@ program Nghttp2ProtobufTests;
   {$MODE DELPHI}{$H+}
 {$IFEND}
 {$M+}   // enable RTTI for message classes below
+{$IF DEFINED(FPC)}
+  // FPC: {$M+} alone only emits CLASSIC RTTI (accessible via TypInfo
+  // GetPropList). System.Rtti / TRttiType.GetProperties reads EXTENDED
+  // RTTI, which Delphi enables implicitly but FPC requires via this
+  // directive. Without it, TRttiType.GetProperties returns 0.
+  {$RTTI EXPLICIT PROPERTIES([vcPublished]) FIELDS([vcPublic]) METHODS([vcPublic])}
+{$IFEND}
 
 uses
 {$IF DEFINED(FPC)}

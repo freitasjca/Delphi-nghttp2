@@ -62,6 +62,7 @@ type
   // ─── Opaque handles ──────────────────────────────────────────────────────
   PSSL_CTX    = Pointer;
   PSSL        = Pointer;
+  PBIO        = Pointer;
   PSSL_METHOD = Pointer;
 
   // ─── ALPN server-side callback signature (openssl/ssl.h) ─────────────────
@@ -164,6 +165,36 @@ var
   SSL_connect:            function(ssl: PSSL): Integer; cdecl;
   SSL_read:               function(ssl: PSSL; buf: Pointer; num: Integer): Integer; cdecl;
   SSL_write:              function(ssl: PSSL; const buf: Pointer; num: Integer): Integer; cdecl;
+  // Bytes already decrypted into SSL's internal buffer and readable without
+  // touching the socket. The connection pump must consult this before any
+  // select()-based readability wait: a full TLS record can decrypt into more
+  // application bytes than one read consumes, leaving data invisible to
+  // select() and the pump parked in a timeout that the peer will never end.
+  SSL_pending:            function(ssl: PSSL): Integer; cdecl;
+
+  { ─── Memory BIOs ──────────────────────────────────────────────────────
+    Used instead of SSL_set_fd so OpenSSL never owns the socket: ciphertext
+    is moved through in-memory buffers and the caller performs every read
+    and write itself.
+
+      send:  SSL_write(plain) → BIO_read(wbio)  → socket
+      recv:  socket → BIO_write(rbio) → SSL_read(plain)
+
+    That inversion is what lets a TLS connection be driven by an event loop
+    (nothing blocks inside OpenSSL) and is the same structure
+    Delphi-Cross-Socket uses over its epoll/IOCP engines. }
+  BIO_new:                function(bio_method: Pointer): PBIO; cdecl;
+  BIO_s_mem:              function: Pointer; cdecl;
+  { No `const` on data — it buys nothing for a Pointer and FPC's rules for
+    const parameters differ enough from Delphi's to not be worth the risk. }
+  BIO_write:              function(b: PBIO; data: Pointer; dlen: Integer): Integer; cdecl;
+  BIO_read:               function(b: PBIO; data: Pointer; dlen: Integer): Integer; cdecl;
+  // BIO_pending is a macro over BIO_ctrl(b, BIO_CTRL_PENDING, 0, nil).
+  BIO_ctrl:               function(b: PBIO; cmd: Integer; larg: LongInt;
+                                   parg: Pointer): LongInt; cdecl;
+  // Takes ownership of both BIOs: SSL_free releases them, so they must not
+  // be freed separately.
+  SSL_set_bio:            procedure(ssl: PSSL; rbio, wbio: PBIO); cdecl;
   SSL_shutdown:           function(ssl: PSSL): Integer; cdecl;
   SSL_get_error:          function(ssl: PSSL; ret_code: Integer): Integer; cdecl;
   SSL_get0_alpn_selected: procedure(ssl: PSSL;
@@ -173,6 +204,10 @@ var
   // ─── Error introspection ─────────────────────────────────────────────────
   ERR_get_error:      function: Cardinal; cdecl;
   ERR_error_string_n: procedure(e: Cardinal; buf: PAnsiChar; len: NativeUInt); cdecl;
+
+// Bytes buffered in a memory BIO and not yet read out. OpenSSL exposes this
+// as a macro over BIO_ctrl, so it has to be written out by hand here.
+function BIO_pending(b: PBIO): Integer;
 
 // Attempt to dynamically load OpenSSL. Idempotent — repeated calls return
 // the cached result. Returns True if libssl was found and every required
@@ -205,6 +240,18 @@ function NghttpsslVersion: string;
 function NghttpsslLastError: string;
 
 implementation
+
+const
+  // openssl/bio.h — BIO_pending(b) is #define BIO_ctrl(b,BIO_CTRL_PENDING,0,NULL)
+  BIO_CTRL_PENDING = 10;
+
+function BIO_pending(b: PBIO): Integer;
+begin
+  if (b = nil) or not Assigned(BIO_ctrl) then
+    Exit(0);
+  Result := Integer(BIO_ctrl(b, BIO_CTRL_PENDING, 0, nil));
+end;
+
 
 const
 {$IF DEFINED(MSWINDOWS)}
@@ -353,12 +400,21 @@ begin
   if not GetFrom(ALibSsl, 'SSL_connect',   Pointer(@SSL_connect))   then Exit;
   if not GetFrom(ALibSsl, 'SSL_read',      Pointer(@SSL_read))      then Exit;
   if not GetFrom(ALibSsl, 'SSL_write',     Pointer(@SSL_write))     then Exit;
+  if not GetFrom(ALibSsl, 'SSL_pending',   Pointer(@SSL_pending))   then Exit;
+  if not GetFrom(ALibSsl, 'SSL_set_bio',   Pointer(@SSL_set_bio))   then Exit;
   if not GetFrom(ALibSsl, 'SSL_shutdown',  Pointer(@SSL_shutdown))  then Exit;
   if not GetFrom(ALibSsl, 'SSL_get_error', Pointer(@SSL_get_error)) then Exit;
 
   // ── libcrypto exports ───────────────────────────────────────────────────
   if not GetFrom(ALibCrypto, 'ERR_get_error',      Pointer(@ERR_get_error))      then Exit;
   if not GetFrom(ALibCrypto, 'ERR_error_string_n', Pointer(@ERR_error_string_n)) then Exit;
+  // The BIO family lives in libcrypto, not libssl — only SSL_set_bio above
+  // is an libssl export.
+  if not GetFrom(ALibCrypto, 'BIO_new',            Pointer(@BIO_new))            then Exit;
+  if not GetFrom(ALibCrypto, 'BIO_s_mem',          Pointer(@BIO_s_mem))          then Exit;
+  if not GetFrom(ALibCrypto, 'BIO_write',          Pointer(@BIO_write))          then Exit;
+  if not GetFrom(ALibCrypto, 'BIO_read',           Pointer(@BIO_read))           then Exit;
+  if not GetFrom(ALibCrypto, 'BIO_ctrl',           Pointer(@BIO_ctrl))           then Exit;
 
   Result := True;
 end;

@@ -16,7 +16,7 @@ interface
 
 uses
 {$IF DEFINED(FPC)}
-  Classes;
+  Classes, SysUtils;   // SysUtils provides TBytes on both compilers
 {$ELSE}
   System.Classes,
   System.SysUtils;
@@ -68,6 +68,23 @@ type
     //  at submit_response time and cannot be modified once the DATA frames
     //  start flowing. Names are lowercased (HTTP/2 requires it).
     procedure AddTrailer(const AName, AValue: string);
+
+    // ─── Async dispatch handshake ────────────────────────────────────────
+    //  For hosts that answer OnRequest from a worker thread instead of
+    //  inline. BeginAsyncDispatch says "a worker now owns this stream";
+    //  EndAsyncDispatch says it is done, responded or not. Between the two
+    //  the connection pump keeps the connection open and keeps polling, so
+    //  the response is flushed even when the client has stopped sending.
+    //
+    //  Call BeginAsyncDispatch on the connection thread BEFORE handing the
+    //  stream over — doing it inside the worker races the pump, which may
+    //  already have concluded there is nothing left to wait for. Pair
+    //  EndAsyncDispatch in the worker's finally: an unmatched Begin parks
+    //  the connection until the peer disconnects.
+    //
+    //  Synchronous hosts ignore both; the counter simply stays at zero.
+    procedure BeginAsyncDispatch;
+    procedure EndAsyncDispatch;
   end;
 
 implementation

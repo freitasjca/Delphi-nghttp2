@@ -296,6 +296,12 @@ var
     session: Pnghttp2_session;
     error_code: UInt32): Integer; cdecl;
 
+  // Highest stream ID this session has actually processed. The number a
+  // graceful-shutdown GOAWAY must carry, so the peer can tell which of its
+  // requests were served and which it must replay elsewhere.
+  nghttp2_session_get_last_proc_stream_id: function(
+    session: Pnghttp2_session): Int32; cdecl;
+
   // ─── I/O (mem_recv / mem_send — no send_callback in v1 for simplicity) ─
   nghttp2_session_mem_recv: function(
     session: Pnghttp2_session;
@@ -539,6 +545,8 @@ begin
                  Pointer(@nghttp2_session_want_write)) then Exit;
   if not GetFrom('nghttp2_session_terminate_session',
                  Pointer(@nghttp2_session_terminate_session)) then Exit;
+  if not GetFrom('nghttp2_session_get_last_proc_stream_id',
+                 Pointer(@nghttp2_session_get_last_proc_stream_id)) then Exit;
 
   // I/O
   if not GetFrom('nghttp2_session_mem_recv',

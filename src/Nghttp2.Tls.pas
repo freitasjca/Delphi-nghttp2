@@ -37,6 +37,27 @@ uses
 type
   ENghttp2Tls = class(Exception);
 
+  { Outcome of a non-blocking TLS operation.
+
+    The two WANT states are NOT errors. They name the readiness the caller
+    must wait for before calling the same operation again, and getting them
+    wrong is the classic event-loop TLS bug in both directions: treat
+    tisWantRead as failure and healthy connections die at random under load;
+    ignore it and the loop spins a core at 100%.
+
+    Note that the direction TLS wants is not the direction the application
+    wants. A WRITE can return tisWantRead — a renegotiation needs peer bytes
+    before it can encrypt — and a READ can return tisWantWrite. An engine that
+    registers readiness based on what the application asked for, rather than
+    on what these values say, will hang on exactly those cases. }
+  TTlsIoState = (
+    tisOk,          // completed; for Read/Write see the out byte count
+    tisWantRead,    // call again once the socket is readable
+    tisWantWrite,   // call again once the socket is writable
+    tisClosed,      // peer closed cleanly (TCP FIN or TLS close_notify)
+    tisError        // fatal; tear the connection down
+  );
+
   { Owns one SSL_CTX for the lifetime of the server. Load cert+key ONCE at
     startup; every accepted connection borrows the same context via
     TTlsConnection.Create(AContext, ASocket). }
@@ -86,11 +107,61 @@ type
 
   { Per-accepted-socket TLS wrapper. Own lifecycle: Create → DoHandshake →
     Read/Write in a loop → Free. }
+  { Memory-BIO TLS connection.
+
+    OpenSSL is never given the socket. Ciphertext moves through two in-memory
+    BIOs and this class performs every socket read and write itself:
+
+      send:  SSL_write(plain) → BIO_read(FBioOut)  → socket
+      recv:  socket → BIO_write(FBioIn) → SSL_read(plain)
+
+    Previously this used SSL_set_fd, which let OpenSSL block inside its own
+    read()/write(). That is fine for a thread-per-connection server and
+    impossible for an event loop, because nothing outside OpenSSL can tell
+    when the descriptor is ready or bound how long a call will park. Moving
+    the socket I/O out here is the prerequisite for driving TLS from epoll or
+    IOCP, and is the structure Delphi-Cross-Socket uses over its engines.
+
+    Behaviour is unchanged for the current blocking pump: Read and Write keep
+    the same signatures and the same "bytes, 0 on clean close, <0 on error"
+    contract. }
   TTlsConnection = class
   strict private
     FCtx:    TTlsServerContext;
     FSocket: Integer;
     FSSL:    PSSL;
+    FBioIn:  PBIO;   // ciphertext IN  — we write, OpenSSL reads
+    FBioOut: PBIO;   // ciphertext OUT — OpenSSL writes, we read
+
+    { Non-blocking mode state. Every field in this class must be declared
+      before the first method — both dcc and fpc reject a field that follows
+      a method within one visibility section (E2169 / "start a new visibility
+      section first"). }
+    FNonBlocking: Boolean;
+    // Ciphertext pulled out of FBioOut that the socket has not accepted yet.
+    // Required in non-blocking mode and meaningless outside it: a short write
+    // must not lose the remainder, and it cannot be pushed back into the BIO.
+    FOutPending: TBytes;
+    FOutUsed:    Integer;   // bytes of FOutPending still to send, from index 0
+
+    // Drains FBioOut to the socket. False on send failure.
+    function FlushOut: Boolean;
+    // Reads ciphertext from the socket into FBioIn.
+    // >0 bytes fed · 0 peer closed · <0 socket error.
+    function FeedIn: Integer;
+
+    { ── Non-blocking counterparts ────────────────────────────────────────
+      Deliberately separate routines rather than a mode branch inside the two
+      above. The blocking pair is what every shipped suite exercises, and
+      keeping it literally untouched is what lets the same suites validate
+      this addition. }
+    procedure SetNonBlocking(AValue: Boolean);
+    // Appends everything in FBioOut to FOutPending, then sends as much as the
+    // socket will take. tisOk = nothing left · tisWantWrite = remainder held.
+    function FlushOutNB: TTlsIoState;
+    // Non-blocking FeedIn. >0 fed · 0 peer closed · SOCKET_WOULD_BLOCK ·
+    // -1 error.
+    function FeedInNB: Integer;
   public
     constructor Create(const AContext: TTlsServerContext; ASocket: Integer);
     destructor  Destroy; override;
@@ -111,9 +182,45 @@ type
     function Read(ABuf: Pointer; ALen: Integer): Integer;
     function Write(ABuf: Pointer; ALen: Integer): Integer;
 
+    // Application bytes already decrypted and buffered inside OpenSSL, i.e.
+    // readable without the socket becoming readable again. A pump that waits
+    // on select() before every Read must check this first — one TLS record
+    // can decrypt to more bytes than a single Read consumes, and select()
+    // cannot see the remainder.
+    function Pending: Integer;
+
     // Best-effort graceful close (SSL_shutdown). Doesn't wait for the peer's
     // close_notify — that's a caller-optional politeness.
     procedure Shutdown;
+
+    { ── Non-blocking API — for an event-loop engine ──────────────────────
+      Setting NonBlocking also puts the underlying socket into the matching
+      mode, so the flag and the descriptor can never disagree. Mixing the two
+      APIs on one connection is not supported: pick a mode before the
+      handshake and stay in it. }
+    property NonBlocking: Boolean read FNonBlocking write SetNonBlocking;
+
+    { One resumable step of SSL_accept. Call again on the readiness it
+      returns; tisOk means the handshake is complete and NegotiatedProtocol
+      is meaningful.
+
+      Note tisWantWrite after a *successful* SSL_accept: the final handshake
+      flight was produced but the socket did not take all of it. The
+      handshake is not done until those bytes leave, so the engine must
+      flush before treating the connection as established. }
+    function HandshakeStep: TTlsIoState;
+
+    // Non-blocking Read/Write. ARead/AWritten are only meaningful on tisOk.
+    function ReadNB(ABuf: Pointer; ALen: Integer; out ARead: Integer): TTlsIoState;
+    function WriteNB(ABuf: Pointer; ALen: Integer; out AWritten: Integer): TTlsIoState;
+
+    // True while ciphertext is held waiting for the socket to drain. An
+    // engine must keep watching for writability until this goes false, or
+    // the tail of a response is never sent.
+    function HasPendingOutput: Boolean;
+
+    // Push held ciphertext after a writable event. Same states as FlushOutNB.
+    function FlushPendingOutput: TTlsIoState;
 
     property SSL: PSSL read FSSL;
   end;
@@ -172,11 +279,17 @@ type
   { Per-connection TLS wrapper on the client side. Own lifecycle: Create →
     DoHandshake → Read/Write in a loop → Free. Same shape as TTlsConnection
     (server) but calls SSL_connect instead of SSL_accept. }
+  // Client side of the same memory-BIO design as TTlsConnection — see the
+  // comment there for why OpenSSL is kept away from the socket.
   TTlsClientConnection = class
   strict private
     FCtx:    TTlsClientContext;
     FSocket: Integer;
     FSSL:    PSSL;
+    FBioIn:  PBIO;
+    FBioOut: PBIO;
+    function FlushOut: Boolean;
+    function FeedIn: Integer;
   public
     constructor Create(const AContext: TTlsClientContext; ASocket: Integer);
     destructor  Destroy; override;
@@ -202,6 +315,13 @@ type
   end;
 
 implementation
+
+uses
+  { Memory-BIO TLS performs its own socket I/O — see TTlsConnection. Kept in
+    the implementation section: nothing in the interface names a socket type,
+    so the dependency stays private. Safe direction either way — Nghttp2.Socket
+    knows nothing about TLS. }
+  Nghttp2.Socket;
 
 // ─── Error helpers ───────────────────────────────────────────────────────
 
@@ -428,12 +548,114 @@ begin
   if FSSL = nil then
     RaiseTls('SSL_new', 0, nil);
 
-  if SSL_set_fd(FSSL, ASocket) <> 1 then
+  FBioIn  := BIO_new(BIO_s_mem());
+  FBioOut := BIO_new(BIO_s_mem());
+  if (FBioIn = nil) or (FBioOut = nil) then
   begin
-    SSL_free(FSSL);
+    SSL_free(FSSL);   // frees any BIO already attached; these are not yet
     FSSL := nil;
-    RaiseTls('SSL_set_fd', 0, nil);
+    RaiseTls('BIO_new', 0, nil);
   end;
+
+  // SSL takes ownership of both BIOs — SSL_free releases them, so they must
+  // never be freed separately.
+  SSL_set_bio(FSSL, FBioIn, FBioOut);
+end;
+
+function TTlsConnection.FlushOut: Boolean;
+var
+  LBuf: array[0..16383] of Byte;   // one TLS record max is ~16 KB + overhead
+  LLen: Integer;
+begin
+  Result := True;
+  if FSSL = nil then Exit;
+  // BIO_read returns <=0 when the buffer is empty, which is the normal exit.
+  repeat
+    LLen := BIO_read(FBioOut, @LBuf[0], SizeOf(LBuf));
+    if LLen <= 0 then Break;
+    if not SocketSendAll(TSocketHandle(FSocket), @LBuf[0], LLen) then
+      Exit(False);
+  until False;
+end;
+
+function TTlsConnection.FeedIn: Integer;
+var
+  LBuf: array[0..16383] of Byte;
+begin
+  Result := SocketRecv(TSocketHandle(FSocket), @LBuf[0], SizeOf(LBuf));
+  if Result <= 0 then Exit;        // 0 = peer closed, <0 = socket error
+  if BIO_write(FBioIn, @LBuf[0], Result) <= 0 then
+    Exit(-1);
+end;
+
+// ─── Non-blocking transport helpers ──────────────────────────────────────
+
+procedure TTlsConnection.SetNonBlocking(AValue: Boolean);
+begin
+  if FNonBlocking = AValue then Exit;
+  // Flag and descriptor are set together on purpose. Held apart they drift,
+  // and the failure is silent: the NB routines run against a still-blocking
+  // socket and park an engine thread that is meant to serve many connections.
+  if not SetSocketNonBlocking(TSocketHandle(FSocket), AValue) then
+    raise ENghttp2Tls.Create('SetSocketNonBlocking failed');
+  FNonBlocking := AValue;
+end;
+
+function TTlsConnection.HasPendingOutput: Boolean;
+begin
+  Result := FOutUsed > 0;
+end;
+
+function TTlsConnection.FlushOutNB: TTlsIoState;
+var
+  LBuf: array[0..16383] of Byte;
+  LLen: Integer;
+begin
+  if FSSL = nil then Exit(tisError);
+
+  // Drain the BIO first, unconditionally. OpenSSL's output must be taken out
+  // in order and cannot be pushed back, so it accumulates here rather than
+  // being left in the BIO — the only place a short write can be remembered.
+  repeat
+    LLen := BIO_read(FBioOut, @LBuf[0], SizeOf(LBuf));
+    if LLen <= 0 then Break;
+    if Length(FOutPending) < FOutUsed + LLen then
+      SetLength(FOutPending, FOutUsed + LLen + 8192);
+    Move(LBuf[0], FOutPending[FOutUsed], LLen);
+    Inc(FOutUsed, LLen);
+  until False;
+
+  Result := FlushPendingOutput;
+end;
+
+function TTlsConnection.FlushPendingOutput: TTlsIoState;
+var
+  LSent: Integer;
+begin
+  while FOutUsed > 0 do
+  begin
+    LSent := SocketSendNB(TSocketHandle(FSocket), @FOutPending[0], FOutUsed);
+    if LSent = SOCKET_WOULD_BLOCK then
+      Exit(tisWantWrite);
+    if LSent <= 0 then
+      Exit(tisError);
+    Dec(FOutUsed, LSent);
+    if FOutUsed > 0 then
+      // Short write: shuffle the tail down. Cheap at these sizes, and it
+      // keeps every other routine free of an offset it would have to respect.
+      Move(FOutPending[LSent], FOutPending[0], FOutUsed);
+  end;
+  Result := tisOk;
+end;
+
+function TTlsConnection.FeedInNB: Integer;
+var
+  LBuf: array[0..16383] of Byte;
+begin
+  Result := SocketRecvNB(TSocketHandle(FSocket), @LBuf[0], SizeOf(LBuf));
+  if Result <= 0 then Exit;          // 0 closed · -1 error · -2 would block
+  if BIO_write(FBioIn, @LBuf[0], Result) <= 0 then
+    Exit(-1);
 end;
 
 destructor TTlsConnection.Destroy;
@@ -448,11 +670,37 @@ end;
 
 procedure TTlsConnection.DoHandshake;
 var
-  LRet: Integer;
+  LRet, LErr, LFed: Integer;
 begin
-  LRet := SSL_accept(FSSL);
-  if LRet <> 1 then
-    RaiseTls('SSL_accept', LRet, FSSL);
+  { With memory BIOs SSL_accept can no longer reach the socket itself, so it
+    returns WANT_READ/WANT_WRITE instead of blocking. Each pass: let OpenSSL
+    advance as far as it can, push whatever handshake bytes it produced, and
+    feed it more from the peer. Flushing on every pass matters — OpenSSL
+    often has output ready even when it reports WANT_READ, and withholding it
+    deadlocks both sides waiting on each other. }
+  repeat
+    LRet := SSL_accept(FSSL);
+
+    if not FlushOut then
+      RaiseTls('SSL_accept (send)', 0, nil);
+
+    if LRet = 1 then
+      Exit;                       // handshake complete
+
+    LErr := SSL_get_error(FSSL, LRet);
+    case LErr of
+      SSL_ERROR_WANT_READ:
+        begin
+          LFed := FeedIn;
+          if LFed <= 0 then
+            RaiseTls('SSL_accept (peer closed during handshake)', LRet, FSSL);
+        end;
+      SSL_ERROR_WANT_WRITE:
+        ;                         // already flushed above; loop again
+    else
+      RaiseTls('SSL_accept', LRet, FSSL);
+    end;
+  until False;
 end;
 
 function TTlsConnection.NegotiatedProtocol: string;
@@ -469,19 +717,230 @@ begin
 end;
 
 function TTlsConnection.Read(ABuf: Pointer; ALen: Integer): Integer;
+var
+  LErr, LFed: Integer;
 begin
-  Result := SSL_read(FSSL, ABuf, ALen);
+  repeat
+    Result := SSL_read(FSSL, ABuf, ALen);
+    if Result > 0 then Exit;
+
+    LErr := SSL_get_error(FSSL, Result);
+    case LErr of
+      SSL_ERROR_WANT_READ:
+        begin
+          // SSL_read can itself produce output (session tickets, a
+          // renegotiation, an alert), so push before blocking on the peer.
+          if not FlushOut then Exit(-1);
+          LFed := FeedIn;
+          if LFed <= 0 then Exit(LFed);   // 0 = closed, <0 = socket error
+        end;
+      SSL_ERROR_WANT_WRITE:
+        if not FlushOut then Exit(-1);
+      SSL_ERROR_ZERO_RETURN:
+        Exit(0);                          // clean TLS close_notify
+    else
+      Exit(-1);
+    end;
+  until False;
 end;
 
 function TTlsConnection.Write(ABuf: Pointer; ALen: Integer): Integer;
+var
+  LErr, LFed: Integer;
 begin
-  Result := SSL_write(FSSL, ABuf, ALen);
+  repeat
+    Result := SSL_write(FSSL, ABuf, ALen);
+    if Result > 0 then
+    begin
+      // The ciphertext is only in FBioOut at this point — nothing has reached
+      // the socket until this flush. Reporting success without it would tell
+      // the caller bytes were sent that are still sitting in memory.
+      if not FlushOut then Exit(-1);
+      Exit;
+    end;
+
+    LErr := SSL_get_error(FSSL, Result);
+    case LErr of
+      SSL_ERROR_WANT_WRITE:
+        if not FlushOut then Exit(-1);
+      SSL_ERROR_WANT_READ:
+        begin
+          // Renegotiation: OpenSSL needs peer input before it can encrypt.
+          if not FlushOut then Exit(-1);
+          LFed := FeedIn;
+          if LFed <= 0 then Exit(-1);
+        end;
+    else
+      Exit(-1);
+    end;
+  until False;
+end;
+
+function TTlsConnection.Pending: Integer;
+begin
+  if FSSL = nil then
+    Exit(0);
+  { Two buffers can hold readable data now, and a pump that waits on select()
+    must know about both: plaintext already decrypted inside SSL, and
+    ciphertext sitting in FBioIn that has not been decrypted yet. Reporting
+    only the former would let the pump wait on a socket that has nothing more
+    to give while a whole record sits undecrypted. }
+  Result := SSL_pending(FSSL) + BIO_pending(FBioIn);
+end;
+
+// ─── Non-blocking handshake / read / write ───────────────────────────────
+
+function TTlsConnection.HandshakeStep: TTlsIoState;
+var
+  LRet, LErr, LFed: Integer;
+begin
+  repeat
+    LRet := SSL_accept(FSSL);
+
+    // Flush every pass, before inspecting the result. OpenSSL frequently has
+    // a flight ready while reporting WANT_READ, and holding it back deadlocks
+    // both ends — each waiting for the other to speak first.
+    Result := FlushOutNB;
+    if Result = tisError then Exit;
+
+    if LRet = 1 then
+    begin
+      // Handshake agreed, but if the closing flight is still buffered the
+      // peer has not seen it. Reporting tisOk here would let the engine send
+      // application data that arrives before the handshake completes.
+      if HasPendingOutput then Exit(tisWantWrite);
+      Exit(tisOk);
+    end;
+
+    LErr := SSL_get_error(FSSL, LRet);
+    case LErr of
+      SSL_ERROR_WANT_READ:
+        begin
+          LFed := FeedInNB;
+          if LFed = SOCKET_WOULD_BLOCK then Exit(tisWantRead);
+          if LFed = 0 then Exit(tisClosed);
+          if LFed < 0 then Exit(tisError);
+          // Bytes are in FBioIn now. Loop rather than return tisWantRead —
+          // the engine would wait for socket readability that has already
+          // been consumed, and a handshake completed by those very bytes
+          // would hang until the peer happened to send more.
+        end;
+      SSL_ERROR_WANT_WRITE:
+        // FlushOutNB above already pushed what it could, so this is genuine
+        // socket backpressure. (With memory BIOs it is close to unreachable:
+        // a memory BIO grows rather than filling.)
+        Exit(tisWantWrite);
+    else
+      Exit(tisError);
+    end;
+  until False;
+end;
+
+function TTlsConnection.ReadNB(ABuf: Pointer; ALen: Integer;
+  out ARead: Integer): TTlsIoState;
+var
+  LErr, LFed: Integer;
+begin
+  ARead := 0;
+  repeat
+    ARead := SSL_read(FSSL, ABuf, ALen);
+    if ARead > 0 then Exit(tisOk);
+
+    LErr := SSL_get_error(FSSL, ARead);
+    ARead := 0;
+    case LErr of
+      SSL_ERROR_WANT_READ:
+        begin
+          // A read can still owe the peer bytes (session tickets, an alert,
+          // a renegotiation flight). Push before waiting on the peer.
+          if FlushOutNB = tisError then Exit(tisError);
+          LFed := FeedInNB;
+          if LFed = SOCKET_WOULD_BLOCK then Exit(tisWantRead);
+          if LFed = 0 then Exit(tisClosed);
+          if LFed < 0 then Exit(tisError);
+          // Fed — loop and let OpenSSL decrypt.
+        end;
+      SSL_ERROR_WANT_WRITE:
+        begin
+          Result := FlushOutNB;
+          if Result <> tisOk then Exit;   // tisWantWrite or tisError
+        end;
+      SSL_ERROR_ZERO_RETURN:
+        Exit(tisClosed);                  // clean close_notify
+    else
+      Exit(tisError);
+    end;
+  until False;
+end;
+
+function TTlsConnection.WriteNB(ABuf: Pointer; ALen: Integer;
+  out AWritten: Integer): TTlsIoState;
+var
+  LErr, LFed: Integer;
+begin
+  AWritten := 0;
+
+  // Anything held from a previous short write goes first — TLS records must
+  // reach the peer in order, so new plaintext cannot overtake it.
+  Result := FlushPendingOutput;
+  if Result <> tisOk then Exit;
+
+  repeat
+    AWritten := SSL_write(FSSL, ABuf, ALen);
+    if AWritten > 0 then
+    begin
+      // The ciphertext is only in FBioOut at this point. Unlike the blocking
+      // Write, a partial socket write here is NOT a failure: FlushOutNB keeps
+      // the remainder and the caller watches for writability.
+      Result := FlushOutNB;
+      if Result = tisError then Exit;
+      Exit(tisOk);                       // accepted in full by OpenSSL
+    end;
+
+    LErr := SSL_get_error(FSSL, AWritten);
+    AWritten := 0;
+    case LErr of
+      SSL_ERROR_WANT_WRITE:
+        begin
+          Result := FlushOutNB;
+          if Result <> tisOk then Exit;
+        end;
+      SSL_ERROR_WANT_READ:
+        begin
+          // Renegotiation: OpenSSL needs peer input before it can encrypt.
+          // This is the case an engine gets wrong by assuming a write only
+          // ever waits on writability.
+          if FlushOutNB = tisError then Exit(tisError);
+          LFed := FeedInNB;
+          if LFed = SOCKET_WOULD_BLOCK then Exit(tisWantRead);
+          if LFed = 0 then Exit(tisClosed);
+          if LFed < 0 then Exit(tisError);
+        end;
+      SSL_ERROR_ZERO_RETURN:
+        Exit(tisClosed);
+    else
+      Exit(tisError);
+    end;
+  until False;
 end;
 
 procedure TTlsConnection.Shutdown;
 begin
-  if FSSL <> nil then
-    SSL_shutdown(FSSL);   // best effort; ignore return code
+  if FSSL = nil then Exit;
+  SSL_shutdown(FSSL);   // best effort; ignore return code
+  { close_notify lands in FBioOut, not on the wire — with memory BIOs nothing
+    is sent until we push it. Without this the peer never sees the alert and
+    reads a bare connection reset instead of a clean TLS close. Still best
+    effort: the socket may already be gone, and that is not worth reporting.
+
+    In non-blocking mode this is one attempt, not a guarantee: FlushOutNB may
+    leave the alert queued behind a full send buffer. That is the right trade
+    at teardown — close_notify is a courtesy, and parking an engine thread on
+    a peer that has stopped reading is not. }
+  if FNonBlocking then
+    FlushOutNB
+  else
+    FlushOut;
 end;
 
 // ─── TTlsClientContext ──────────────────────────────────────────────────
@@ -586,12 +1045,42 @@ begin
   if FSSL = nil then
     RaiseTls('SSL_new (client)', 0, nil);
 
-  if SSL_set_fd(FSSL, ASocket) <> 1 then
+  FBioIn  := BIO_new(BIO_s_mem());
+  FBioOut := BIO_new(BIO_s_mem());
+  if (FBioIn = nil) or (FBioOut = nil) then
   begin
     SSL_free(FSSL);
     FSSL := nil;
-    RaiseTls('SSL_set_fd (client)', 0, nil);
+    RaiseTls('BIO_new (client)', 0, nil);
   end;
+
+  // SSL owns both BIOs from here; SSL_free releases them.
+  SSL_set_bio(FSSL, FBioIn, FBioOut);
+end;
+
+function TTlsClientConnection.FlushOut: Boolean;
+var
+  LBuf: array[0..16383] of Byte;
+  LLen: Integer;
+begin
+  Result := True;
+  if FSSL = nil then Exit;
+  repeat
+    LLen := BIO_read(FBioOut, @LBuf[0], SizeOf(LBuf));
+    if LLen <= 0 then Break;
+    if not SocketSendAll(TSocketHandle(FSocket), @LBuf[0], LLen) then
+      Exit(False);
+  until False;
+end;
+
+function TTlsClientConnection.FeedIn: Integer;
+var
+  LBuf: array[0..16383] of Byte;
+begin
+  Result := SocketRecv(TSocketHandle(FSocket), @LBuf[0], SizeOf(LBuf));
+  if Result <= 0 then Exit;
+  if BIO_write(FBioIn, @LBuf[0], Result) <= 0 then
+    Exit(-1);
 end;
 
 destructor TTlsClientConnection.Destroy;
@@ -606,11 +1095,34 @@ end;
 
 procedure TTlsClientConnection.DoHandshake;
 var
-  LRet: Integer;
+  LRet, LErr, LFed: Integer;
 begin
-  LRet := SSL_connect(FSSL);
-  if LRet <> 1 then
-    RaiseTls('SSL_connect', LRet, FSSL);
+  // Same pump as the server side: advance, flush what OpenSSL produced, feed
+  // it more. Flushing on every pass is required — withholding output while
+  // OpenSSL reports WANT_READ deadlocks both ends.
+  repeat
+    LRet := SSL_connect(FSSL);
+
+    if not FlushOut then
+      RaiseTls('SSL_connect (send)', 0, nil);
+
+    if LRet = 1 then
+      Exit;
+
+    LErr := SSL_get_error(FSSL, LRet);
+    case LErr of
+      SSL_ERROR_WANT_READ:
+        begin
+          LFed := FeedIn;
+          if LFed <= 0 then
+            RaiseTls('SSL_connect (peer closed during handshake)', LRet, FSSL);
+        end;
+      SSL_ERROR_WANT_WRITE:
+        ;
+    else
+      RaiseTls('SSL_connect', LRet, FSSL);
+    end;
+  until False;
 end;
 
 function TTlsClientConnection.NegotiatedProtocol: string;
@@ -627,19 +1139,67 @@ begin
 end;
 
 function TTlsClientConnection.Read(ABuf: Pointer; ALen: Integer): Integer;
+var
+  LErr, LFed: Integer;
 begin
-  Result := SSL_read(FSSL, ABuf, ALen);
+  repeat
+    Result := SSL_read(FSSL, ABuf, ALen);
+    if Result > 0 then Exit;
+
+    LErr := SSL_get_error(FSSL, Result);
+    case LErr of
+      SSL_ERROR_WANT_READ:
+        begin
+          if not FlushOut then Exit(-1);
+          LFed := FeedIn;
+          if LFed <= 0 then Exit(LFed);
+        end;
+      SSL_ERROR_WANT_WRITE:
+        if not FlushOut then Exit(-1);
+      SSL_ERROR_ZERO_RETURN:
+        Exit(0);
+    else
+      Exit(-1);
+    end;
+  until False;
 end;
 
 function TTlsClientConnection.Write(ABuf: Pointer; ALen: Integer): Integer;
+var
+  LErr, LFed: Integer;
 begin
-  Result := SSL_write(FSSL, ABuf, ALen);
+  repeat
+    Result := SSL_write(FSSL, ABuf, ALen);
+    if Result > 0 then
+    begin
+      // Nothing has left the process until this flush — the ciphertext is
+      // still only in FBioOut.
+      if not FlushOut then Exit(-1);
+      Exit;
+    end;
+
+    LErr := SSL_get_error(FSSL, Result);
+    case LErr of
+      SSL_ERROR_WANT_WRITE:
+        if not FlushOut then Exit(-1);
+      SSL_ERROR_WANT_READ:
+        begin
+          if not FlushOut then Exit(-1);
+          LFed := FeedIn;
+          if LFed <= 0 then Exit(-1);
+        end;
+    else
+      Exit(-1);
+    end;
+  until False;
 end;
 
 procedure TTlsClientConnection.Shutdown;
 begin
-  if FSSL <> nil then
-    SSL_shutdown(FSSL);
+  if FSSL = nil then Exit;
+  SSL_shutdown(FSSL);
+  // close_notify only reaches the wire if we push it — see TTlsConnection.
+  FlushOut;
 end;
 
 end.

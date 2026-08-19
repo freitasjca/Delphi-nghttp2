@@ -221,17 +221,33 @@ begin
       AKind := pkInt32;
     tkInt64:
       AKind := pkInt64;
-    tkChar, tkWChar, tkString, tkLString, tkWString, tkUString:
+    tkChar, tkWChar, tkString, tkLString, tkWString, tkUString
+    {$IF DEFINED(FPC)}
+      // FPC: with {$MODE DELPHI}{$H+}, `string` = AnsiString = tkAString (9).
+      // Delphi's `string` = UnicodeString = tkUString (24); its `AnsiString`
+      // is tkLString (already in the list above). This branch mirrors both.
+      , tkAString
+    {$IFEND}:
       AKind := pkString;
     tkEnumeration:
       begin
-        // Boolean is a Pascal enumeration whose PTypeInfo is System.Boolean.
-        // Every other enum type maps to pkEnum (int32 on the wire).
+        // Boolean on Delphi is a Pascal enumeration whose PTypeInfo is
+        // System.Boolean. Every other enum type maps to pkEnum (int32 on
+        // the wire). On FPC, Boolean has its own TypeKind (tkBool = 18),
+        // handled by the FPC-only branch below — this arm covers only true
+        // enumerations there.
         if LTypeInfo = System.TypeInfo(Boolean) then
           AKind := pkBool
         else
           AKind := pkEnum;
       end;
+{$IF DEFINED(FPC)}
+    tkBool:
+      // FPC-only: Boolean has a distinct TypeKind (18), not tkEnumeration.
+      // ByteBool / WordBool / LongBool also land here — all map to proto3 bool
+      // (single-byte varint on the wire).
+      AKind := pkBool;
+{$IFEND}
     tkFloat:
       begin
         // Distinguish Single vs Double by the underlying PTypeInfo handle.

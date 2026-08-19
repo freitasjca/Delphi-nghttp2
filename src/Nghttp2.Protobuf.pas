@@ -39,7 +39,11 @@ interface
 
 uses
 {$IF DEFINED(FPC)}
-  SysUtils, Classes
+  { FPC 3.2.2: TCustomAttribute lives in the `Rtti` unit (not `TypInfo` as
+    initially suspected, and not `SysUtils` as on Delphi). Without it the
+    attribute-class declarations below fail with
+    `Error: Identifier not found "TCustomAttribute"`. }
+  SysUtils, Classes, Rtti
 {$ELSE}
   System.SysUtils, System.Classes
 {$IFEND}
