@@ -50,3 +50,6 @@ desktop.ini
 # Editor
 .vscode/
 .idea/
+*.dsv
+*.identcache
+*.local
