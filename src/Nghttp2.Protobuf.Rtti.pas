@@ -12,15 +12,20 @@ unit Nghttp2.Protobuf.Rtti;
 //  serialize/deserialize through TProtoWriter / TProtoReader from
 //  Nghttp2.Protobuf.
 //
-//  Types supported in M1b (the 90% subset — extend in follow-up milestones):
-//    Int32 / Integer  — pkInt32
-//    Int64            — pkInt64
-//    string           — pkString (UTF-8)
-//    Boolean          — pkBool
+//  Types supported:
+//    Int32 / Integer  — pkInt32        Single      — pkFloat
+//    Int64            — pkInt64        Double      — pkDouble
+//    string           — pkString       enum        — pkEnum (int32 varint)
+//    Boolean          — pkBool         TBytes      — pkBytes
+//    nested class     — pkSubmessage
+//    TArray<T>        — repeated, for any T above  (M1c.2)
 //
-//  Deferred to M1c or later:
-//    ZigZag (sint32/sint64), fixed/sfixed, float/double, enum, bytes,
-//    submessages, repeated fields (packed + LEN)
+//  TBytes is proto3 `bytes` (a scalar), NOT `repeated uint8` — so TArray<Byte>
+//  is deliberately excluded from repeated handling. Changing that would
+//  re-frame every existing bytes field on the wire.
+//
+//  Still deferred:
+//    ZigZag (sint32/sint64), fixed/sfixed, unsigned (uint32/uint64), maps
 //
 //  ── Design decisions ─────────────────────────────────────────────────────
 //
@@ -61,10 +66,13 @@ uses
 
 type
   // ── Proto3 field kinds we can currently marshal ──────────────────────────
-  // M1c (2026-08-07) adds pkFloat, pkDouble, pkEnum, pkBytes, pkSubmessage.
-  // Still deferred to M1c.2: unsigned variants (UInt32/UInt64), ZigZag variants
-  // (SInt32/SInt64), fixed variants (Fixed32/64/SFixed32/64), and repeated
-  // fields (packed for numeric via TArray<T>, LEN-per-element for others).
+  // M1c   (2026-08-07) added pkFloat, pkDouble, pkEnum, pkBytes, pkSubmessage.
+  // M1c.2 (2026-08-20) added REPEATED fields: any TArray<T> whose T is one of
+  //   the kinds below — packed on the wire for numerics, LEN-per-element for
+  //   string/bytes/submessage. Repeated is a framing property, recorded on
+  //   TProtoFieldInfo.IsRepeated, not a kind of its own.
+  // Still deferred: unsigned variants (UInt32/UInt64), ZigZag variants
+  //   (SInt32/SInt64), fixed variants (Fixed32/64/SFixed32/64), and maps.
   TProtoFieldKind = (
     pkInt32,
     pkInt64,
@@ -82,8 +90,16 @@ type
     Tag:            Integer;
     Name:           string;           // property name — for diagnostics
     Prop:           TRttiProperty;    // long-lived — anchored to THorseProtobufRtti.FContext
+    { For a repeated field this is the ELEMENT kind, not a kind of its own.
+      Keeping it that way is what lets the scalar read/write code below be
+      reused per element instead of duplicated into a parallel enum. }
     Kind:           TProtoFieldKind;
     SubmessageClass: TClass;          // set only when Kind = pkSubmessage
+
+    // ── Repeated fields (M1c.2) ────────────────────────────────────────────
+    IsRepeated:     Boolean;          // property is TArray<T>, T <> Byte
+    ArrayTypeInfo:  PTypeInfo;        // the TArray<T> type — for TValue.FromArray
+    ElemTypeInfo:   PTypeInfo;        // T — for building element TValues
   end;
 
   // ── Cached info about ONE message class ──────────────────────────────────
@@ -113,8 +129,15 @@ type
 
     class procedure LazyInit;
     class function BuildTypeInfo(AClass: TClass): TProtoTypeInfo;
-    class procedure InferProtoKind(AProp: TRttiProperty;
+    { Maps one RTTI type to a scalar proto kind. Split out of InferProtoKind so
+      the repeated branch can ask the same question about its ELEMENT type —
+      `repeated int32` and `int32` differ in framing, never in element coding.
+      ADesc names what is being described in error text ("property X" vs
+      "element type of property X"), because a failure inside an array is
+      otherwise indistinguishable from one on the property itself. }
+    class procedure InferScalarKind(ARttiType: TRttiType; const ADesc: string;
       out AKind: TProtoFieldKind; out ASubmessageClass: TClass);
+    class procedure InferProtoKind(AProp: TRttiProperty; var AField: TProtoFieldInfo);
   public
     (* GetTypeInfo returns cached info for AClass, building it on first call.
        Raises EProtoRttiError if AClass has NO ProtoMember-annotated
@@ -207,16 +230,16 @@ begin
   end;
 end;
 
-class procedure THorseProtobufRtti.InferProtoKind(AProp: TRttiProperty;
-  out AKind: TProtoFieldKind; out ASubmessageClass: TClass);
+class procedure THorseProtobufRtti.InferScalarKind(ARttiType: TRttiType;
+  const ADesc: string; out AKind: TProtoFieldKind; out ASubmessageClass: TClass);
 var
   LTypeInfo:  PTypeInfo;
   LDynArrType: TRttiDynamicArrayType;
 begin
-  LTypeInfo        := AProp.PropertyType.Handle;
+  LTypeInfo        := ARttiType.Handle;
   ASubmessageClass := nil;
 
-  case AProp.PropertyType.TypeKind of
+  case ARttiType.TypeKind of
     tkInteger:
       AKind := pkInt32;
     tkInt64:
@@ -258,38 +281,86 @@ begin
           AKind := pkDouble
         else
           raise EProtoRttiError.CreateFmt(
-            'ProtoMember property "%s": tkFloat with type kind not Single/Double is unsupported. ' +
+            'ProtoMember %s: tkFloat with type kind not Single/Double is unsupported. ' +
             'Proto3 supports only float (Single) and double (Double).',
-            [AProp.Name]);
+            [ADesc]);
       end;
     tkDynArray:
       begin
-        // Only TBytes (= TArray<Byte>) is supported in M1c. Other dynamic
-        // arrays would be "repeated <element>" — deferred to M1c.2.
-        LDynArrType := AProp.PropertyType as TRttiDynamicArrayType;
+        { Only TBytes reaches here as a SCALAR — proto3 `bytes` is a length-
+          delimited scalar, not a repeated field. Every other dynamic array is
+          a repeated field and was peeled off by InferProtoKind before this
+          call, so arriving here with one means nesting: TArray<TArray<T>>,
+          which proto3 cannot express (repeated repeated is illegal; it
+          requires a wrapper message). }
+        LDynArrType := ARttiType as TRttiDynamicArrayType;
         if (LDynArrType.ElementType <> nil)
           and (LDynArrType.ElementType.Handle = System.TypeInfo(Byte)) then
           AKind := pkBytes
         else
           raise EProtoRttiError.CreateFmt(
-            'ProtoMember property "%s": tkDynArray of non-Byte element is unsupported. ' +
-            'Repeated-field support is deferred to M1c.2. Use TBytes for arbitrary byte payloads.',
-            [AProp.Name]);
+            'ProtoMember %s: nested dynamic array. proto3 has no "repeated repeated" — ' +
+            'wrap the inner array in a message class and use TArray<TWrapper>.',
+            [ADesc]);
       end;
     tkClass:
       begin
         // Nested message. Return the class handle so Serialize/Deserialize
         // can recurse via GetTypeInfo(ASubmessageClass).
         AKind := pkSubmessage;
-        ASubmessageClass := (AProp.PropertyType as TRttiInstanceType).MetaclassType;
+        ASubmessageClass := (ARttiType as TRttiInstanceType).MetaclassType;
       end;
   else
     raise EProtoRttiError.CreateFmt(
-      'ProtoMember property "%s" has type kind %d — not supported. ' +
-      'M1c covers Int32/Int64/string/Boolean/Float/Double/Enum/TBytes/submessage. ' +
-      'UInt/SInt/Fixed variants + repeated fields deferred to M1c.2.',
-      [AProp.Name, Ord(AProp.PropertyType.TypeKind)]);
+      'ProtoMember %s has type kind %d — not supported. ' +
+      'Covered: Int32/Int64/string/Boolean/Float/Double/Enum/TBytes/submessage, ' +
+      'and TArray<> of any of those. ' +
+      'UInt/SInt/Fixed variants remain deferred.',
+      [ADesc, Ord(ARttiType.TypeKind)]);
   end;
+end;
+
+{ Peels one level of "repeated" off the property type, then defers to
+  InferScalarKind for the element.
+
+  TBytes is the deliberate exception: TArray<Byte> is proto3 `bytes`, a scalar,
+  NOT `repeated uint8`. Testing for it before treating any dynamic array as
+  repeated is what keeps existing TBytes fields encoding exactly as they did —
+  the alternative would silently re-frame every one of them and break the wire
+  compatibility the 52/52 codec suite locks in. }
+class procedure THorseProtobufRtti.InferProtoKind(AProp: TRttiProperty;
+  var AField: TProtoFieldInfo);
+var
+  LDynArrType: TRttiDynamicArrayType;
+  LElemType:   TRttiType;
+begin
+  AField.IsRepeated    := False;
+  AField.ArrayTypeInfo := nil;
+  AField.ElemTypeInfo  := nil;
+
+  if AProp.PropertyType.TypeKind = tkDynArray then
+  begin
+    LDynArrType := AProp.PropertyType as TRttiDynamicArrayType;
+    LElemType   := LDynArrType.ElementType;
+
+    if LElemType = nil then
+      raise EProtoRttiError.CreateFmt(
+        'ProtoMember property "%s": dynamic array with no element RTTI.', [AProp.Name]);
+
+    if LElemType.Handle <> System.TypeInfo(Byte) then
+    begin
+      AField.IsRepeated    := True;
+      AField.ArrayTypeInfo := AProp.PropertyType.Handle;
+      AField.ElemTypeInfo  := LElemType.Handle;
+      InferScalarKind(LElemType,
+        Format('element type of property "%s"', [AProp.Name]),
+        AField.Kind, AField.SubmessageClass);
+      Exit;
+    end;
+  end;
+
+  InferScalarKind(AProp.PropertyType, Format('property "%s"', [AProp.Name]),
+    AField.Kind, AField.SubmessageClass);
 end;
 
 class function THorseProtobufRtti.BuildTypeInfo(AClass: TClass): TProtoTypeInfo;
@@ -326,10 +397,17 @@ begin
         end;
       if LMember = nil then Continue;
 
+      { Zeroed rather than assigned field-by-field: TProtoFieldInfo gained
+        repeated-field members, and LField is reused across loop iterations —
+        a stale IsRepeated from the previous property would otherwise carry
+        into this one. }
+      Finalize(LField);
+      FillChar(LField, SizeOf(LField), 0);
+
       LField.Tag  := LMember.Tag;
       LField.Name := LProp.Name;
       LField.Prop := LProp;
-      InferProtoKind(LProp, LField.Kind, LField.SubmessageClass);
+      InferProtoKind(LProp, LField);
 
       LList.Add(LField);
     end;
@@ -364,6 +442,81 @@ end;
 
 // ── TProtoSerializer ─────────────────────────────────────────────────────────
 
+{ proto3 packs repeated NUMERIC scalars by default: one LEN record holding the
+  concatenated values, no per-element tag. string / bytes / submessage cannot
+  be packed — their encodings are already length-delimited, so packing would be
+  ambiguous — and are emitted as one tagged record per element.
+
+  Decoders must accept BOTH forms for packable types regardless of which the
+  encoder chose (proto3 language guide, "Packed Encoding"); Deserialize below
+  does. This function only decides what we EMIT. }
+function IsPackableKind(AKind: TProtoFieldKind): Boolean;
+begin
+  Result := AKind in [pkInt32, pkInt64, pkBool, pkEnum, pkFloat, pkDouble];
+end;
+
+{ One packed element, tagless, into AWriter. Mirrors the body of the matching
+  Write*Field in Nghttp2.Protobuf minus its WriteTag — the encodings must stay
+  identical, only the framing differs. }
+procedure WritePackedElement(AWriter: TProtoWriter; AKind: TProtoFieldKind;
+  const AValue: TValue);
+var
+  LU32: UInt32;
+  LU64: UInt64;
+  LSingle: Single;
+  LDouble: Double;
+begin
+  case AKind of
+    pkInt32: AWriter.WriteVarint(UInt64(Int64(AValue.AsInteger)));
+    pkInt64: AWriter.WriteVarint(UInt64(AValue.AsInt64));
+    pkBool:  if AValue.AsBoolean then AWriter.WriteVarint(1) else AWriter.WriteVarint(0);
+    pkEnum:  AWriter.WriteVarint(UInt64(Int64(AValue.AsOrdinal)));
+    pkFloat:
+      begin
+        LSingle := AValue.AsType<Single>;
+        Move(LSingle, LU32, 4);
+        AWriter.WriteFixed32(LU32);
+      end;
+    pkDouble:
+      begin
+        LDouble := AValue.AsType<Double>;
+        Move(LDouble, LU64, 8);
+        AWriter.WriteFixed64(LU64);
+      end;
+  else
+    raise EProtoRttiError.CreateFmt(
+      'WritePackedElement: kind %d is not packable.', [Ord(AKind)]);
+  end;
+end;
+
+{ One tagged element for a non-packable repeated field. Each element repeats
+  the tag, which is exactly how proto3 encodes repeated string/bytes/message. }
+procedure WriteUnpackedElement(AWriter: TProtoWriter; ATag: Integer;
+  AKind: TProtoFieldKind; const AValue: TValue);
+var
+  LSubObj: TObject;
+begin
+  case AKind of
+    pkString: AWriter.WriteStringField(ATag, AValue.AsString);
+    pkBytes:  AWriter.WriteBytesField(ATag, AValue.AsType<TBytes>);
+    pkSubmessage:
+      begin
+        LSubObj := AValue.AsObject;
+        { A nil ELEMENT is not the same as an absent field. Skipping it would
+          silently shorten the array the peer receives, so the count no longer
+          matches what was sent — encode it as a zero-length submessage, which
+          decodes to a default-constructed instance. }
+        if LSubObj = nil then
+          AWriter.WriteSubmessageField(ATag, nil)
+        else
+          AWriter.WriteSubmessageField(ATag, TProtoSerializer.Serialize(LSubObj));
+      end;
+  else
+    raise EProtoRttiError.CreateFmt(
+      'WriteUnpackedElement: kind %d unexpected here.', [Ord(AKind)]);
+  end;
+end;
+
 class function TProtoSerializer.Serialize(AObj: TObject): TBytes;
 var
   LInfo:      TProtoTypeInfo;
@@ -372,6 +525,9 @@ var
   LValue:     TValue;
   LSubObj:    TObject;
   LSubBytes:  TBytes;
+  LPacked:    TProtoWriter;   // M1c.2 — packed repeated payload
+  LCount:     Integer;
+  LIdx:       Integer;
 begin
   if AObj = nil then
     raise EProtoRttiError.Create('Serialize: AObj is nil');
@@ -382,6 +538,37 @@ begin
     for LField in LInfo.Fields do
     begin
       LValue := LField.Prop.GetValue(AObj);
+
+      // ── Repeated (M1c.2) ────────────────────────────────────────────────
+      if LField.IsRepeated then
+      begin
+        LCount := LValue.GetArrayLength;
+        { An empty repeated field emits nothing at all — proto3 has no way to
+          distinguish "empty" from "absent", and both decode to length 0. }
+        if LCount = 0 then Continue;
+
+        if IsPackableKind(LField.Kind) then
+        begin
+          LPacked := TProtoWriter.Create;
+          try
+            for LIdx := 0 to LCount - 1 do
+              WritePackedElement(LPacked, LField.Kind, LValue.GetArrayElement(LIdx));
+            { WriteSubmessageField is just "tag with pwLen + length-prefixed
+              payload", which is precisely the packed framing — reused rather
+              than reimplemented so the two cannot drift. }
+            LWriter.WriteSubmessageField(LField.Tag, LPacked.ToBytes);
+          finally
+            LPacked.Free;
+          end;
+        end
+        else
+          for LIdx := 0 to LCount - 1 do
+            WriteUnpackedElement(LWriter, LField.Tag, LField.Kind,
+              LValue.GetArrayElement(LIdx));
+
+        Continue;
+      end;
+
       case LField.Kind of
         pkInt32:   LWriter.WriteInt32Field(LField.Tag, LValue.AsInteger);
         pkInt64:   LWriter.WriteInt64Field(LField.Tag, LValue.AsInt64);
@@ -412,6 +599,44 @@ begin
   end;
 end;
 
+{ Reads ONE element of a repeated field from AReader, positioned just after its
+  tag (unpacked) or at the next value inside a packed block. AElemTypeInfo is
+  needed only for enums, whose TValue must carry the concrete enum type rather
+  than a bare ordinal. }
+function ReadScalarElement(AReader: TProtoReader; AKind: TProtoFieldKind;
+  AElemTypeInfo: PTypeInfo; ASubmessageClass: TClass): TValue;
+var
+  LSubObj: TObject;
+begin
+  case AKind of
+    pkInt32:  Result := TValue.From<Integer>(AReader.ReadVarintAsInt32);
+    pkInt64:  Result := TValue.From<Int64>(AReader.ReadVarintAsInt64);
+    pkBool:   Result := TValue.From<Boolean>(AReader.ReadBool);
+    pkFloat:  Result := TValue.From<Single>(AReader.ReadFloat);
+    pkDouble: Result := TValue.From<Double>(AReader.ReadDouble);
+    pkEnum:   Result := TValue.FromOrdinal(AElemTypeInfo, AReader.ReadVarintAsInt32);
+    pkString: Result := TValue.From<string>(AReader.ReadString);
+    pkBytes:  Result := TValue.From<TBytes>(AReader.ReadBytes);
+    pkSubmessage:
+      begin
+        { Every element gets its own instance. The array owns them, so the
+          message class is responsible for freeing them in its destructor —
+          same contract as a scalar submessage property. }
+        LSubObj := ASubmessageClass.Create;
+        TProtoSerializer.Deserialize(AReader.ReadBytes, LSubObj);
+        { TValue.Make with the ELEMENT's type info, not TValue.From<TObject>.
+          The latter tags the value as plain TObject, and TValue.FromArray
+          then has to fit a TObject-typed element into a TArray<TConcrete> —
+          which fails outright on FPC and is merely unchecked on Delphi.
+          Make carries the declared class through. }
+        TValue.Make(@LSubObj, AElemTypeInfo, Result);
+      end;
+  else
+    raise EProtoRttiError.CreateFmt(
+      'ReadScalarElement: unhandled kind %d.', [Ord(AKind)]);
+  end;
+end;
+
 class procedure TProtoSerializer.Deserialize(const AData: TBytes; AObj: TObject);
 var
   LInfo:       TProtoTypeInfo;
@@ -425,12 +650,22 @@ var
   LEnumOrd:    Int32;
   LSubBytes:   TBytes;
   LSubObj:     TObject;
+  { M1c.2 — repeated fields accumulate across wire records rather than
+    overwriting. A sender may split one repeated field into several records
+    (and may mix packed with unpacked), so the array can only be built once
+    the whole message has been read. Keyed by tag. }
+  LRepeated:   TObjectDictionary<Integer, TList<TValue>>;
+  LAccum:      TList<TValue>;
+  LPackReader: TProtoReader;
+  LElems:      TArray<TValue>;
 begin
   if AObj = nil then
     raise EProtoRttiError.Create('Deserialize: AObj is nil');
 
   LInfo := THorseProtobufRtti.GetTypeInfo(AObj.ClassType);
 
+  LRepeated := TObjectDictionary<Integer, TList<TValue>>.Create([doOwnsValues]);
+  try
   LReader := TProtoReader.Create(AData);
   try
     while LReader.ReadTag(LTag, LWire) do
@@ -442,6 +677,43 @@ begin
         begin
           LField := LInfo.Fields[I];
           LFound := True;
+
+          // ── Repeated (M1c.2) ────────────────────────────────────────────
+          if LField.IsRepeated then
+          begin
+            if not LRepeated.TryGetValue(LTag, LAccum) then
+            begin
+              LAccum := TList<TValue>.Create;
+              LRepeated.Add(LTag, LAccum);
+            end;
+
+            { A packable kind arriving as pwLen is a PACKED block: one record
+              holding many tagless values. The same kind arriving as its
+              native wire type is a single unpacked element. proto3 requires
+              decoders to accept both no matter which the encoder chose, and
+              this is the branch that honours it.
+
+              Non-packable kinds (string/bytes/message) are also pwLen, hence
+              the IsPackableKind guard — without it every repeated string
+              would be misread as a packed block of varints. }
+            if IsPackableKind(LField.Kind) and (LWire = pwLen) then
+            begin
+              LPackReader := TProtoReader.Create(LReader.ReadLenBytes);
+              try
+                while not LPackReader.Eof do
+                  LAccum.Add(ReadScalarElement(LPackReader, LField.Kind,
+                    LField.ElemTypeInfo, LField.SubmessageClass));
+              finally
+                LPackReader.Free;
+              end;
+            end
+            else
+              LAccum.Add(ReadScalarElement(LReader, LField.Kind,
+                LField.ElemTypeInfo, LField.SubmessageClass));
+
+            Break;
+          end;
+
           case LField.Kind of
             pkInt32:
               begin
@@ -513,8 +785,24 @@ begin
       if not LFound then
         LReader.SkipField(LWire);
     end;
+
+    { M1c.2 — build each repeated property once, now that every record for it
+      has been seen. Assigning inside the read loop instead would make an array
+      split across records overwrite itself down to its final fragment. }
+    for I := 0 to Length(LInfo.Fields) - 1 do
+    begin
+      if not LInfo.Fields[I].IsRepeated then Continue;
+      if not LRepeated.TryGetValue(LInfo.Fields[I].Tag, LAccum) then Continue;
+
+      LElems := LAccum.ToArray;
+      LValue := TValue.FromArray(LInfo.Fields[I].ArrayTypeInfo, LElems);
+      LInfo.Fields[I].Prop.SetValue(AObj, LValue);
+    end;
   finally
     LReader.Free;
+  end;
+  finally
+    LRepeated.Free;
   end;
 end;
 

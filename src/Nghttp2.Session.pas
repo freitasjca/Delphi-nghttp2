@@ -125,8 +125,35 @@ type
     // response is composed; FResponseSubmitted alone would stop guarding it.
     FResponseStaged:    Boolean;
     FTrailerSubmitted:  Boolean;   // FIX-TRAILER-ORDER (2026-08-08) — guards single-shot submit_trailer call from within read_callback
+
+    // ─── Streaming state (STREAM-1) ───────────────────────────────────────
+    //  FStreamBuf is the hand-off point between the handler thread, which
+    //  appends, and the connection thread, whose read_callback drains. Both
+    //  sides take FStreamLock; nothing else in this class needs it because
+    //  nothing else is touched by two threads.
+    FStreaming:         Boolean;
+    FStreamEnded:       Boolean;
+    FStreamBuf:         TMemoryStream;
+    FStreamLock:        TCriticalSection;
+    FStreamDeferred:    Boolean;   // read_callback returned DEFERRED; needs resume
+    FStreamClosed:      Boolean;   // peer gone — set by on_stream_close
+
+    // ─── Incremental inbound state (INBOUND-1) ────────────────────────────
+    //  Mirror of the outbound streaming fields above, and deliberately a
+    //  SEPARATE buffer, lock and event rather than a reuse of them: a
+    //  bidirectional stream reads and writes at the same time, from different
+    //  threads, and sharing one lock across both directions would let a slow
+    //  reader stall the writer for no reason.
+    FInbound:        Boolean;
+    FInboundBuf:     TMemoryStream;
+    FInboundLock:    TCriticalSection;
+    FInboundReady:   TEvent;       // auto-reset; signalled on append and on end
+    FInboundEnded:   Boolean;      // END_STREAM seen on the request side
     procedure DoSubmitResponse;
     procedure DoSubmitTrailers;
+    // Connection thread only. Re-arms the data provider if the read_callback
+    // parked it and bytes have since arrived. Called from DrainPendingResponses.
+    procedure ResumeStreamingIfPending;
   public
     constructor Create(ASession: TNghttp2Session; AStreamId: Int32;
       const AConnection: INghttp2Connection);
@@ -141,6 +168,11 @@ type
     // Read-only accessor for the response data-provider read callback
     property ResponseBody:    TMemoryStream read FResponseBody;
     property ResponseStream:  TStream       read FResponseStream;
+    property Streaming:       Boolean       read FStreaming;
+
+    // Called by the session's on_stream_close callback so a streaming handler
+    // still producing data learns the peer is gone.
+    procedure MarkStreamClosed;
 
     { INghttp2Stream }
     function  GetHeader(const AName: string): string;
@@ -153,6 +185,26 @@ type
     procedure SetStatusCode(const AValue: Integer);
     procedure Send(const AData: TBytes);
     procedure SendStream(const ASource: TStream);
+
+    // ─── Streaming (STREAM-1) — see INghttp2Stream contract ───────────────
+    procedure BeginStreaming;
+    procedure PushStreamData(const AData: TBytes);
+    procedure EndStreaming;
+    function  IsStreamAlive: Boolean;
+
+    // ─── Incremental inbound (INBOUND-1) — see INghttp2Stream contract ────
+    function  InboundStreaming: Boolean;
+    function  ReadInbound(var ABuffer: TBytes; ACount: Integer;
+      ATimeoutMS: Integer): Integer;
+    function  InboundEnded: Boolean;
+
+    { Connection thread only. Called by the session before it dispatches a
+      stream the host has asked to receive incrementally. }
+    procedure BeginInbound;
+    { Connection thread only — fed from on_data_chunk_recv. }
+    procedure AppendInbound(const AData: PByte; ALen: NativeUInt);
+    { Connection thread only — END_STREAM seen on the request side. }
+    procedure MarkInboundEnded;
 
     // ─── HTTP/2 trailer (M2b) — see INghttp2Stream contract ───────────────
     procedure AddTrailer(const AName, AValue: string);
@@ -185,6 +237,26 @@ type
     same defect the thread pump had before FResponseReady existed. }
   TNghttp2WakeProc = procedure of object;
 
+  { INBOUND-1. Asked once per request, on HEADERS, before dispatch: should
+    this stream deliver its body incrementally instead of being accumulated?
+
+    The session cannot answer that itself — whether a path is a client-
+    streaming RPC or a WebSocket upgrade is the host's knowledge, not the
+    transport's. Leave it unset and every stream behaves exactly as before:
+    accumulate, dispatch on END_STREAM.
+
+    Returning True changes two things together, and they are inseparable: the
+    stream enters inbound mode, and dispatch moves from END_STREAM to HEADERS
+    — because a handler that must read the body as it arrives cannot be
+    started after the body has finished arriving.
+
+    Runs on the connection thread inside a callback. Keep it a cheap lookup.
+
+    Plain procedure type, NOT `of object` — same reason TNghttp2OnRequestProc
+    is: the host wires a unit-scope trampoline, and a method pointer here
+    would force a type mismatch at the assignment. }
+  TNghttp2ShouldStreamInboundProc = function(const AStream: INghttp2Stream): Boolean;
+
   TNghttp2Session = class
   private
     FNativeSession: Pnghttp2_session;
@@ -213,9 +285,18 @@ type
     // thread-safe and must not block — the engine's is a single write() to
     // an eventfd.
     FOnWorkStaged:    TNghttp2WakeProc;
+    { INBOUND-1 — see TNghttp2ShouldStreamInbound. Set by the host before the
+      pump starts; read on the connection thread only, so no lock. }
+    FOnShouldStreamInbound: TNghttp2ShouldStreamInboundProc;
     // Streams handed to a worker and not yet finished. The server's pump
     // keeps the connection alive and keeps polling while this is > 0.
     FPendingDispatch: Integer;   // TInterlocked-managed
+    // STREAM-1. Non-zero when some streaming stream has pushed data (or
+    // ended) that its parked data provider has not been re-armed for yet.
+    // Set from any thread, cleared by the connection thread in
+    // DrainPendingResponses. Interlocked rather than lock-held because
+    // PushStreamData is on the hot path of every streamed chunk.
+    FStreamDataReady: Integer;
     FShutdownNoticeSent: Boolean;
     FShutdownNoticeAt:   TDateTime;
     FFinalGoawaySent:    Boolean;
@@ -250,6 +331,11 @@ type
 
     // Blocks until a worker stages a response or ATimeoutMS elapses.
     procedure WaitForResponse(ATimeoutMS: Integer);
+
+    { STREAM-1. Called by a streaming stream — from any thread — when it has
+      appended data or ended. Flags the resume as owed and wakes the driver
+      through both signals, exactly as staging a response does. }
+    procedure NotifyStreamDataReady;
 
     // Streams currently owned by a worker thread.
     function PendingDispatch: Integer;
@@ -320,6 +406,11 @@ type
       a driver MUST do before it can be freed. }
     procedure SetWakeProc(const AProc: TNghttp2WakeProc);
 
+    { INBOUND-1. Set before Listen; unset means every stream accumulates its
+      body and dispatches on END_STREAM, which is the historical behaviour. }
+    property OnShouldStreamInboundProc: TNghttp2ShouldStreamInboundProc
+      read FOnShouldStreamInbound write FOnShouldStreamInbound;
+
     // Called by the cdecl trampolines below — these are the real handlers
     function DoBeginHeaders(const AFrame: Pnghttp2_frame): Integer;
     function DoHeader(const AFrame: Pnghttp2_frame;
@@ -381,6 +472,69 @@ begin
     invocation) still works and is preserved — it's the historical path
     validated by the 94/94 nghttp2 test suite. }
   LHasTrailers := (LState.FResponseTrailers <> nil) and (LState.FResponseTrailers.Count > 0);
+
+  { STREAM-1: open-ended body. Unlike the two branches below, the total size
+    is unknown — the handler is still producing. Three outcomes:
+
+      bytes buffered  → hand them over, no EOF (more may follow)
+      empty, ended    → EOF (plus the trailer two-step when trailers exist)
+      empty, running  → NGHTTP2_ERR_DEFERRED — park the provider
+
+    DEFERRED is the reason this needs nghttp2_session_resume_data: once
+    parked, nghttp2 stops asking until explicitly re-armed. FStreamDeferred
+    records that a resume is owed, and PushStreamData wakes the connection
+    thread to pay it (nghttp2_* is session-affine and a handler may be on a
+    worker thread). Missing that wake-up is a permanent stall, not a delay. }
+  if LState.FStreaming then
+  begin
+    LState.FStreamLock.Enter;
+    try
+      { Re-read under the lock rather than trusting the value computed above.
+        A streaming handler may add trailers at any point up to EndStreaming
+        (gRPC only knows its status once it has finished producing), so the
+        snapshot taken before entering this branch can be stale by now. }
+      LHasTrailers := (LState.FResponseTrailers <> nil)
+                      and (LState.FResponseTrailers.Count > 0);
+
+      LRemaining := NativeInt(LState.FStreamBuf.Size) - NativeInt(LState.FStreamBuf.Position);
+
+      if LRemaining <= 0 then
+      begin
+        if not LState.FStreamEnded then
+        begin
+          LState.FStreamDeferred := True;
+          Exit(NGHTTP2_ERR_DEFERRED);
+        end;
+
+        if LHasTrailers then
+        begin
+          data_flags^ := NGHTTP2_DATA_FLAG_EOF or NGHTTP2_DATA_FLAG_NO_END_STREAM;
+          LState.DoSubmitTrailers;   // FIX-TRAILER-ORDER
+        end
+        else
+          data_flags^ := NGHTTP2_DATA_FLAG_EOF;
+        Exit(0);
+      end;
+
+      LToRead := LRemaining;
+      if NativeInt(length) < LToRead then
+        LToRead := NativeInt(length);
+      LToRead := LState.FStreamBuf.Read(buf^, LToRead);
+
+      { Reclaim the buffer once fully drained. Without this an SSE stream that
+        runs for hours grows a TMemoryStream by every byte it ever sent. }
+      if LState.FStreamBuf.Position >= LState.FStreamBuf.Size then
+      begin
+        LState.FStreamBuf.Clear;
+        LState.FStreamBuf.Position := 0;
+      end;
+
+      Result := LToRead;
+    finally
+      LState.FStreamLock.Leave;
+    end;
+    Exit;
+  end;
 
   if LState.ResponseStream <> nil then
   begin
@@ -514,6 +668,20 @@ begin
   FResponseSubmitted := False;
   FResponseStaged    := False;
   FTrailerSubmitted  := False;
+  FStreaming         := False;
+  FStreamEnded       := False;
+  FStreamDeferred    := False;
+  FStreamClosed      := False;
+  FStreamBuf         := TMemoryStream.Create;
+  FStreamLock        := TCriticalSection.Create;
+  FInbound           := False;
+  FInboundEnded      := False;
+  FInboundBuf        := TMemoryStream.Create;
+  FInboundLock       := TCriticalSection.Create;
+  { Auto-reset: each SetEvent releases exactly one waiter, and ReadInbound
+    re-checks the buffer under the lock anyway, so a missed or spurious wake
+    costs one extra loop rather than correctness. }
+  FInboundReady      := TEvent.Create(nil, {ManualReset=}False, {InitialState=}False, '');
 end;
 
 destructor TNghttp2StreamState.Destroy;
@@ -523,6 +691,11 @@ begin
   FResponseHeaders.Free;
   FResponseTrailers.Free;   // nil-safe (M2b)
   FResponseBody.Free;
+  FStreamBuf.Free;
+  FStreamLock.Free;
+  FInboundBuf.Free;
+  FInboundLock.Free;
+  FInboundReady.Free;
   // FResponseStream is non-owning; do not free
   // FConnection is an interface — released automatically
   inherited;
@@ -530,8 +703,37 @@ end;
 
 // ── M2b: HTTP/2 trailer (see INghttp2Stream.AddTrailer) ────────────────────
 
+{ Trailers must normally be complete before the response is staged, because a
+  buffered response is submitted immediately and the trailer list is read at
+  that moment.
+
+  A STREAMING response is the exception, and necessarily so: gRPC carries its
+  status as a trailer, and a server-streaming handler cannot know that status
+  until it has finished producing. Late trailers are safe here only because
+  FIX-TRAILER-ORDER moved DoSubmitTrailers into the read_callback's EOF branch
+  — for a stream, EOF is reached after EndStreaming, so the list is read well
+  after the handler has had its say. Adding one after EndStreaming is still too
+  late and is refused. }
 procedure TNghttp2StreamState.AddTrailer(const AName, AValue: string);
 begin
+  if FStreaming then
+  begin
+    if FStreamEnded then
+      raise Exception.Create('AddTrailer: trailers must be added BEFORE EndStreaming');
+
+    { Under the stream lock: the handler adds from a worker thread while the
+      connection thread's read_callback reads the same list at EOF. }
+    FStreamLock.Enter;
+    try
+      if FResponseTrailers = nil then
+        FResponseTrailers := TStringList.Create;
+      FResponseTrailers.Add(LowerCase(AName) + '=' + AValue);
+    finally
+      FStreamLock.Leave;
+    end;
+    Exit;
+  end;
+
   if FResponseStaged then
     raise Exception.Create('AddTrailer: trailers must be added BEFORE Send/SendStream');
   if FResponseTrailers = nil then
@@ -637,6 +839,232 @@ begin
   FResponseStream := ASource;
   FResponseStaged := True;
   FSession.SubmitOrDefer(Self);
+end;
+
+// ── STREAM-1: open-ended response body ─────────────────────────────────────
+
+{ Stages the response the same way Send does — the difference is entirely in
+  the read_callback, which finds FStreaming set and keeps the provider hungry
+  instead of reading a finished buffer. Sharing FResponseStaged means Send and
+  BeginStreaming exclude each other for free: whichever runs first wins. }
+procedure TNghttp2StreamState.BeginStreaming;
+begin
+  if FResponseStaged then Exit;
+  FResponseBody.Clear;
+  FResponseStream := nil;
+  FStreaming      := True;
+  FResponseStaged := True;
+  FSession.SubmitOrDefer(Self);
+end;
+
+{ Worker-thread safe. Appends at the end without disturbing the read position
+  the callback is draining from, then asks the connection thread for a resume —
+  the callback may already have parked the provider, and only that thread may
+  call nghttp2_session_resume_data. }
+procedure TNghttp2StreamState.PushStreamData(const AData: TBytes);
+begin
+  if (not FStreaming) or FStreamEnded or (Length(AData) = 0) then Exit;
+
+  FStreamLock.Enter;
+  try
+    FStreamBuf.Seek(0, soEnd);
+    FStreamBuf.WriteBuffer(AData[0], Length(AData));
+    FStreamBuf.Seek(0, soBeginning);
+  finally
+    FStreamLock.Leave;
+  end;
+
+  FSession.NotifyStreamDataReady;
+end;
+
+procedure TNghttp2StreamState.EndStreaming;
+begin
+  if not FStreaming then Exit;
+
+  FStreamLock.Enter;
+  try
+    FStreamEnded := True;
+  finally
+    FStreamLock.Leave;
+  end;
+
+  { Same wake-up as PushStreamData: without it a stream whose handler ends
+    while the provider is parked never emits its END_STREAM and the client
+    waits forever. }
+  FSession.NotifyStreamDataReady;
+end;
+
+function TNghttp2StreamState.IsStreamAlive: Boolean;
+begin
+  Result := not FStreamClosed;
+end;
+
+// ── INBOUND-1: incremental request body ────────────────────────────────────
+
+procedure TNghttp2StreamState.BeginInbound;
+begin
+  { Refused outside async mode, and this is a hard requirement rather than a
+    preference. ReadInbound blocks; in synchronous mode the handler runs ON
+    the connection thread, which is the only thread that can deliver the bytes
+    it would be waiting for. That deadlocks the connection outright, so fail
+    loudly at setup instead of hanging later with no clue why. }
+  if not FSession.FAsyncMode then
+    raise Exception.Create(
+      'BeginInbound: incremental inbound requires async dispatch — ' +
+      'ReadInbound blocks, and in synchronous mode the handler is the ' +
+      'connection thread that would have to feed it.');
+
+  FInbound := True;
+end;
+
+function TNghttp2StreamState.InboundStreaming: Boolean;
+begin
+  Result := FInbound;
+end;
+
+function TNghttp2StreamState.InboundEnded: Boolean;
+begin
+  Result := FInboundEnded;
+end;
+
+{ Connection thread. Appends at the end without moving the read position the
+  consumer is draining from — the same discipline PushStreamData uses in the
+  other direction. }
+procedure TNghttp2StreamState.AppendInbound(const AData: PByte; ALen: NativeUInt);
+var
+  LPos: Int64;
+begin
+  if (ALen = 0) or (AData = nil) then Exit;
+
+  FInboundLock.Enter;
+  try
+    LPos := FInboundBuf.Position;
+    FInboundBuf.Seek(0, soEnd);
+    FInboundBuf.WriteBuffer(AData^, ALen);
+    FInboundBuf.Position := LPos;
+  finally
+    FInboundLock.Leave;
+  end;
+
+  FInboundReady.SetEvent;
+end;
+
+procedure TNghttp2StreamState.MarkInboundEnded;
+begin
+  FInboundLock.Enter;
+  try
+    FInboundEnded := True;
+  finally
+    FInboundLock.Leave;
+  end;
+
+  { Wake any reader parked on the event. Without this a handler blocked in
+    ReadInbound when the peer half-closes waits out its full timeout before
+    learning the stream is done — turning a clean end into a stall. }
+  FInboundReady.SetEvent;
+end;
+
+{ Worker thread. Loops rather than waiting once: the event is auto-reset and
+  may have been consumed by a previous call, and WaitFor can return early, so
+  the buffer state under the lock is the authority and the event only a hint
+  that it is worth re-checking. }
+function TNghttp2StreamState.ReadInbound(var ABuffer: TBytes; ACount: Integer;
+  ATimeoutMS: Integer): Integer;
+var
+  LAvail:    Int64;
+  LToRead:   Integer;
+  LDeadline: TDateTime;
+  LWaitMS:   Integer;
+  LEnded:    Boolean;
+begin
+  SetLength(ABuffer, 0);
+  if ACount <= 0 then Exit(0);
+
+  LDeadline := IncMilliSecond(Now, ATimeoutMS);
+
+  while True do
+  begin
+    FInboundLock.Enter;
+    try
+      LAvail := FInboundBuf.Size - FInboundBuf.Position;
+      LEnded := FInboundEnded;
+
+      if LAvail > 0 then
+      begin
+        LToRead := ACount;
+        if LAvail < LToRead then
+          LToRead := Integer(LAvail);
+
+        SetLength(ABuffer, LToRead);
+        FInboundBuf.ReadBuffer(ABuffer[0], LToRead);
+
+        { Reclaim once drained. A long-lived bidirectional stream would
+          otherwise grow this buffer by every byte it ever received. }
+        if FInboundBuf.Position >= FInboundBuf.Size then
+        begin
+          FInboundBuf.Clear;
+          FInboundBuf.Position := 0;
+        end;
+
+        Exit(LToRead);
+      end;
+
+      { Nothing buffered AND the peer has half-closed: genuine end of stream.
+        Order matters — the availability check comes first, because ended can
+        be true while bytes are still queued. }
+      if LEnded then
+        Exit(0);
+    finally
+      FInboundLock.Leave;
+    end;
+
+    if FStreamClosed then
+      Exit(0);   // connection gone — treat as end rather than spin to timeout
+
+    LWaitMS := MilliSecondsBetween(Now, LDeadline);
+    if (LWaitMS <= 0) or (Now >= LDeadline) then
+      Exit(-1);
+    if LWaitMS > 50 then
+      LWaitMS := 50;   // bounded so FStreamClosed is re-checked promptly
+
+    FInboundReady.WaitFor(LWaitMS);
+  end;
+end;
+
+procedure TNghttp2StreamState.MarkStreamClosed;
+begin
+  FStreamClosed := True;
+
+  { Wake a reader parked in ReadInbound. It re-checks FStreamClosed on every
+    loop, so it would notice within one poll tick anyway — but a peer that
+    vanishes mid-stream is exactly when a handler should stop promptly, and
+    the event costs nothing. Safe before FInboundReady exists only because
+    on_stream_close cannot fire before the constructor has run. }
+  if FInboundReady <> nil then
+    FInboundReady.SetEvent;
+end;
+
+{ Connection thread only. Re-arms a provider the read_callback parked, but only
+  once there is something for it to find — resuming into an empty buffer just
+  re-parks it. }
+procedure TNghttp2StreamState.ResumeStreamingIfPending;
+var
+  LHasWork: Boolean;
+begin
+  if (not FStreaming) or (not FResponseSubmitted) or (not FStreamDeferred) then Exit;
+
+  FStreamLock.Enter;
+  try
+    LHasWork := FStreamEnded or
+                (NativeInt(FStreamBuf.Size) - NativeInt(FStreamBuf.Position) > 0);
+    if LHasWork then
+      FStreamDeferred := False;
+  finally
+    FStreamLock.Leave;
+  end;
+
+  if LHasWork then
+    nghttp2_session_resume_data(FSession.FNativeSession, FStreamId);
 end;
 
 procedure TNghttp2StreamState.SubmitStagedResponse;
@@ -822,12 +1250,40 @@ end;
 function TNghttp2Session.HasPendingResponses: Boolean;
 begin
   if not FAsyncMode then Exit(False);
+
+  { A streaming chunk is pending work in exactly the sense this predicate
+    exists for: the pump must not settle into a blocking wait while a resume
+    is owed, or the chunk sits until the next poll tick. }
+  if TInterlocked.CompareExchange(FStreamDataReady, 0, 0) <> 0 then Exit(True);
+
   FQueueLock.Enter;
   try
     Result := FPendingQueue.Count > 0;
   finally
     FQueueLock.Leave;
   end;
+end;
+
+procedure TNghttp2Session.NotifyStreamDataReady;
+var
+  LWake: TNghttp2WakeProc;
+begin
+  TInterlocked.Exchange(FStreamDataReady, 1);
+
+  { Synchronous mode has no pump to wake: the caller IS the connection thread,
+    inside a callback, so the resume happens on its own next drain. }
+  if not FAsyncMode then Exit;
+
+  FQueueLock.Enter;
+  try
+    LWake := FOnWorkStaged;   // copied under the lock — see SubmitOrDefer
+  finally
+    FQueueLock.Leave;
+  end;
+
+  FResponseReady.SetEvent;
+  if Assigned(LWake) then
+    LWake;
 end;
 
 procedure TNghttp2Session.WaitForResponse(ATimeoutMS: Integer);
@@ -966,10 +1422,24 @@ end;
 
 function TNghttp2Session.DrainPendingResponses: Boolean;
 var
-  LItem: INghttp2StreamInternal;
+  LItem:   INghttp2StreamInternal;
+  LStream: TNghttp2StreamState;
 begin
   Result := False;
   if not FAsyncMode then Exit;
+
+  { STREAM-1. Pay any resumes owed before draining new submissions. Clearing
+    the flag first is deliberate: a push landing during the sweep re-sets it
+    and earns another pass, whereas clearing afterwards would swallow it. }
+  if TInterlocked.Exchange(FStreamDataReady, 0) <> 0 then
+  begin
+    for LStream in FStreams.Values do
+      if LStream.Streaming then
+      begin
+        LStream.ResumeStreamingIfPending;
+        Result := True;
+      end;
+  end;
 
   // Streams drained on the previous pass have had their DATA frames pulled by
   // now (the caller ran ExtractOutgoing to completion after that drain), so
@@ -1087,19 +1557,66 @@ end;
 
 function TNghttp2Session.DoFrameRecv(const AFrame: Pnghttp2_frame): Integer;
 var
-  LState: TNghttp2StreamState;
+  LState:    TNghttp2StreamState;
+  LEndOfReq: Boolean;
 begin
   Result := 0;
 
   case AFrame^.hd.ftype of
     NGHTTP2_HEADERS, NGHTTP2_DATA:
       begin
-        // Dispatch when END_STREAM arrives — client has finished sending
-        if (AFrame^.hd.flags and NGHTTP2_FLAG_END_STREAM) <> 0 then
+        LEndOfReq := (AFrame^.hd.flags and NGHTTP2_FLAG_END_STREAM) <> 0;
+
+        { Look the stream up only when there is something to do with it. With
+          no inbound hook installed that is END_STREAM alone, exactly as before
+          — DoDataChunk already performs one lookup per DATA frame, and a
+          second one here would double that cost on every large upload for no
+          benefit. }
+        if not (LEndOfReq
+                or ((AFrame^.hd.ftype = NGHTTP2_HEADERS)
+                    and Assigned(FOnShouldStreamInbound))) then
+          Exit;
+
+        if not FStreams.TryGetValue(AFrame^.hd.stream_id, LState) then Exit;
+
+        { INBOUND-1. Decided once, on HEADERS, and only for a stream not
+          already in inbound mode — a client-streaming request sends many DATA
+          frames and must not be dispatched again for each one. }
+        if (AFrame^.hd.ftype = NGHTTP2_HEADERS)
+           and (not LState.FInbound)
+           and Assigned(FOnShouldStreamInbound) then
         begin
-          if FStreams.TryGetValue(AFrame^.hd.stream_id, LState) then
+          if FOnShouldStreamInbound(LState as INghttp2Stream) then
+          begin
+            LState.BeginInbound;
+
+            { HEADERS may itself carry END_STREAM — a client-streaming call
+              that sends no messages at all. Mark before dispatching so the
+              handler's first ReadInbound returns end-of-stream rather than
+              blocking for a body that will never come. }
+            if LEndOfReq then
+              LState.MarkInboundEnded;
+
             if Assigned(FOnRequest) then
               FOnRequest(LState as INghttp2Stream);
+            Exit;
+          end;
+        end;
+
+        if LEndOfReq then
+        begin
+          { In inbound mode the handler is already running; END_STREAM closes
+            the request side and wakes it, but must NOT dispatch a second
+            time. }
+          if LState.FInbound then
+          begin
+            LState.MarkInboundEnded;
+            Exit;
+          end;
+
+          // Historical path: client has finished sending, dispatch now.
+          if Assigned(FOnRequest) then
+            FOnRequest(LState as INghttp2Stream);
         end;
       end;
   end;
@@ -1111,12 +1628,29 @@ var
   LState: TNghttp2StreamState;
 begin
   if FStreams.TryGetValue(AStreamId, LState) then
-    LState.AppendRequestBody(AData, ALen);
+  begin
+    { INBOUND-1. In inbound mode the handler is already running and waiting on
+      these bytes, so they go to the queue it drains rather than to the request
+      body it will never read. }
+    if LState.FInbound then
+      LState.AppendInbound(AData, ALen)
+    else
+      LState.AppendRequestBody(AData, ALen);
+  end;
   Result := 0;
 end;
 
 function TNghttp2Session.DoStreamClose(AStreamId: Int32; AErrorCode: UInt32): Integer;
+var
+  LState: TNghttp2StreamState;
 begin
+  { STREAM-1. A streaming handler is a loop, and the only thing that ends it
+    short of its own completion is IsStreamAlive going False. Mark before
+    dropping the reference: after the Remove below the stream is unreachable
+    from here, and a handler still producing would never learn the peer left. }
+  if FStreams.TryGetValue(AStreamId, LState) then
+    LState.MarkStreamClosed;
+
   // Drops the session's reference rather than destroying the stream. In
   // synchronous mode that is the only reference and the stream dies here,
   // exactly as before. In async mode this callback can fire while a worker is

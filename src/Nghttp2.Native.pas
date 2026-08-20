@@ -406,6 +406,15 @@ var
     stream_id: Int32;
     const nva: Pnghttp2_nv; nvlen: NativeUInt): Integer; cdecl;
 
+  //  Re-arms a data_provider whose read_callback previously returned
+  //  NGHTTP2_ERR_DEFERRED. Until this is called nghttp2 will not ask the
+  //  stream for more DATA, so a streaming response stalls permanently.
+  //  Session-affine like every other nghttp2_* entry point: call it only
+  //  from the thread that owns the session.
+  nghttp2_session_resume_data: function(
+    session:   Pnghttp2_session;
+    stream_id: Int32): Integer; cdecl;
+
   // ─── Per-stream user data ──────────────────────────────────────────────
   nghttp2_session_set_stream_user_data: function(
     session:           Pnghttp2_session;
@@ -591,6 +600,8 @@ begin
                  Pointer(@nghttp2_submit_ping)) then Exit;
   if not GetFrom('nghttp2_submit_trailer',
                  Pointer(@nghttp2_submit_trailer)) then Exit;
+  if not GetFrom('nghttp2_session_resume_data',
+                 Pointer(@nghttp2_session_resume_data)) then Exit;
 
   // Per-stream user data
   if not GetFrom('nghttp2_session_set_stream_user_data',

@@ -89,6 +89,18 @@ Find the output:
 dir /s /b build64\nghttp2.dll
 ```
 
+> **You do not need the "x64 Native Tools Command Prompt".** The Visual Studio
+> generator with `-A x64` targets 64-bit on its own, from an ordinary prompt or
+> from VS Code's terminal. The Developer Command Prompt is only worth opening
+> when you need MSVC environment variables available to *other* commands in the
+> same session.
+
+> **Do not mix MSVC and MinGW.** Build nghttp2 with the same toolchain family as
+> the application that will load it: MSVC for a Delphi or Visual Studio binary,
+> MinGW/MSYS2 only if you specifically need a MinGW DLL. A mismatch links and
+> loads, then fails in ways that look like corruption rather than a toolchain
+> problem.
+
 ### Win32 (32-bit)
 
 ```bat

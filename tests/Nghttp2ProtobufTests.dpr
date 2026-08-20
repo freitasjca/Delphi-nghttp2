@@ -156,11 +156,79 @@ type
     property address: TAddress read Faddress write Faddress;
   end;
 
+  // ── M1c.2 additions: repeated fields ──────────────────────────────────────
+  //  One repeated field per encoding family, because the two families are
+  //  framed completely differently on the wire and a test covering only one
+  //  proves nothing about the other:
+  //    packed   — numerics collapse into ONE length-delimited record
+  //    unpacked — string/bytes/message repeat the tag per element
+  //  `payload` is deliberately a plain TBytes, not repeated: proto3 `bytes` is
+  //  a scalar, and this field is what catches a regression that starts
+  //  treating TArray<Byte> as `repeated uint8`.
+
+  [TGrpcMessage]
+  TRepeatedMessage = class
+  private
+    Fids:       TArray<Integer>;
+    Fscores:    TArray<Double>;
+    Fflags:     TArray<Boolean>;
+    Fstates:    TArray<TStatusCode>;
+    Ftags:      TArray<string>;
+    Faddresses: TArray<TAddress>;
+    Fpayload:   TBytes;
+  public
+    destructor Destroy; override;
+  published
+    [TProtoMember(1)]
+    property ids: TArray<Integer> read Fids write Fids;             // packed varint
+    [TProtoMember(2)]
+    property scores: TArray<Double> read Fscores write Fscores;     // packed fixed64
+    [TProtoMember(3)]
+    property flags: TArray<Boolean> read Fflags write Fflags;       // packed varint
+    [TProtoMember(4)]
+    property states: TArray<TStatusCode> read Fstates write Fstates; // packed enum
+    [TProtoMember(5)]
+    property tags: TArray<string> read Ftags write Ftags;           // unpacked LEN
+    [TProtoMember(6)]
+    property addresses: TArray<TAddress> read Faddresses write Faddresses; // unpacked LEN
+    [TProtoMember(7)]
+    property payload: TBytes read Fpayload write Fpayload;          // scalar bytes
+  end;
+
+  { One repeated field and nothing else, for the byte-exact wire assertions.
+
+    TRepeatedMessage cannot serve there: this codec emits EVERY scalar field
+    unconditionally, including ones holding their proto3 default, so its empty
+    `payload: TBytes` contributes a stray tag+len(0) — two bytes that have
+    nothing to do with repeated framing but land in any byte count taken over
+    the whole message. Isolating the field under test is what makes the
+    assertion about packing rather than about the rest of the class. }
+  [TGrpcMessage]
+  TPackedOnlyMessage = class
+  private
+    Fids: TArray<Integer>;
+  published
+    [TProtoMember(1)]
+    property ids: TArray<Integer> read Fids write Fids;
+  end;
+
 // ── Destructor for TAdvancedMessage — implementation outside type block ─────
 
 destructor TAdvancedMessage.Destroy;
 begin
   Faddress.Free;
+  inherited;
+end;
+
+{ The deserializer allocates one TAddress per repeated element and hands
+  ownership to the array, so the message must free them — the same contract a
+  scalar submessage property carries. }
+destructor TRepeatedMessage.Destroy;
+var
+  I: Integer;
+begin
+  for I := 0 to High(Faddresses) do
+    Faddresses[I].Free;
   inherited;
 end;
 
@@ -442,6 +510,258 @@ begin
   end;
 end;
 
+// ── M1c.2 — repeated fields ────────────────────────────────────────────────
+//
+//  Array literals are built through these open-array helpers rather than
+//  `TArray<T>.Create(...)`. The rest of this file already builds every array
+//  with SetLength for the same reason: the dynamic-array constructor form is
+//  a Delphi idiom whose generic spelling is not reliably available under FPC
+//  {$MODE DELPHI}, and this suite has to pass on both compilers. An open-array
+//  parameter is plain Object Pascal and behaves identically on each.
+
+function ArrInt(const A: array of Integer): TArray<Integer>;
+var I: Integer;
+begin
+  Result := nil;   // silences FPC's uninitialised-result warning
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do Result[I] := A[I];
+end;
+
+function ArrDbl(const A: array of Double): TArray<Double>;
+var I: Integer;
+begin
+  Result := nil;   // silences FPC's uninitialised-result warning
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do Result[I] := A[I];
+end;
+
+function ArrBool(const A: array of Boolean): TArray<Boolean>;
+var I: Integer;
+begin
+  Result := nil;   // silences FPC's uninitialised-result warning
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do Result[I] := A[I];
+end;
+
+function ArrStr(const A: array of string): TArray<string>;
+var I: Integer;
+begin
+  Result := nil;   // silences FPC's uninitialised-result warning
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do Result[I] := A[I];
+end;
+
+function ArrStatus(const A: array of TStatusCode): TArray<TStatusCode>;
+var I: Integer;
+begin
+  Result := nil;   // silences FPC's uninitialised-result warning
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do Result[I] := A[I];
+end;
+
+function ArrBytes(const A: array of Byte): TBytes;
+var I: Integer;
+begin
+  Result := nil;   // silences FPC's uninitialised-result warning
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do Result[I] := A[I];
+end;
+
+procedure TestRepeatedRoundTrip;
+var
+  LSrc, LDst: TRepeatedMessage;
+  LBytes:     TBytes;
+  I:          Integer;
+  LOk:        Boolean;
+begin
+  Section('09  Repeated fields — round-trip (packed + unpacked)');
+
+  LSrc := TRepeatedMessage.Create;
+  LDst := TRepeatedMessage.Create;
+  try
+    LSrc.ids    := ArrInt([1, -2, 300, 0, MaxInt]);
+    LSrc.scores := ArrDbl([1.5, -2.25, 1E10]);
+    LSrc.flags  := ArrBool([True, False, True]);
+    LSrc.states := ArrStatus([scRetry, scOk, scPending]);
+    LSrc.tags   := ArrStr(['alpha', '', 'ünïcødé', 'delta']);
+    LSrc.payload := ArrBytes([9, 8, 7]);
+
+    SetLength(LSrc.Faddresses, 2);
+    LSrc.Faddresses[0] := TAddress.Create;
+    LSrc.Faddresses[0].city := 'Lisboa';
+    LSrc.Faddresses[0].zip  := 1000;
+    LSrc.Faddresses[1] := TAddress.Create;
+    LSrc.Faddresses[1].city := 'Porto';
+    LSrc.Faddresses[1].zip  := 4000;
+
+    LBytes := TProtoSerializer.Serialize(LSrc);
+    TProtoSerializer.Deserialize(LBytes, LDst);
+
+    // ── packed numerics ────────────────────────────────────────────────────
+    Check('ids length 5', Length(LDst.ids) = 5, IntToStr(Length(LDst.ids)));
+    LOk := Length(LDst.ids) = 5;
+    if LOk then
+      for I := 0 to High(LSrc.ids) do
+        LOk := LOk and (LDst.ids[I] = LSrc.ids[I]);
+    Check('ids values match (incl. negative + zero + MaxInt)', LOk);
+
+    Check('scores length 3', Length(LDst.scores) = 3, IntToStr(Length(LDst.scores)));
+    LOk := Length(LDst.scores) = 3;
+    if LOk then
+      for I := 0 to High(LSrc.scores) do
+        LOk := LOk and (Abs(LDst.scores[I] - LSrc.scores[I]) < 1E-9);
+    Check('scores values match', LOk);
+
+    Check('flags length 3', Length(LDst.flags) = 3, IntToStr(Length(LDst.flags)));
+    Check('flags values match',
+      (Length(LDst.flags) = 3) and LDst.flags[0] and (not LDst.flags[1]) and LDst.flags[2]);
+
+    Check('states length 3', Length(LDst.states) = 3, IntToStr(Length(LDst.states)));
+    Check('states values match',
+      (Length(LDst.states) = 3) and (LDst.states[0] = scRetry)
+      and (LDst.states[1] = scOk) and (LDst.states[2] = scPending));
+
+    // ── unpacked LEN-per-element ───────────────────────────────────────────
+    // The empty string at index 1 matters: it is a zero-length LEN record, the
+    // element most likely to be dropped by a decoder that treats "no bytes" as
+    // "no element" — which would silently shift every later index.
+    Check('tags length 4', Length(LDst.tags) = 4, IntToStr(Length(LDst.tags)));
+    LOk := Length(LDst.tags) = 4;
+    if LOk then
+      for I := 0 to High(LSrc.tags) do
+        LOk := LOk and (LDst.tags[I] = LSrc.tags[I]);
+    Check('tags values match (incl. empty string + non-ASCII)', LOk);
+
+    Check('addresses length 2', Length(LDst.addresses) = 2, IntToStr(Length(LDst.addresses)));
+    Check('addresses[0] round-tripped',
+      (Length(LDst.addresses) = 2) and (LDst.addresses[0].city = 'Lisboa')
+      and (LDst.addresses[0].zip = 1000));
+    Check('addresses[1] round-tripped',
+      (Length(LDst.addresses) = 2) and (LDst.addresses[1].city = 'Porto')
+      and (LDst.addresses[1].zip = 4000));
+
+    // ── the regression guard ───────────────────────────────────────────────
+    Check('payload (TBytes) still a scalar, not repeated',
+      (Length(LDst.payload) = 3) and (LDst.payload[0] = 9)
+      and (LDst.payload[1] = 8) and (LDst.payload[2] = 7));
+  finally
+    LSrc.Free;
+    LDst.Free;
+  end;
+end;
+
+procedure TestRepeatedEmptyAndWire;
+var
+  LSrc, LDst: TPackedOnlyMessage;
+  LFull:      TRepeatedMessage;
+  LBytes:     TBytes;
+  LW:         TProtoWriter;
+  LPacked:    TBytes;
+begin
+  Section('10  Repeated fields — empty arrays + wire shape');
+
+  { An empty repeated field emits NOTHING — proto3 cannot distinguish "empty"
+    from "absent", so any byte here is waste. Measured on TPackedOnlyMessage
+    so the count reflects only the repeated field; see that class's comment
+    for why the fuller message cannot answer this question. }
+  LSrc := TPackedOnlyMessage.Create;
+  LDst := TPackedOnlyMessage.Create;
+  try
+    LBytes := TProtoSerializer.Serialize(LSrc);
+    Check('empty repeated field emits 0 bytes',
+      Length(LBytes) = 0, IntToStr(Length(LBytes)));
+
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('empty round-trip leaves ids empty', Length(LDst.ids) = 0);
+  finally
+    LSrc.Free;
+    LDst.Free;
+  end;
+
+  // Same question against the full message, which additionally has scalars.
+  LFull := TRepeatedMessage.Create;
+  try
+    TProtoSerializer.Deserialize(TProtoSerializer.Serialize(LFull), LFull);
+    Check('empty round-trip leaves tags empty', Length(LFull.tags) = 0);
+    Check('empty round-trip leaves addresses empty', Length(LFull.addresses) = 0);
+  finally
+    LFull.Free;
+  end;
+
+  { Packed framing, byte-exact rather than by round-trip. A codec emitting one
+    tagged varint per element would round-trip perfectly against itself and
+    still be wrong against every other proto3 stack — only the byte shape
+    catches that. Expected: tag(1,pwLen) len(3) 01 02 03 = 5 bytes. }
+  LSrc := TPackedOnlyMessage.Create;
+  try
+    LSrc.ids := ArrInt([1, 2, 3]);
+    LBytes := TProtoSerializer.Serialize(LSrc);
+
+    LW := TProtoWriter.Create;
+    try
+      LPacked := ArrBytes([1, 2, 3]);       // three single-byte varints
+      LW.WriteSubmessageField(1, LPacked);  // tag 1, pwLen, len 3
+      Check('packed ids wire bytes = tag+len+3 varints',
+        BytesEqual(LBytes, LW.ToBytes),
+        Format('got [%s], expected [%s]',
+          [BytesToHex(LBytes), BytesToHex(LW.ToBytes)]));
+    finally
+      LW.Free;
+    end;
+  finally
+    LSrc.Free;
+  end;
+end;
+
+procedure TestRepeatedAcceptsUnpackedNumeric;
+var
+  LW:   TProtoWriter;
+  LW2:  TProtoWriter;   // second message — a separate variable so neither
+                        // writer is ever reassigned inside its own try/finally
+  LDst: TRepeatedMessage;
+begin
+  Section('11  Repeated numerics decode from UNPACKED wire form');
+
+  { proto3 requires a decoder to accept both forms for packable types, whatever
+    the encoder chose. Nothing we emit exercises this — our writer always packs
+    — so the input is hand-built as three separately tagged varints, which is
+    what an older or differently-configured peer sends. Without this the
+    decoder could reject every such peer and the suite would stay green. }
+  LW  := TProtoWriter.Create;
+  LW2 := TProtoWriter.Create;
+  LDst := TRepeatedMessage.Create;
+  try
+    LW.WriteInt32Field(1, 10);
+    LW.WriteInt32Field(1, 20);
+    LW.WriteInt32Field(1, 30);
+
+    TProtoSerializer.Deserialize(LW.ToBytes, LDst);
+
+    Check('unpacked ids length 3', Length(LDst.ids) = 3, IntToStr(Length(LDst.ids)));
+    Check('unpacked ids values match',
+      (Length(LDst.ids) = 3) and (LDst.ids[0] = 10)
+      and (LDst.ids[1] = 20) and (LDst.ids[2] = 30));
+
+    // Split across records: a sender may emit a repeated field in fragments,
+    // packed or not. Accumulation must append, never overwrite.
+    LDst.ids := nil;
+    LW2.WriteSubmessageField(1, ArrBytes([1, 2]));   // packed   [1,2]
+    LW2.WriteInt32Field(1, 3);                       // unpacked  3
+    LW2.WriteSubmessageField(1, ArrBytes([4]));      // packed   [4]
+
+    TProtoSerializer.Deserialize(LW2.ToBytes, LDst);
+    Check('mixed packed/unpacked fragments accumulate to 4 elements',
+      Length(LDst.ids) = 4, IntToStr(Length(LDst.ids)));
+    Check('fragment order preserved [1,2,3,4]',
+      (Length(LDst.ids) = 4) and (LDst.ids[0] = 1) and (LDst.ids[1] = 2)
+      and (LDst.ids[2] = 3) and (LDst.ids[3] = 4));
+  finally
+    LW.Free;
+    LW2.Free;
+    LDst.Free;
+  end;
+end;
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 begin
@@ -457,6 +777,9 @@ begin
     TestRttiUnknownFieldSkip;
     TestBytesEqualForKnownEncoding;
     TestAdvancedTypes;
+    TestRepeatedRoundTrip;
+    TestRepeatedEmptyAndWire;
+    TestRepeatedAcceptsUnpackedNumeric;
 
     WriteLn;
     WriteLn(Format('[Nghttp2Protobuf] %d passed, %d failed', [GPassCount, GFailCount]));

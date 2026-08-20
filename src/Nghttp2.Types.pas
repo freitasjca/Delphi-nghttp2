@@ -69,6 +69,68 @@ type
     //  start flowing. Names are lowercased (HTTP/2 requires it).
     procedure AddTrailer(const AName, AValue: string);
 
+    // ─── Streaming responses (chunked/SSE equivalent) ────────────────────
+    //  Send/SendStream stage a body whose size is known when they are called.
+    //  A streaming response is open-ended: headers go out immediately and the
+    //  body arrives in pieces the handler produces over time.
+    //
+    //  BeginStreaming submits the response headers with a data provider that
+    //  stays hungry, so nothing is buffered waiting for a total length. Each
+    //  PushStreamData appends one piece and wakes the pump; EndStreaming
+    //  closes the stream. Call them in that order, exactly once for Begin and
+    //  End. Mutually exclusive with Send/SendStream on the same stream.
+    //
+    //  PushStreamData is safe from a worker thread — it touches only the
+    //  stream's own buffer and a resume flag the connection thread consumes.
+    //  Every nghttp2_* call still happens on the connection thread.
+    procedure BeginStreaming;
+    procedure PushStreamData(const AData: TBytes);
+    procedure EndStreaming;
+
+    //  False once the peer has gone away (RST_STREAM, GOAWAY, or a dead
+    //  connection). A streaming handler should poll this and stop producing —
+    //  an SSE loop that ignores it runs until its own timeout with nowhere to
+    //  send.
+    function IsStreamAlive: Boolean;
+
+    // ─── Incremental inbound (INBOUND-1) ─────────────────────────────────
+    //  Body normally arrives whole: the session accumulates DATA and only
+    //  dispatches once END_STREAM lands, so Body is complete when a handler
+    //  first sees it. That is right for a request/response exchange and wrong
+    //  for anything long-lived — client-streaming and bidirectional gRPC, and
+    //  WebSocket over RFC 8441 — where the handler must consume DATA while the
+    //  peer is still sending.
+    //
+    //  Inbound mode reverses that: the session dispatches on HEADERS and
+    //  routes each DATA chunk to a queue the handler drains through
+    //  ReadInbound. It is opt-in per stream, chosen by the host before
+    //  dispatch (see TNghttp2Session.OnShouldStreamInbound); nothing changes
+    //  for a stream that does not ask for it.
+    //
+    //  REQUIRES async dispatch. ReadInbound blocks, and in synchronous mode
+    //  the handler IS the connection thread — the one that must return to
+    //  read more socket data. Blocking there deadlocks permanently rather
+    //  than slowly, so BeginInbound refuses outside async mode.
+
+    { True once the session has put this stream in inbound mode. }
+    function InboundStreaming: Boolean;
+
+    { Blocks until at least one byte is available, the peer half-closes, or
+      ATimeoutMS elapses. Returns:
+        > 0  bytes copied into ABuffer
+        = 0  end of stream — the peer sent END_STREAM, nothing more is coming
+        < 0  timeout, with the stream still open; call again
+
+      ABuffer is sized to ACount by the callee. Partial reads are normal: this
+      returns what has arrived, not what was asked for. }
+    function ReadInbound(var ABuffer: TBytes; ACount: Integer;
+      ATimeoutMS: Integer): Integer;
+
+    { True once END_STREAM has been seen on the request side. Note it can be
+      true while ReadInbound still has buffered bytes to return — check the
+      ReadInbound result for end-of-stream, not this. }
+    function InboundEnded: Boolean;
+
     // ─── Async dispatch handshake ────────────────────────────────────────
     //  For hosts that answer OnRequest from a worker thread instead of
     //  inline. BeginAsyncDispatch says "a worker now owns this stream";

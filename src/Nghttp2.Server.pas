@@ -377,6 +377,11 @@ type
   private
     FConfig:         THorseNghttp2Config;
     FOnRequest:      TNghttp2OnRequestProc;
+    { INBOUND-1 — handed to every new session. Plain-proc rather than
+      `of object` for the same reason OnRequest is: the host wires a
+      unit-scope trampoline, and a method pointer here would force a type
+      mismatch at the assignment below. }
+    FOnShouldStreamInbound: TNghttp2ShouldStreamInboundProc;
     FListener:       TSocketHandle;
     FAcceptThread:   TNghttp2AcceptThread;
     FConnections:    TList<TNghttp2ConnectionThread>;
@@ -471,6 +476,13 @@ type
     procedure Stop;
 
     property OnRequest:      TNghttp2OnRequestProc read FOnRequest write FOnRequest;
+
+    { INBOUND-1. Leave unset and every stream accumulates its body and
+      dispatches on END_STREAM — the historical behaviour. See
+      TNghttp2ShouldStreamInbound in Nghttp2.Session.pas for what setting it
+      changes. }
+    property OnShouldStreamInbound: TNghttp2ShouldStreamInboundProc
+      read FOnShouldStreamInbound write FOnShouldStreamInbound;
     property ActiveRequests: Integer               read FActiveRequests;
     property Port:           Word                  read FConfig.Port;
     // Read by an engine that binds its own listeners.
@@ -1073,6 +1085,7 @@ begin
   // well as execution). Keeping it there avoids a method-pointer vs
   // plain-procedure type mismatch here.
   FSession.OnRequest := FServer.OnRequest;
+  FSession.OnShouldStreamInboundProc := FServer.OnShouldStreamInbound;   { INBOUND-1 }
 
   { Flush initial SETTINGS before entering the pump.
 

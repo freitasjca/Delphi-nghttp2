@@ -169,6 +169,12 @@ call-by-call.
   | **Linux** (Debian/Ubuntu) | `sudo apt install libnghttp2-14` | [`doc/getting-nghttp2-linux.md`](doc/getting-nghttp2-linux.md) |
   | **Linux** (Fedora/RHEL) | `sudo dnf install libnghttp2` | [`doc/getting-nghttp2-linux.md`](doc/getting-nghttp2-linux.md) |
   | **macOS** | `brew install nghttp2` | — |
+
+  **Building libnghttp2 yourself** — needed for a pinned version, debug symbols,
+  the import `.lib`, or a target with no package: both guides carry a
+  from-source route. Windows uses MSVC + CMake ([Win64 and Win32 recipes](doc/getting-nghttp2-windows.md#option-c--build-from-source-msvc--cmake));
+  Linux uses the standard autotools build ([from source](doc/getting-nghttp2-linux.md#build-from-source),
+  plus [ARM / cross-compile notes](doc/getting-nghttp2-linux.md#arm--cross-compile-targets)).
 - **Platforms:** Windows (Win32/Win64), Linux (x86_64, ARM64 via SONAME), macOS (Intel + Apple Silicon).
 
 The library loads libnghttp2 by its stable SONAME (`libnghttp2.so.14` on Linux, `libnghttp2.dylib` on macOS, `nghttp2.dll` on Windows). No binaries bundled — the platform's package manager owns the file.
