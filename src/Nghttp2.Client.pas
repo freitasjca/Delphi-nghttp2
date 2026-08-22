@@ -84,6 +84,20 @@ type
     Body:    TBytes;
   end;
 
+  { MULTISTREAM-1 — one in-flight stream's accumulated state. The on_header,
+    on_data_chunk_recv and on_stream_close callbacks each locate their slot by
+    the stream_id nghttp2 hands them, rather than assuming a single active
+    request. A slot stays InUse until its response is taken. }
+  TNghttp2StreamSlot = record
+    Id:         Int32;
+    InUse:      Boolean;
+    Done:       Boolean;
+    Error:      string;
+    Response:   TNghttp2Response;
+    ReqBody:    TBytes;      { pulled by ReadRequestBodyCallback }
+    ReqBodyPos: Integer;
+  end;
+
   TNghttp2Client = class
   private
     // NOTE: plain `private` (not `strict private`) is required — the FFI
@@ -106,18 +120,26 @@ type
     // Per-connection TLS wrapper (allocated by Connect when FTlsContext<>nil).
     FTlsConn:     TTlsClientConnection;
 
-    // In-flight response accumulator. Populated by the on_header /
-    // on_data_chunk_recv / on_stream_close callbacks. One request at a time,
-    // so a stream_id → response map isn't needed for v1.
-    FActiveStreamId: Int32;
-    FActiveResponse: TNghttp2Response;
-    FActiveDone:     Boolean;
-    FActiveError:    string;
+    { MULTISTREAM-1 — per-stream state, indexed by nghttp2 stream id.
 
-    // Request body cursor — read by ReadRequestBodyCallback while nghttp2
-    // pulls bytes for the outgoing DATA frames of the current stream.
-    FActiveRequestBody:    TBytes;
-    FActiveRequestBodyPos: Integer;
+      Was a single FActive* set: one request at a time. That made case C of the
+      drain gate — N streams sharing ONE connection through a graceful shutdown
+      — inexpressible, and it is the only shape where GOAWAY's last_stream_id
+      semantics are actually exercised.
+
+      A plain array with linear search rather than a TDictionary: N is small
+      (tens of streams), the scan is nothing beside a network round trip, and it
+      keeps generic specialization out of a unit that must build on FPC 3.2.2 as
+      well as trunk and Delphi.
+
+      NOT thread-safe, by design. One thread drives one client; concurrency here
+      means multiplexed streams on that connection, not a shared client. Use
+      separate clients for separate connections. }
+    FStreams: array of TNghttp2StreamSlot;
+
+    function  FindSlot(AStreamId: Int32): Integer;
+    function  AllocSlot(AStreamId: Int32): Integer;
+    function  AnyPending: Boolean;
 
     procedure SubmitClientSettings;
     procedure FlushSession;
@@ -147,6 +169,27 @@ type
       const AHeaders: TNghttp2Headers;
       const ABody:    TBytes;
       ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS): TNghttp2Response;
+
+    { MULTISTREAM-1 — the three-call form SubmitRequest is built from. Use it to
+      hold several streams open on ONE connection at once, which SubmitRequest
+      cannot express because it pumps to completion before returning.
+
+        for I := 1 to 8 do Ids[I] := C.BeginRequest('GET', '/slow/3000', ...);
+        C.PumpAll(20000);
+        for I := 1 to 8 do R[I] := C.TakeResponse(Ids[I]);
+
+      BeginRequest submits and returns immediately. PumpAll drives the session
+      until every open stream has closed, or the timeout expires. TakeResponse
+      hands back one stream's result and frees its slot — raising if THAT stream
+      failed, so one broken stream does not discard the others. }
+    function  BeginRequest(
+      const AMethod:  string;
+      const APath:    string;
+      const AHeaders: TNghttp2Headers;
+      const ABody:    TBytes): Int32;
+    procedure PumpAll(ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS);
+    function  TakeResponse(AStreamId: Int32): TNghttp2Response;
+    function  PendingStreams: Integer;
 
     property Connected:  Boolean            read FConnected;
     property Host:       string             read FHost;
@@ -179,21 +222,24 @@ var
   LClient: TNghttp2Client;
   LName, LValue: AnsiString;
   LHdr: TNghttp2Header;
+  LIdx: Integer;
 begin
   LClient := TNghttp2Client(user_data);
-  if (LClient = nil) or (frame^.hd.stream_id <> LClient.FActiveStreamId) then
-    Exit(0);
+  if LClient = nil then Exit(0);
+  LIdx := LClient.FindSlot(frame^.hd.stream_id);   { MULTISTREAM-1 }
+  if LIdx < 0 then Exit(0);
 
   SetString(LName,  PAnsiChar(name),  namelen);
   SetString(LValue, PAnsiChar(value), valuelen);
 
   if LName = ':status' then
-    LClient.FActiveResponse.Status := StrToIntDef(string(LValue), 0)
+    LClient.FStreams[LIdx].Response.Status := StrToIntDef(string(LValue), 0)
   else if (Length(LName) = 0) or (LName[1] <> ':') then
   begin
     LHdr.Name  := string(LName);
     LHdr.Value := string(LValue);
-    LClient.FActiveResponse.Headers := LClient.FActiveResponse.Headers + [LHdr];
+    LClient.FStreams[LIdx].Response.Headers :=
+      LClient.FStreams[LIdx].Response.Headers + [LHdr];
   end;
   Result := 0;
 end;
@@ -207,14 +253,16 @@ function OnDataChunkRecvCb(
 var
   LClient: TNghttp2Client;
   LOldLen: Integer;
+  LIdx:    Integer;
 begin
   LClient := TNghttp2Client(user_data);
-  if (LClient = nil) or (stream_id <> LClient.FActiveStreamId) or (len = 0) then
-    Exit(0);
+  if (LClient = nil) or (len = 0) then Exit(0);
+  LIdx := LClient.FindSlot(stream_id);   { MULTISTREAM-1 }
+  if LIdx < 0 then Exit(0);
 
-  LOldLen := Length(LClient.FActiveResponse.Body);
-  SetLength(LClient.FActiveResponse.Body, LOldLen + Integer(len));
-  Move(data^, LClient.FActiveResponse.Body[LOldLen], len);
+  LOldLen := Length(LClient.FStreams[LIdx].Response.Body);
+  SetLength(LClient.FStreams[LIdx].Response.Body, LOldLen + Integer(len));
+  Move(data^, LClient.FStreams[LIdx].Response.Body[LOldLen], len);
   Result := 0;
 end;
 
@@ -225,25 +273,27 @@ function OnStreamCloseCb(
   user_data: Pointer): Integer; cdecl;
 var
   LClient: TNghttp2Client;
+  LIdx:    Integer;
 begin
   LClient := TNghttp2Client(user_data);
-  if (LClient = nil) or (stream_id <> LClient.FActiveStreamId) then
-    Exit(0);
+  if LClient = nil then Exit(0);
+  LIdx := LClient.FindSlot(stream_id);   { MULTISTREAM-1 }
+  if LIdx < 0 then Exit(0);
 
-  LClient.FActiveDone := True;
+  LClient.FStreams[LIdx].Done := True;
   if error_code <> NGHTTP2_NO_ERROR then
-    LClient.FActiveError := Format(
+    LClient.FStreams[LIdx].Error := Format(
       'stream %d closed with nghttp2 error code %d — received status=%d, %d header(s), %d body byte(s) before close',
       [stream_id, error_code,
-       LClient.FActiveResponse.Status,
-       Length(LClient.FActiveResponse.Headers),
-       Length(LClient.FActiveResponse.Body)]);
+       LClient.FStreams[LIdx].Response.Status,
+       Length(LClient.FStreams[LIdx].Response.Headers),
+       Length(LClient.FStreams[LIdx].Response.Body)]);
   Result := 0;
 end;
 
 // ─── Request body data provider (POST/PUT/PATCH support) ─────────────────
 // Called by nghttp2 to pull request body bytes as it emits DATA frames.
-// Reads from FActiveRequestBody at FActiveRequestBodyPos; sets EOF when
+// Reads from the stream's own ReqBody at ReqBodyPos; sets EOF when
 // the buffer is exhausted.
 
 function ReadRequestBodyCallback(
@@ -257,11 +307,19 @@ var
   LClient:    TNghttp2Client;
   LRemaining: NativeInt;
   LToRead:    NativeInt;
+  LIdx:       Integer;
 begin
   LClient := TNghttp2Client(user_data);
   if LClient = nil then Exit(0);
+  LIdx := LClient.FindSlot(stream_id);   { MULTISTREAM-1 — per-stream cursor }
+  if LIdx < 0 then
+  begin
+    data_flags^ := NGHTTP2_DATA_FLAG_EOF;
+    Exit(0);
+  end;
 
-  LRemaining := System.Length(LClient.FActiveRequestBody) - LClient.FActiveRequestBodyPos;
+  LRemaining := System.Length(LClient.FStreams[LIdx].ReqBody)
+                - LClient.FStreams[LIdx].ReqBodyPos;
   if LRemaining <= 0 then
   begin
     data_flags^ := NGHTTP2_DATA_FLAG_EOF;
@@ -273,11 +331,12 @@ begin
   else
     LToRead := NativeInt(length);
 
-  Move(LClient.FActiveRequestBody[LClient.FActiveRequestBodyPos],
+  Move(LClient.FStreams[LIdx].ReqBody[LClient.FStreams[LIdx].ReqBodyPos],
        buf^, LToRead);
-  Inc(LClient.FActiveRequestBodyPos, LToRead);
+  Inc(LClient.FStreams[LIdx].ReqBodyPos, LToRead);
 
-  if LClient.FActiveRequestBodyPos >= System.Length(LClient.FActiveRequestBody) then
+  if LClient.FStreams[LIdx].ReqBodyPos
+     >= System.Length(LClient.FStreams[LIdx].ReqBody) then
     data_flags^ := NGHTTP2_DATA_FLAG_EOF;
 
   Result := LToRead;
@@ -308,7 +367,7 @@ begin
   FSession        := nil;
   FCallbacks      := nil;
   FConnected      := False;
-  FActiveStreamId := -1;
+  SetLength(FStreams, 0);   { MULTISTREAM-1 }
   FTlsContext     := nil;   // caller opts in via TlsContext property
   FTlsConn        := nil;
 
@@ -501,12 +560,13 @@ var
   LConsumed: NativeInt;
 begin
   LStart := Now;
-  while not FActiveDone do
+  { MULTISTREAM-1 — run until every open stream has closed, not just one. }
+  while AnyPending do
   begin
     if MilliSecondsSince(LStart) > ATimeoutMS then
       raise ENghttp2Client.CreateFmt(
-        'request timed out after %d ms — server did not close stream %d',
-        [ATimeoutMS, FActiveStreamId]);
+        'request timed out after %d ms — %d stream(s) still open',
+        [ATimeoutMS, PendingStreams]);
 
     FlushSession;
 
@@ -524,16 +584,16 @@ begin
 
   FlushSession;   // final flush of anything callbacks queued
 
-  if FActiveError <> '' then
-    raise ENghttp2Client.Create(FActiveError);
+  { Per-stream errors are NOT raised here. With several streams in flight, one
+    failure must not discard the others' responses — TakeResponse raises for the
+    stream it is asked about, so SubmitRequest still throws exactly as before. }
 end;
 
-function TNghttp2Client.SubmitRequest(
+function TNghttp2Client.BeginRequest(
   const AMethod:  string;
   const APath:    string;
   const AHeaders: TNghttp2Headers;
-  const ABody:    TBytes;
-  ATimeoutMS: Integer): TNghttp2Response;
+  const ABody:    TBytes): Int32;
 var
   LNvs:         array of Tnghttp2_nv;
   LNames:       array of AnsiString;    // hold refs so PAnsiChar stays valid
@@ -541,20 +601,17 @@ var
   I, LBase:     Integer;
   LAuthority:   string;
   LStreamId:    Int32;
+  LIdx:         Integer;
   LProvider:    Tnghttp2_data_provider;
   LProviderPtr: Pnghttp2_data_provider;
 begin
   if not FConnected then
     raise ENghttp2Client.Create('not connected — call Connect first');
 
-  // Per-request state reset. FActiveRequestBodyPos MUST be reset before
-  // nghttp2_submit_request because the read callback can be invoked
-  // immediately (during the first FlushSession).
-  FActiveResponse       := Default(TNghttp2Response);
-  FActiveDone           := False;
-  FActiveError          := '';
-  FActiveRequestBody    := ABody;
-  FActiveRequestBodyPos := 0;
+  { The slot is allocated AFTER submit, once nghttp2 has assigned the id — but
+    the body cursor must exist before the first FlushSession, because the read
+    callback can fire during it. AllocSlot below therefore runs immediately
+    after nghttp2_submit_request and before any pumping. }
 
   LAuthority := FHost + ':' + IntToStr(FPort);
   LBase := 4;   // 4 pseudo-headers
@@ -598,12 +655,108 @@ begin
   if LStreamId < 0 then
     raise ENghttp2Client.CreateFmt('nghttp2_submit_request: %d', [LStreamId]);
 
-  FActiveStreamId := LStreamId;
+  LIdx := AllocSlot(LStreamId);
+  FStreams[LIdx].ReqBody    := ABody;
+  FStreams[LIdx].ReqBodyPos := 0;
 
+  Result := LStreamId;
+end;
+
+{ ─── MULTISTREAM-1 slot bookkeeping ─────────────────────────────────────── }
+
+function TNghttp2Client.FindSlot(AStreamId: Int32): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and (FStreams[I].Id = AStreamId) then
+      Exit(I);
+  Result := -1;
+end;
+
+{ Reuses a freed slot before growing, so a long-lived client running thousands
+  of sequential requests does not grow this array without bound. }
+function TNghttp2Client.AllocSlot(AStreamId: Int32): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to High(FStreams) do
+    if not FStreams[I].InUse then
+    begin
+      FStreams[I] := Default(TNghttp2StreamSlot);
+      FStreams[I].Id    := AStreamId;
+      FStreams[I].InUse := True;
+      Exit(I);
+    end;
+  SetLength(FStreams, Length(FStreams) + 1);
+  Result := High(FStreams);
+  FStreams[Result] := Default(TNghttp2StreamSlot);
+  FStreams[Result].Id    := AStreamId;
+  FStreams[Result].InUse := True;
+end;
+
+function TNghttp2Client.AnyPending: Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and (not FStreams[I].Done) then
+      Exit(True);
+  Result := False;
+end;
+
+function TNghttp2Client.PendingStreams: Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and (not FStreams[I].Done) then
+      Inc(Result);
+end;
+
+procedure TNghttp2Client.PumpAll(ATimeoutMS: Integer);
+begin
   PumpUntilDone(ATimeoutMS);
+end;
 
-  Result := FActiveResponse;
-  FActiveStreamId := -1;
+{ Frees the slot as it hands the response back, so the caller cannot read a
+  stale response twice and a long run does not accumulate slots. }
+function TNghttp2Client.TakeResponse(AStreamId: Int32): TNghttp2Response;
+var
+  LIdx: Integer;
+  LErr: string;
+begin
+  LIdx := FindSlot(AStreamId);
+  if LIdx < 0 then
+    raise ENghttp2Client.CreateFmt('no such stream: %d', [AStreamId]);
+  if not FStreams[LIdx].Done then
+    raise ENghttp2Client.CreateFmt(
+      'stream %d has not completed — call PumpAll first', [AStreamId]);
+
+  Result := FStreams[LIdx].Response;
+  LErr   := FStreams[LIdx].Error;
+  FStreams[LIdx].InUse := False;
+  FStreams[LIdx] := Default(TNghttp2StreamSlot);
+
+  if LErr <> '' then
+    raise ENghttp2Client.Create(LErr);
+end;
+
+{ The original one-shot API, now expressed in the three-call form. Behaviour is
+  unchanged: submit one stream, pump to completion, return or raise. }
+function TNghttp2Client.SubmitRequest(
+  const AMethod:  string;
+  const APath:    string;
+  const AHeaders: TNghttp2Headers;
+  const ABody:    TBytes;
+  ATimeoutMS: Integer): TNghttp2Response;
+var
+  LStreamId: Int32;
+begin
+  LStreamId := BeginRequest(AMethod, APath, AHeaders, ABody);
+  PumpAll(ATimeoutMS);
+  Result := TakeResponse(LStreamId);
 end;
 
 // ─── Convenience one-shot helper ─────────────────────────────────────────

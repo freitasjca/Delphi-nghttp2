@@ -24,6 +24,7 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | TCP accept loop + cross-platform sockets | **✓** |
 | Client-side FFI (`nghttp2_session_client_new`, `nghttp2_submit_request`, …) | **✓** |
 | `TNghttp2Client` — synchronous request/response API | **✓** |
+| **Multiplexed client streams** — `BeginRequest` / `PumpAll` / `TakeResponse` | **✓** (MULTISTREAM-1 — N concurrent streams on ONE connection) |
 | Native HTTP/2 test client (94/94 pass) | **✓** |
 | TLS + ALPN — server side (`TTlsServerContext`, `TTlsConnection`) | **✓** |
 | TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** |
@@ -33,9 +34,9 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | **Async dispatch** — host answers `OnRequest` off the connection thread | **✓** |
 | **Graceful shutdown** — drain contract + two-stage GOAWAY (RFC 9113 §6.8) | **✓** |
 | **Memory-BIO TLS** — OpenSSL never touches the socket (event-loop prerequisite) | **✓** (validated 2026-08-16: Windows/Delphi 12, FPC 3.3.1, Linux64) |
-| **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** |
+| **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
 | Reusable session pool for high-concurrency clients | planned |
-| Async client API (non-blocking `SubmitRequest`) | planned |
+| Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
 ---
 
@@ -269,6 +270,49 @@ begin
   end;
 end;
 ```
+
+### Several streams on one connection
+
+`SubmitRequest` pumps to completion before returning, so calling it in a loop
+serialises the requests. To hold N streams open at once — the thing HTTP/2
+exists for — submit them all first, then pump:
+
+```pascal
+uses Nghttp2.Client;
+
+var
+  C:   TNghttp2Client;
+  Ids: array[0..7] of Int32;
+  R:   TNghttp2Response;
+  I:   Integer;
+begin
+  C := TNghttp2Client.Create;
+  try
+    C.Connect('127.0.0.1', 9000);
+
+    for I := 0 to 7 do
+      Ids[I] := C.BeginRequest('GET', '/slow/3000', nil, nil);   // returns at once
+
+    C.PumpAll(20000);          // drives the session until every stream closes
+
+    for I := 0 to 7 do
+    begin
+      R := C.TakeResponse(Ids[I]);   // raises only for THIS stream
+      WriteLn(Ids[I], ' -> ', R.Status);
+    end;
+  finally
+    C.Free;
+  end;
+end;
+```
+
+`TakeResponse` frees the stream's slot as it hands the response back, and raises
+only if *that* stream failed — one broken stream does not discard the others.
+`SubmitRequest` is itself a wrapper over these three calls.
+
+**One thread per client.** Concurrency here means multiplexed streams on one
+connection, not a client shared between threads; use separate clients for
+separate connections.
 
 ---
 
