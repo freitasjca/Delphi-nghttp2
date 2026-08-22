@@ -160,7 +160,7 @@ call-by-call.
 ## Requirements
 
 - **Delphi 10.4 Sydney or later** (for inline `var`, `System.Threading`). Older versions gated by `{$IF CompilerVersion >= 32.0}`.
-- **Free Pascal trunk 3.3.1 / Lazarus (matching)** — FPC 3.2.2 is a **hard blocker** (`constref` generics regression). `{$MODE DELPHI}` required.
+- **Free Pascal 3.2.2 or trunk 3.3.1 / Lazarus (matching)** — `{$MODE DELPHI}` required. The HTTP/2 transport, TLS and streaming build and pass on **3.2.2** (verified 2026-08-22). The **protobuf/gRPC codec needs trunk 3.3.1**: 3.2.2's `Rtti` unit declares no `TCustomAttribute` and its compiler rejects `{$RTTI EXPLICIT}`, both of which the attribute-driven serializer requires.
 - **libnghttp2 ≥ 1.59** at runtime — loaded dynamically at startup (no link-time dependency):
 
   | Platform | Quick install | Full guide |

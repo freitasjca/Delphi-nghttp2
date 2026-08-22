@@ -16,8 +16,14 @@
 #  Neither message names the real cause. 3.2.2 has no {$RTTI EXPLICIT ...}
 #  directive and no TCustomAttribute in its Rtti unit, so extended RTTI — which
 #  the whole attribute-driven serializer depends on — simply is not there.
-#  FPC 3.2.2 is a documented HARD BLOCKER for this codebase, not a soft
-#  minimum; there is no flag that makes it work.
+#  FPC 3.2.2 is a HARD BLOCKER *for the codec*, not a soft minimum: there is no
+#  flag that makes attribute-driven serialization work there.
+#
+#  Scope, since this used to be stated too broadly: the HTTP/2 transport, TLS,
+#  the epoll engine, streaming and WebSocket all build AND pass on 3.2.2 —
+#  verified 2026-08-22 via build-fpc.sh, 24 stages green. Only this codec and
+#  the gRPC layer above it require trunk. Do not generalize this refusal into
+#  "the project needs trunk".
 #
 #  This script pins trunk and the unit paths that go with it. -Fu$TU/rtl-objpas
 #  is the one that matters: that is where trunk keeps Rtti and TCustomAttribute.
