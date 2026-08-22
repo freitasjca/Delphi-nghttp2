@@ -66,6 +66,25 @@ const
     Measuring the round trip with PING/ACK would remove the guess. }
   GOAWAY_GRACE_MS = 100;
 
+  { BACKPRESSURE-1 — bounds the outbound streaming buffer.
+
+    Without a bound, PushStreamData appends and returns: HTTP/2 flow control
+    throttles the WIRE, not the producer, so a handler generating faster than
+    the peer consumes grows this buffer until the peer catches up or memory
+    runs out. A `while True do Writer.Write(...)` loop is an OOM, not a slow
+    response.
+
+    Two marks rather than one, because blocking until empty makes the producer
+    stop and start on every frame. The producer parks at HIGH and is released
+    at LOW, so it refills in useful batches. }
+  STREAM_BUF_HIGH_WATER = 1024 * 1024;   // 1 MB — park the producer here
+  STREAM_BUF_LOW_WATER  =  256 * 1024;   // 256 KB — release it here
+
+  { One wait slice. A slow peer is not an error, so a producer keeps waiting
+    across slices; this only bounds how often liveness is re-checked so a
+    vanished peer does not park a worker indefinitely. }
+  STREAM_BACKPRESSURE_TICK_MS = 100;
+
 type
   TNghttp2Session = class;   // forward
 
@@ -137,6 +156,11 @@ type
     FStreamLock:        TCriticalSection;
     FStreamDeferred:    Boolean;   // read_callback returned DEFERRED; needs resume
     FStreamClosed:      Boolean;   // peer gone — set by on_stream_close
+    { BACKPRESSURE-1. Signalled by the read_callback once the outbound buffer
+      falls below the low-water mark, releasing a producer parked in
+      PushStreamData. Auto-reset: the producer re-checks the buffer under the
+      lock, so a missed or spurious wake costs one loop, not correctness. }
+    FStreamDrained:     TEvent;
 
     // ─── Incremental inbound state (INBOUND-1) ────────────────────────────
     //  Mirror of the outbound streaming fields above, and deliberately a
@@ -189,6 +213,8 @@ type
     // ─── Streaming (STREAM-1) — see INghttp2Stream contract ───────────────
     procedure BeginStreaming;
     procedure PushStreamData(const AData: TBytes);
+    { BACKPRESSURE-1. False when the stream died while waiting for room. }
+    function  AwaitDrainRoom: Boolean;
     procedure EndStreaming;
     function  IsStreamAlive: Boolean;
 
@@ -288,6 +314,9 @@ type
     { INBOUND-1 — see TNghttp2ShouldStreamInbound. Set by the host before the
       pump starts; read on the connection thread only, so no lock. }
     FOnShouldStreamInbound: TNghttp2ShouldStreamInboundProc;
+    { WS-8441 — advertise SETTINGS_ENABLE_CONNECT_PROTOCOL. Set before the
+      pump starts; read once, in SendInitialSettings. }
+    FEnableConnectProtocol: Boolean;
     // Streams handed to a worker and not yet finished. The server's pump
     // keeps the connection alive and keeps polling while this is > 0.
     FPendingDispatch: Integer;   // TInterlocked-managed
@@ -311,8 +340,14 @@ type
     // synchronous mode; enqueues for the connection thread in async mode.
     procedure SubmitOrDefer(const AStream: TNghttp2StreamState);
   public
+    { AEnableConnectProtocol must be a CONSTRUCTOR argument, not a property:
+      SendInitialSettings runs at the end of this constructor, so a property
+      assigned afterwards would arrive after the SETTINGS frame was already
+      queued — the setting silently absent, and no client ever attempting the
+      upgrade. }
     constructor Create(const AConnection: INghttp2Connection;
-      AMaxConcurrentStreams: Integer = 100);
+      AMaxConcurrentStreams: Integer = 100;
+      AEnableConnectProtocol: Boolean = False);
     destructor  Destroy; override;
 
     // Submits every response staged by a worker since the last call. MUST be
@@ -410,6 +445,11 @@ type
       body and dispatches on END_STREAM, which is the historical behaviour. }
     property OnShouldStreamInboundProc: TNghttp2ShouldStreamInboundProc
       read FOnShouldStreamInbound write FOnShouldStreamInbound;
+
+    { WS-8441. Read-only by design — see the constructor comment. Set it
+      through the constructor argument; a setter here would compile and do
+      nothing. }
+    property EnableConnectProtocol: Boolean read FEnableConnectProtocol;
 
     // Called by the cdecl trampolines below — these are the real handlers
     function DoBeginHeaders(const AFrame: Pnghttp2_frame): Integer;
@@ -528,6 +568,13 @@ begin
         LState.FStreamBuf.Clear;
         LState.FStreamBuf.Position := 0;
       end;
+
+      { BACKPRESSURE-1. Release a producer parked in AwaitDrainRoom once the
+        backlog is back under the low-water mark. Signalling at LOW rather
+        than at every drain is what stops the producer thrashing: it wakes
+        with real room to refill instead of once per frame. }
+      if (LState.FStreamBuf.Size - LState.FStreamBuf.Position) < STREAM_BUF_LOW_WATER then
+        LState.FStreamDrained.SetEvent;
 
       Result := LToRead;
     finally
@@ -674,6 +721,7 @@ begin
   FStreamClosed      := False;
   FStreamBuf         := TMemoryStream.Create;
   FStreamLock        := TCriticalSection.Create;
+  FStreamDrained     := TEvent.Create(nil, {ManualReset=}False, {InitialState=}False, '');
   FInbound           := False;
   FInboundEnded      := False;
   FInboundBuf        := TMemoryStream.Create;
@@ -693,6 +741,7 @@ begin
   FResponseBody.Free;
   FStreamBuf.Free;
   FStreamLock.Free;
+  FStreamDrained.Free;
   FInboundBuf.Free;
   FInboundLock.Free;
   FInboundReady.Free;
@@ -861,9 +910,52 @@ end;
   the callback is draining from, then asks the connection thread for a resume —
   the callback may already have parked the provider, and only that thread may
   call nghttp2_session_resume_data. }
+{ Blocks the producer while the outbound buffer is over its high-water mark —
+  see STREAM_BUF_HIGH_WATER.
+
+  ONLY in async mode. Under inline dispatch the handler IS the connection
+  thread, and the read_callback that would drain this buffer runs on that same
+  thread after the handler returns — so waiting here could never be satisfied.
+  Inline streaming is therefore unbounded by construction, which is a property
+  of that dispatch mode rather than something this function can fix. }
+function TNghttp2StreamState.AwaitDrainRoom: Boolean;
+var
+  LPending: Int64;
+begin
+  Result := True;
+  if not FSession.FAsyncMode then Exit;   // see above — cannot wait here
+
+  while True do
+  begin
+    FStreamLock.Enter;
+    try
+      LPending := FStreamBuf.Size - FStreamBuf.Position;
+    finally
+      FStreamLock.Leave;
+    end;
+
+    if LPending < STREAM_BUF_HIGH_WATER then Exit(True);
+
+    { A peer that has gone away will never drain anything. Returning False
+      lets the caller drop the write rather than park a worker forever on a
+      dead stream. }
+    if FStreamClosed or FStreamEnded then Exit(False);
+
+    { Waiting on a live-but-slow peer is the entire point — this is
+      backpressure working, not a failure — so the loop continues rather than
+      timing out. The slice only bounds how often liveness is re-checked. }
+    FStreamDrained.WaitFor(STREAM_BACKPRESSURE_TICK_MS);
+  end;
+end;
+
 procedure TNghttp2StreamState.PushStreamData(const AData: TBytes);
 begin
   if (not FStreaming) or FStreamEnded or (Length(AData) = 0) then Exit;
+
+  { Before the append, not after: waiting afterwards would let the buffer
+    overshoot by one write of arbitrary size, which for a handler emitting
+    megabyte chunks defeats the bound entirely. }
+  if not AwaitDrainRoom then Exit;
 
   FStreamLock.Enter;
   try
@@ -892,6 +984,11 @@ begin
     while the provider is parked never emits its END_STREAM and the client
     waits forever. }
   FSession.NotifyStreamDataReady;
+
+  { And release anyone parked in AwaitDrainRoom — a second thread writing to a
+    stream this one just ended would otherwise wait out its slice before
+    noticing. }
+  FStreamDrained.SetEvent;
 end;
 
 function TNghttp2StreamState.IsStreamAlive: Boolean;
@@ -1042,6 +1139,11 @@ begin
     on_stream_close cannot fire before the constructor has run. }
   if FInboundReady <> nil then
     FInboundReady.SetEvent;
+
+  { BACKPRESSURE-1 — a producer parked waiting for a peer that has just gone
+    away should stop now, not at the end of its next slice. }
+  if FStreamDrained <> nil then
+    FStreamDrained.SetEvent;
 end;
 
 { Connection thread only. Re-arms a provider the read_callback parked, but only
@@ -1195,7 +1297,7 @@ end;
 // ============================================================================
 
 constructor TNghttp2Session.Create(const AConnection: INghttp2Connection;
-  AMaxConcurrentStreams: Integer);
+  AMaxConcurrentStreams: Integer; AEnableConnectProtocol: Boolean);
 var
   LRc: Integer;
 begin
@@ -1217,6 +1319,8 @@ begin
     FMaxConcurrentStreams := AMaxConcurrentStreams
   else
     FMaxConcurrentStreams := 100;
+
+  FEnableConnectProtocol := AEnableConnectProtocol;   { WS-8441 — before SendInitialSettings }
 
   BuildCallbacks;
 
@@ -1483,7 +1587,8 @@ end;
 
 procedure TNghttp2Session.SendInitialSettings;
 var
-  LIv: array[0..0] of Tnghttp2_settings_entry;
+  LIv:    array[0..1] of Tnghttp2_settings_entry;
+  LCount: NativeUInt;
 begin
   // Advertise reasonable server defaults. Everything else uses nghttp2 defaults:
   //   HEADER_TABLE_SIZE=4096, ENABLE_PUSH=0 (server ignores anyway),
@@ -1493,7 +1598,22 @@ begin
   // layer, before a request ever reaches the worker pool.
   LIv[0].settings_id := NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS;
   LIv[0].value       := FMaxConcurrentStreams;
-  nghttp2_submit_settings(FNativeSession, NGHTTP2_FLAG_NONE, @LIv[0], 1);
+  LCount := 1;
+
+  { RFC 8441 §3 — only advertised when the host has actually registered a
+    WebSocket route. This is not caution for its own sake: advertising it
+    invites conforming clients to send extended CONNECT, and a server that
+    then has nowhere to route those streams is worse than one that never
+    offered. Off by default, so a plain HTTP/2 or gRPC deployment is
+    byte-identical on the wire to before. }
+  if FEnableConnectProtocol then
+  begin
+    LIv[1].settings_id := NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL;
+    LIv[1].value       := 1;
+    LCount := 2;
+  end;
+
+  nghttp2_submit_settings(FNativeSession, NGHTTP2_FLAG_NONE, @LIv[0], LCount);
 end;
 
 function TNghttp2Session.FeedIncoming(const AData: PByte; ALen: NativeUInt): NativeInt;

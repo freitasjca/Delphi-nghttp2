@@ -382,6 +382,8 @@ type
       unit-scope trampoline, and a method pointer here would force a type
       mismatch at the assignment below. }
     FOnShouldStreamInbound: TNghttp2ShouldStreamInboundProc;
+    { WS-8441 — handed to every new session; see the property below. }
+    FEnableConnectProtocol: Boolean;
     FListener:       TSocketHandle;
     FAcceptThread:   TNghttp2AcceptThread;
     FConnections:    TList<TNghttp2ConnectionThread>;
@@ -483,6 +485,12 @@ type
       changes. }
     property OnShouldStreamInbound: TNghttp2ShouldStreamInboundProc
       read FOnShouldStreamInbound write FOnShouldStreamInbound;
+
+    { WS-8441. Set before Listen to advertise
+      SETTINGS_ENABLE_CONNECT_PROTOCOL, permitting WebSocket-over-HTTP/2 via
+      extended CONNECT (RFC 8441). Off by default. }
+    property EnableConnectProtocol: Boolean
+      read FEnableConnectProtocol write FEnableConnectProtocol;
     property ActiveRequests: Integer               read FActiveRequests;
     property Port:           Word                  read FConfig.Port;
     // Read by an engine that binds its own listeners.
@@ -678,7 +686,8 @@ begin
   SetLength(FRecvBuf, 16 * 1024);   // matches Config.RecvBufferSize default
 
   FConn    := TNghttp2ConnectionState.Create(APeerAddr, AServer.Port);
-  FSession := TNghttp2Session.Create(FConn, AServer.MaxConcurrentStreams);
+  FSession := TNghttp2Session.Create(FConn, AServer.MaxConcurrentStreams,
+                                    AServer.EnableConnectProtocol);   { WS-8441 }
   FSession.AsyncMode := FAsync;
 end;
 

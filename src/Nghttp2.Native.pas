@@ -121,6 +121,11 @@ const
   // SETTINGS parameter IDs (RFC 7540 §6.5.2)
   NGHTTP2_SETTINGS_HEADER_TABLE_SIZE      = $01;
   NGHTTP2_SETTINGS_ENABLE_PUSH            = $02;
+  { RFC 8441 §3. Advertising this with value 1 tells the peer it may open a
+    stream with :method CONNECT plus a :protocol pseudo-header — the mechanism
+    WebSocket-over-HTTP/2 is built on. Without it a conforming client will not
+    attempt the upgrade at all, so the setting is the entire opt-in. }
+  NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL = $08;
   NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS = $03;
   NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE    = $04;
   NGHTTP2_SETTINGS_MAX_FRAME_SIZE         = $05;
