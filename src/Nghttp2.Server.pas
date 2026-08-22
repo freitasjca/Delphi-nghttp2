@@ -65,6 +65,7 @@ uses
 {$ELSE}
   System.SysUtils, System.Classes, System.SyncObjs, System.Generics.Collections,
 {$IFEND}
+  Nghttp2.Compat,   { TInterlocked shim for FPC < 3.3.1 — no-op elsewhere }
   Nghttp2.Types,
   Nghttp2.Session,
   Nghttp2.Socket,

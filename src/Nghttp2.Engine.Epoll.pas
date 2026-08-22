@@ -45,6 +45,7 @@ uses
   System.Generics.Collections,
   Posix.Base, Posix.Unistd,
 {$IFEND}
+  Nghttp2.Compat,   { TInterlocked shim for FPC < 3.3.1 — no-op elsewhere }
   Nghttp2.Socket,
   Nghttp2.Server;
 
@@ -806,13 +807,13 @@ begin
 
   N := AServer.EngineThreads;
   if N <= 0 then
-    N := TThread.ProcessorCount;
+    N := Nghttp2CpuCount;
   if N < 1 then N := 1;
   { Cap it. Past the core count the loops contend for the same CPUs while each
     still carries its own epoll set and per-cycle sweep, so more threads buy
     nothing and cost cache. }
-  if N > TThread.ProcessorCount then
-    N := TThread.ProcessorCount;
+  if N > Nghttp2CpuCount then
+    N := Nghttp2CpuCount;
 
   SetLength(FLoops, N);
   for I := 0 to N - 1 do

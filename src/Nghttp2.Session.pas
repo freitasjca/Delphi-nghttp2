@@ -56,6 +56,7 @@ uses
   System.SysUtils, System.Classes, System.SyncObjs, System.DateUtils,
   System.Generics.Collections,
 {$ENDIF}
+  Nghttp2.Compat,   { TInterlocked shim for FPC < 3.3.1 — no-op elsewhere }
   Nghttp2.Native,
   Nghttp2.Types;
 

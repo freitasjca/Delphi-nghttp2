@@ -89,6 +89,7 @@ uses
   System.SysUtils, System.Classes, System.SyncObjs, Winapi.Windows,
   System.Generics.Collections,
 {$IFEND}
+  Nghttp2.Compat,   { TInterlocked shim for FPC < 3.3.1 — no-op elsewhere }
   Nghttp2.Socket,
   Nghttp2.Server;
 
@@ -811,7 +812,7 @@ begin
   inherited Create;
   FServer := AServer;
   N := AServer.EngineThreads;
-  if N <= 0 then N := TThread.ProcessorCount;
+  if N <= 0 then N := Nghttp2CpuCount;
   if N < 1 then N := 1;
   SetLength(FLoops, N);
   for I := 0 to N - 1 do

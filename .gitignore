@@ -53,3 +53,7 @@ desktop.ini
 *.dsv
 *.identcache
 *.local
+
+# FPC build output
+.fpc-out/
+tests/interlocked_check
