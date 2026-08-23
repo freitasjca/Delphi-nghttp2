@@ -2,7 +2,9 @@
 
 **Server + client bindings for [libnghttp2](https://nghttp2.org/) in Object Pascal (Delphi + FPC).**
 
-Low-level HTTP/2 transport primitives — session state, HPACK, streams, callbacks — packaged as a standalone library. Use it directly to build HTTP/2 servers/clients in Delphi, or via the higher-level [`horse-provider-nghttp2`](https://github.com/freitasjca/horse-provider-nghttp2) glue for the [Horse](https://github.com/HashLoad/horse) web framework.
+HTTP/2 transport primitives — session state, HPACK, streams, callbacks — packaged as a standalone library, plus a **framework-agnostic gRPC layer** on top: protobuf codec, service registry, dispatcher, and streaming readers and writers. Use it directly to build HTTP/2 or gRPC servers and clients in Delphi, or via the higher-level [`horse-provider-nghttp2`](https://github.com/freitasjca/horse-provider-nghttp2) glue for the [Horse](https://github.com/HashLoad/horse) web framework.
+
+The gRPC layer takes an `INghttp2Stream` and nothing else — no web framework is involved on either side, so any host that owns a stream can serve gRPC with it. `horse-provider-nghttp2` is one such host, not a prerequisite.
 
 Parallels the ecosystem's proven pattern:
 
@@ -35,6 +37,7 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | **Graceful shutdown** — drain contract + two-stage GOAWAY (RFC 9113 §6.8) | **✓** |
 | **Memory-BIO TLS** — OpenSSL never touches the socket (event-loop prerequisite) | **✓** (validated 2026-08-16: Windows/Delphi 12, FPC 3.3.1, Linux64) |
 | **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
+| **gRPC layer** — protobuf codec, registry (procedural + `RegisterService<T>`), dispatcher, all four RPC shapes | **✓** (extracted from `horse-provider-nghttp2` 2026-08-23; the units never depended on Horse, only their names did) |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
@@ -214,6 +217,11 @@ src/
   Nghttp2.Client.pas          — synchronous HTTP/2 client (TNghttp2Client + TNghttp2Response)
   Nghttp2.Protobuf.pas        — Protobuf wire-format codec
   Nghttp2.Protobuf.Rtti.pas   — RTTI-driven Protobuf ↔ Delphi/FPC record mapping
+  Nghttp2.Grpc.Attributes.pas — [TGrpcService('pkg.Svc')] for the IInvokable API
+  Nghttp2.Grpc.Registry.pas   — service/method registry (procedural + IInvokable)
+  Nghttp2.Grpc.Dispatcher.pas — application/grpc interception, framing, trailers
+  Nghttp2.Grpc.StreamWriter.pas — IGrpcStreamWriter (server-streaming, bidi out)
+  Nghttp2.Grpc.StreamReader.pas — IGrpcStreamReader (client-streaming, bidi in)
 
 samples/
   tests/                      — protocol-level and integration tests
