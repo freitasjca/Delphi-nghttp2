@@ -55,7 +55,7 @@ type
     so `is`/`as` and every existing call site keep working unchanged.
     REMOVED IN 2.0.0. }
   THorseGrpcDispatcher = TGrpcDispatcher
-    deprecated 'Renamed to TGrpcDispatcher. Removed in 2.0.0.';
+    deprecated 'Renamed in 1.6.0 to TGrpcDispatcher. Removed in 2.0.0.';
 
 const
   // Standard gRPC status codes — https://github.com/grpc/grpc/blob/master/doc/statuscodes.md

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package echo;
+
+// Mirrors Sample.Echo.Messages.pas. The field NUMBERS are the contract;
+// the Pascal property names differ where a proto name collides with a
+// Delphi keyword (message -> text).
+
+message SayRequest {
+  string name = 1;
+}
+
+message SayResponse {
+  string message = 1;   // Pascal: TSayResponse.text
+  int32  length  = 2;
+}
+
+service Echo {
+  rpc Say   (SayRequest) returns (SayResponse);
+  rpc Upper (SayRequest) returns (SayResponse);
+}

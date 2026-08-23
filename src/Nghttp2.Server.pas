@@ -119,7 +119,7 @@ type
     declared with either name is the same record type and assigns freely to the
     other. REMOVED IN 2.0.0. }
   THorseNghttp2Config = TNghttp2Config
-    deprecated 'Renamed to TNghttp2Config. Removed in 2.0.0.';
+    deprecated 'Renamed in 1.6.0 to TNghttp2Config. Removed in 2.0.0.';
 
   TNghttp2OnRequestProc = Nghttp2.Session.TNghttp2OnRequestProc;
 

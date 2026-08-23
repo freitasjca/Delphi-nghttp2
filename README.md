@@ -4,7 +4,7 @@
 
 HTTP/2 transport primitives — session state, HPACK, streams, callbacks — packaged as a standalone library, plus a **framework-agnostic gRPC layer** on top: protobuf codec, service registry, dispatcher, and streaming readers and writers. Use it directly to build HTTP/2 or gRPC servers and clients in Delphi, or via the higher-level [`horse-provider-nghttp2`](https://github.com/freitasjca/horse-provider-nghttp2) glue for the [Horse](https://github.com/HashLoad/horse) web framework.
 
-The gRPC layer takes an `INghttp2Stream` and nothing else — no web framework is involved on either side, so any host that owns a stream can serve gRPC with it. `horse-provider-nghttp2` is one such host, not a prerequisite.
+The gRPC layer takes an `INghttp2Stream` and nothing else — no web framework is involved on either side, so any host that owns a stream can serve gRPC with it. `horse-provider-nghttp2` is one such host, not a prerequisite. [`samples/grpc-server`](samples/grpc-server) is a working server that proves it: two RPCs and a plain HTTP/2 route on one port, in about sixty lines, with no framework in the uses clause.
 
 Parallels the ecosystem's proven pattern:
 
@@ -224,6 +224,8 @@ src/
   Nghttp2.Grpc.StreamReader.pas — IGrpcStreamReader (client-streaming, bidi in)
 
 samples/
+  PingClient.dpr              — minimal HTTP/2 client
+  grpc-server/                — a gRPC server on this library alone, no framework
   tests/                      — protocol-level and integration tests
 
 doc/                          — design docs, upstream notes, migration guides
@@ -236,19 +238,30 @@ doc/                          — design docs, upstream notes, migration guides
 ```pascal
 uses Nghttp2.Server, Nghttp2.Types;
 
+procedure Handle(const AStream: INghttp2Stream);
+begin
+  AStream.StatusCode := 200;
+  AStream.Header['content-type'] := 'text/plain';
+  AStream.Send(TEncoding.UTF8.GetBytes('hello from HTTP/2'));
+end;
+
 var Srv: TNghttp2Server;
 begin
   Srv := TNghttp2Server.Create;
-  Srv.OnRequest := procedure(const AStream: INghttp2Stream)
-    begin
-      AStream.StatusCode := 200;
-      AStream.Header['content-type'] := 'text/plain';
-      AStream.Send(TEncoding.UTF8.GetBytes('hello from HTTP/2'));
-    end;
+  Srv.OnRequest := Handle;
   Srv.Start(TNghttp2Config.Default);  // loads libnghttp2, binds :9000
   ReadLn;
 end;
 ```
+
+`OnRequest` is a **plain** `procedure(const AStream: INghttp2Stream)` — not
+`of object`, and not an anonymous method. That is deliberate: a plain type
+accepts a unit-scope procedure, which is the only shape that compiles on FPC
+without `FUNCTIONREFERENCES`. A host that needs state wraps a class method in
+such a trampoline; `horse-provider-nghttp2` does exactly that.
+
+*(Corrected 2026-08-23 — this example previously assigned an anonymous method
+to that property, which compiles on neither Delphi nor FPC.)*
 
 `Start` loads libnghttp2 itself and raises if it cannot — no explicit
 `NghttpLoad` call is needed. Before v2.2 it did not, and only the Horse

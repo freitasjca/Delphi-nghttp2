@@ -156,7 +156,7 @@ type
     two distinct classes here would mean two RTTI contexts and two caches.
     REMOVED IN 2.0.0. }
   THorseProtobufRtti = TProtobufRtti
-    deprecated 'Renamed to TProtobufRtti. Removed in 2.0.0.';
+    deprecated 'Renamed in 1.6.0 to TProtobufRtti. Removed in 2.0.0.';
 
   // ── Orchestrator ─────────────────────────────────────────────────────────
   { TProtoSerializer converts between proto3 wire bytes and message-class

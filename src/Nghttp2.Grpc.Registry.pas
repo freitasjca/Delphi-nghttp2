@@ -294,13 +294,38 @@ type
     real generic class method and `except on E: EHorseGrpcRegistry` still
     catches what this unit raises. REMOVED IN 2.0.0. }
   THorseGrpc = TGrpcRegistry
-    deprecated 'Renamed to TGrpcRegistry. Removed in 2.0.0.';
+    deprecated 'Renamed in 1.6.0 to TGrpcRegistry. Removed in 2.0.0.';
   EHorseGrpcRegistry = EGrpcRegistry
-    deprecated 'Renamed to EGrpcRegistry. Removed in 2.0.0.';
+    deprecated 'Renamed in 1.6.0 to EGrpcRegistry. Removed in 2.0.0.';
 
 implementation
 
-{$IF DEFINED(FPC) AND NOT DEFINED(HORSE_GRPC_NO_FFI)}
+{ The escape-hatch define was named HORSE_GRPC_NO_FFI when this unit lived in
+  horse-provider-nghttp2. Nothing here depends on Horse, so the name is now
+  NGHTTP2_GRPC_NO_FFI — but a define cannot be aliased the way a type can, so
+  both are honoured and the old one is merely announced. It stops working at
+  2.0.0, alongside the type aliases and the unit-name shims.
+
+  It fires regardless of compiler on purpose. The define only has an effect on
+  FPC, but someone who sets it on Delphi has still written the old name into a
+  build script, and that is exactly who needs telling.
+
+  WARNING, not HINT, and the spelling differs by compiler — Delphi accepts
+  only WARN, FPC only WARNING, so this needs the conditional. It was a HINT
+  first, which was useless: FPC suppresses hints unless -vh is passed, so the
+  announcement was invisible in every normal build. A deprecation nobody sees
+  is how the old name survives to 2.0.0 unnoticed. HINT, ERROR and FATAL are
+  the only levels both compilers spell the same way; WARN/WARNING is not one
+  of them, which is the trap that produced the first version. }
+{$IF DEFINED(HORSE_GRPC_NO_FFI)}
+  {$IF DEFINED(FPC)}
+    {$MESSAGE WARNING 'HORSE_GRPC_NO_FFI is deprecated: define NGHTTP2_GRPC_NO_FFI instead. Removed in 2.0.0.'}
+  {$ELSE}
+    {$MESSAGE WARN 'HORSE_GRPC_NO_FFI is deprecated: define NGHTTP2_GRPC_NO_FFI instead. Removed in 2.0.0.'}
+  {$IFEND}
+{$IFEND}
+
+{$IF DEFINED(FPC) AND NOT DEFINED(NGHTTP2_GRPC_NO_FFI) AND NOT DEFINED(HORSE_GRPC_NO_FFI)}
 uses
   { Imported for its INITIALIZATION SIDE EFFECT ONLY — nothing here calls
     into it. FPC ships no built-in function-call manager, so a bare
@@ -317,10 +342,11 @@ uses
       - add  -Fu<fpc-units>/libffi  to the compile line
       - libffi present at run time (Ubuntu: libffi8; Windows: libffi.dll)
 
-    Escape hatch: define HORSE_GRPC_NO_FFI to drop the dependency. The M4a
-    procedural API (RegisterMethod) keeps working — it never touches RTTI
-    invoke — but RegisterService<T> will then fail with the ENotImplemented
-    above on first call. }
+    Escape hatch: define NGHTTP2_GRPC_NO_FFI to drop the dependency (the old
+    spelling HORSE_GRPC_NO_FFI still works until 2.0.0). The M4a procedural
+    API (RegisterMethod) keeps working — it never touches RTTI invoke — but
+    RegisterService<T> will then fail with the ENotImplemented above on first
+    call. }
   ffi.manager;
 {$IFEND}
 

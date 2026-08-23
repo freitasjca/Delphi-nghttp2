@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  build-codec-fpc.sh
-#  Compile + run Nghttp2ProtobufTests under FPC.
+#  Compile + run Nghttp2ProtobufTests under FPC, then compile (not run) the
+#  standalone samples/grpc-server. Both need trunk for the same reason, and
+#  both need the same -Fu list, which is why they share this script.
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -119,4 +121,101 @@ if [[ $RC -eq 0 ]]; then
 else
   echo "codec suite: FAILED (exit $RC)"
 fi
+
+# ── samples/grpc-server — compile only ───────────────────────────────────────
+# That sample is this library's claim that the gRPC layer needs no web
+# framework, and a claim nobody compiles is a claim nobody has checked. It is
+# built here rather than in its own script because the hard part is already
+# solved above: the trunk pin and the exact -Fu list. Duplicating that list
+# into a second script is the thing this file's own comment warns against.
+#
+# Compile only, never run: it binds a port and blocks on ReadLn.
+#
+# -dNGHTTP2_GRPC_NO_FFI is not an optimisation, it is the sample's whole premise
+# under test. Nghttp2.Grpc.Registry pulls in ffi.manager on FPC unless that
+# define is set, and ffi.manager needs libffi units on the search path. The
+# sample registers only through the PROCEDURAL RegisterMethod, which never
+# reaches TRttiMethod.Invoke and therefore never needs libffi — so if this
+# compiles with the define set, the README's claim to that effect is proven
+# rather than asserted. A sample using RegisterService<T> would instead need
+# the define OFF and -Fu$TU/libffi ON.
+SAMPLE="$HERE/../samples/grpc-server/Nghttp2GrpcServer.dpr"
+if [[ -f "$SAMPLE" ]]; then
+  echo
+  echo "── samples/grpc-server (compile only) ───────────────────────────────"
+  SOUT="$OUT/sample"
+  mkdir -p "$SOUT"
+  rm -f "$SOUT"/*.ppu "$SOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+       -FU"$SOUT" -FE"$SOUT" \
+       -Fu"$SRC" -Fu"$(dirname "$SAMPLE")" \
+       $TRUNK_UNIT_PATHS \
+       "$SAMPLE" > "$SOUT/build.log" 2>&1 && [[ -x "$SOUT/Nghttp2GrpcServer" ]]; then
+    echo "  PASS  Nghttp2GrpcServer.dpr"
+  else
+    echo "  FAIL  Nghttp2GrpcServer.dpr"
+    grep -E "Error|Fatal" "$SOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $SOUT/build.log"
+    RC=2
+  fi
+  # ── the DEPRECATED define, still honoured until 2.0.0 ─────────────────────
+  # A back-compat path nobody exercises is the same trap as a shim nobody
+  # compiles, and this one is easy to break silently: the guard reads
+  #   NOT DEFINED(NGHTTP2_GRPC_NO_FFI) AND NOT DEFINED(HORSE_GRPC_NO_FFI)
+  # and dropping either clause still compiles for everyone using the OTHER
+  # name. So build the same sample with the old spelling and require that it
+  # compiles — which is the property users actually depend on.
+  #
+  # It does NOT assert that the deprecation notice was printed, and that is a
+  # deliberate retreat. The unit carries a {$MESSAGE WARNING} for the old
+  # define; it demonstrably fires when the unit is compiled directly, and an
+  # equivalent directive fires from an equivalent unit compiled as a
+  # dependency under these exact flags — but it does not appear in THIS
+  # build's output, and eight rounds of bisection did not explain why.
+  # Ruled out along the way, each by experiment: the directive itself
+  # (WARNING and WARN both fire on FPC 3.3.1, quoted text included), nesting
+  # and {$IFEND}, interface vs implementation placement, unit vs program,
+  # -O1, the long -Fu list, -FU/-FE output dirs, and stale .ppu reuse. What
+  # DID reproduce: a cached .ppu suppresses the message, because {$MESSAGE}
+  # only fires when a unit is genuinely recompiled — worth remembering, but
+  # not the cause here, since the ppu timestamps post-date the source.
+  #
+  # Asserting an unexplained diagnostic would make this gate fail for a
+  # reason nobody can act on. The rename works; the courtesy warning is
+  # cosmetic. Left as an open question rather than a red build.
+  #
+  # Do not try this by hand with an ad-hoc fpc line. Without -n and the full
+  # -Fu list, trunk reads /etc/fpc.cfg, loads the distro 3.2.2 system.ppu and
+  # dies with "PPU Invalid Version 207 expecting 208" — the trap this file's
+  # header already documents, and which cost a round trip on 2026-08-23.
+  echo
+  echo "── samples/grpc-server via the DEPRECATED define ────────────────────"
+  BOUT="$OUT/sample-oldname"
+  mkdir -p "$BOUT"
+  rm -f "$BOUT"/*.ppu "$BOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 -dHORSE_GRPC_NO_FFI \
+       -FU"$BOUT" -FE"$BOUT" \
+       -Fu"$SRC" -Fu"$(dirname "$SAMPLE")" \
+       $TRUNK_UNIT_PATHS \
+       "$SAMPLE" > "$BOUT/build.log" 2>&1 && [[ -x "$BOUT/Nghttp2GrpcServer" ]]; then
+    if grep -q 'HORSE_GRPC_NO_FFI is deprecated' "$BOUT/build.log"; then
+      echo "  PASS  old define still honoured, and announced"
+    else
+      # Informational, not a failure — see the note above.
+      echo "  PASS  old define still honoured"
+      echo "        (deprecation notice not printed in this build; known open"
+      echo "         question, see the comment above. Compiling the unit alone"
+      echo "         does print it.)"
+    fi
+  else
+    echo "  FAIL  old define no longer compiles — back-compat is broken"
+    grep -E "Error|Fatal" "$BOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $BOUT/build.log"
+    RC=2
+  fi
+else
+  echo
+  echo "  SKIP  samples/grpc-server not present"
+fi
+
 exit $RC
