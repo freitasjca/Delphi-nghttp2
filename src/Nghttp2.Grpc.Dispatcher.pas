@@ -36,7 +36,7 @@ uses
   Nghttp2.Types;
 
 type
-  THorseGrpcDispatcher = class
+  TGrpcDispatcher = class
   public
     { Call this at the top of your request pipeline, before any per-request
       allocation the host would otherwise do. If the request is
@@ -49,6 +49,13 @@ type
       ahead of its context-pool acquire, which is the shape to copy. }
     class function TryDispatch(const AStream: INghttp2Stream): Boolean; static;
   end;
+
+  { Pre-1.6.0 name. The Horse prefix was a leftover from where this unit was
+    written; nothing here has ever depended on Horse. An ALIAS, not a subclass,
+    so `is`/`as` and every existing call site keep working unchanged.
+    REMOVED IN 2.0.0. }
+  THorseGrpcDispatcher = TGrpcDispatcher
+    deprecated 'Renamed to TGrpcDispatcher. Removed in 2.0.0.';
 
 const
   // Standard gRPC status codes — https://github.com/grpc/grpc/blob/master/doc/statuscodes.md
@@ -154,7 +161,7 @@ end;
 
 // ── Main dispatcher ────────────────────────────────────────────────────────
 
-class function THorseGrpcDispatcher.TryDispatch(const AStream: INghttp2Stream): Boolean;
+class function TGrpcDispatcher.TryDispatch(const AStream: INghttp2Stream): Boolean;
 var
   LContentType: string;
   LPath:        string;
@@ -180,7 +187,7 @@ begin
 
   // 2. Registry lookup — 404-equivalent is UNIMPLEMENTED status trailer
   LPath := AStream.Header[':path'];
-  if not THorseGrpc.TryGet(LPath, LInfo) then
+  if not TGrpcRegistry.TryGet(LPath, LInfo) then
   begin
     SendGrpcStatusOnly(AStream, GRPC_STATUS_UNIMPLEMENTED,
       'method not registered: ' + LPath);

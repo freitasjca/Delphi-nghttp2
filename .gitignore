@@ -57,4 +57,3 @@ desktop.ini
 # FPC build output
 .fpc-out/
 tests/interlocked_check
-tests/Nghttp2ProtobufTests

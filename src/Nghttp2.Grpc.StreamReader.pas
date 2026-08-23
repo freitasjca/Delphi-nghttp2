@@ -119,7 +119,7 @@ begin
   if FBufLen < 5 then Exit;
 
   if FBuf[0] <> 0 then
-    raise EHorseGrpcRegistry.Create(
+    raise EGrpcRegistry.Create(
       'gRPC stream: per-message compression is not supported');
 
   LLen := (UInt32(FBuf[1]) shl 24) or
@@ -128,7 +128,7 @@ begin
            UInt32(FBuf[4]);
 
   if LLen > GRPC_MAX_MESSAGE_BYTES then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'gRPC stream: message length %u exceeds the %d-byte limit',
       [LLen, GRPC_MAX_MESSAGE_BYTES]);
 
@@ -190,7 +190,7 @@ begin
         peer half-closed mid-message — report it rather than silently dropping
         the fragment, which would look like a clean short stream. }
       if FBufLen > 0 then
-        raise EHorseGrpcRegistry.CreateFmt(
+        raise EGrpcRegistry.CreateFmt(
           'gRPC stream: peer half-closed with %d bytes of an incomplete message',
           [FBufLen]);
       Exit(False);

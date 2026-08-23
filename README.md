@@ -47,7 +47,7 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 
 By default `OnRequest` runs inline on the connection thread: one request at a
 time per connection, so a slow handler blocks every other stream the client
-has multiplexed there. Set `THorseNghttp2Config.AsyncDispatch` and the host
+has multiplexed there. Set `TNghttp2Config.AsyncDispatch` and the host
 may answer from its own threads instead.
 
 One libnghttp2 rule shapes the entire design (`doc/programmers-guide.rst`):
@@ -245,7 +245,7 @@ begin
       AStream.Header['content-type'] := 'text/plain';
       AStream.Send(TEncoding.UTF8.GetBytes('hello from HTTP/2'));
     end;
-  Srv.Start(THorseNghttp2Config.Default);  // loads libnghttp2, binds :9000
+  Srv.Start(TNghttp2Config.Default);  // loads libnghttp2, binds :9000
   ReadLn;
 end;
 ```

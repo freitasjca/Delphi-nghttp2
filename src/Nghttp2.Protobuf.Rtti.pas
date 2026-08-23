@@ -89,7 +89,7 @@ type
   TProtoFieldInfo = record
     Tag:            Integer;
     Name:           string;           // property name — for diagnostics
-    Prop:           TRttiProperty;    // long-lived — anchored to THorseProtobufRtti.FContext
+    Prop:           TRttiProperty;    // long-lived — anchored to TProtobufRtti.FContext
     { For a repeated field this is the ELEMENT kind, not a kind of its own.
       Keeping it that way is what lets the scalar read/write code below be
       reused per element instead of duplicated into a parallel enum. }
@@ -112,7 +112,7 @@ type
   EProtoRttiError = class(Exception);
 
   // ── Global registry / cache (singleton via class methods) ────────────────
-  { THorseProtobufRtti is a process-wide singleton implemented via class
+  { TProtobufRtti is a process-wide singleton implemented via class
     methods + class vars. The one TRttiContext instance lives for the
     program lifetime — every TRttiType and TRttiProperty returned from
     GetTypeInfo remains valid until the program exits.
@@ -120,7 +120,7 @@ type
     Thread-safe: all mutation of the cache dictionary is guarded by
     FLock. Repeat lookups for the same class are O(1) after the first
     scan. }
-  THorseProtobufRtti = class
+  TProtobufRtti = class
   strict private
     class var FContext: TRttiContext;
     class var FCache:   TDictionary<TClass, TProtoTypeInfo>;
@@ -150,9 +150,17 @@ type
     class procedure Shutdown;
   end;
 
+  { Pre-1.6.0 name. The Horse prefix was a leftover from where this unit was
+    written; nothing here has ever depended on Horse. An ALIAS, not a subclass,
+    so the process-wide singleton stays a single instance however it is named —
+    two distinct classes here would mean two RTTI contexts and two caches.
+    REMOVED IN 2.0.0. }
+  THorseProtobufRtti = TProtobufRtti
+    deprecated 'Renamed to TProtobufRtti. Removed in 2.0.0.';
+
   // ── Orchestrator ─────────────────────────────────────────────────────────
   { TProtoSerializer converts between proto3 wire bytes and message-class
-    instances. Uses THorseProtobufRtti for field discovery and
+    instances. Uses TProtobufRtti for field discovery and
     Nghttp2.Protobuf for wire I/O. Stateless — all methods are class-level. }
   TProtoSerializer = class
   public
@@ -171,9 +179,9 @@ type
 
 implementation
 
-// ── THorseProtobufRtti ───────────────────────────────────────────────────────
+// ── TProtobufRtti ───────────────────────────────────────────────────────
 
-class procedure THorseProtobufRtti.LazyInit;
+class procedure TProtobufRtti.LazyInit;
 begin
   // Guard against double-init in racy scenarios — use a boolean flag with
   // a critical-section double-check. First call in a process bootstraps
@@ -198,7 +206,7 @@ begin
   end;
 end;
 
-class procedure THorseProtobufRtti.Shutdown;
+class procedure TProtobufRtti.Shutdown;
 begin
   if not FReady then Exit;
   FLock.Enter;
@@ -215,7 +223,7 @@ begin
   FLock := nil;
 end;
 
-class function THorseProtobufRtti.GetTypeInfo(AClass: TClass): TProtoTypeInfo;
+class function TProtobufRtti.GetTypeInfo(AClass: TClass): TProtoTypeInfo;
 begin
   LazyInit;
 
@@ -230,7 +238,7 @@ begin
   end;
 end;
 
-class procedure THorseProtobufRtti.InferScalarKind(ARttiType: TRttiType;
+class procedure TProtobufRtti.InferScalarKind(ARttiType: TRttiType;
   const ADesc: string; out AKind: TProtoFieldKind; out ASubmessageClass: TClass);
 var
   LTypeInfo:  PTypeInfo;
@@ -328,7 +336,7 @@ end;
   repeated is what keeps existing TBytes fields encoding exactly as they did —
   the alternative would silently re-frame every one of them and break the wire
   compatibility the 52/52 codec suite locks in. }
-class procedure THorseProtobufRtti.InferProtoKind(AProp: TRttiProperty;
+class procedure TProtobufRtti.InferProtoKind(AProp: TRttiProperty;
   var AField: TProtoFieldInfo);
 var
   LDynArrType: TRttiDynamicArrayType;
@@ -363,7 +371,7 @@ begin
     AField.Kind, AField.SubmessageClass);
 end;
 
-class function THorseProtobufRtti.BuildTypeInfo(AClass: TClass): TProtoTypeInfo;
+class function TProtobufRtti.BuildTypeInfo(AClass: TClass): TProtoTypeInfo;
 var
   LType:  TRttiType;
   LProp:  TRttiProperty;
@@ -532,7 +540,7 @@ begin
   if AObj = nil then
     raise EProtoRttiError.Create('Serialize: AObj is nil');
 
-  LInfo := THorseProtobufRtti.GetTypeInfo(AObj.ClassType);
+  LInfo := TProtobufRtti.GetTypeInfo(AObj.ClassType);
   LWriter := TProtoWriter.Create;
   try
     for LField in LInfo.Fields do
@@ -662,7 +670,7 @@ begin
   if AObj = nil then
     raise EProtoRttiError.Create('Deserialize: AObj is nil');
 
-  LInfo := THorseProtobufRtti.GetTypeInfo(AObj.ClassType);
+  LInfo := TProtobufRtti.GetTypeInfo(AObj.ClassType);
 
   LRepeated := TObjectDictionary<Integer, TList<TValue>>.Create([doOwnsValues]);
   try
@@ -810,6 +818,6 @@ initialization
   // FReady starts False by class-var default; LazyInit brings us up on first use.
 
 finalization
-  THorseProtobufRtti.Shutdown;
+  TProtobufRtti.Shutdown;
 
 end.

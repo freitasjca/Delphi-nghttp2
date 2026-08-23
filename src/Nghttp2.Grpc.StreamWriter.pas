@@ -94,14 +94,14 @@ var
   LProto: TBytes;
 begin
   if AResponse = nil then
-    raise EHorseGrpcRegistry.Create('IGrpcStreamWriter.Send: AResponse is nil');
+    raise EGrpcRegistry.Create('IGrpcStreamWriter.Send: AResponse is nil');
 
   try
     { Guard rather than trust: a handler that sends the wrong message type
       would otherwise produce a stream the client decodes as garbage, with the
       first sign of trouble arriving as a protobuf error on the far side. }
     if (FResponseClass <> nil) and (not AResponse.InheritsFrom(FResponseClass)) then
-      raise EHorseGrpcRegistry.CreateFmt(
+      raise EGrpcRegistry.CreateFmt(
         'IGrpcStreamWriter.Send: expected %s, got %s',
         [FResponseClass.ClassName, AResponse.ClassName]);
 

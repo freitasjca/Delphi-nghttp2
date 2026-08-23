@@ -6,7 +6,7 @@ unit Nghttp2.Engine.Iocp;
 //  Nghttp2.Engine.Iocp — IOCP event-loop driver for Windows.
 //
 //  The Windows counterpart to Nghttp2.Engine.Epoll. Same contract
-//  (INghttp2Engine), same opt-in (THorseNghttp2Config.UseEventLoop), same
+//  (INghttp2Engine), same opt-in (TNghttp2Config.UseEventLoop), same
 //  registration trick: nothing references this unit, so LINKING it is what
 //  enables it and the dependency stays one-way. On any non-Windows target the
 //  whole unit compiles to nothing.

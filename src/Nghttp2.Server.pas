@@ -12,7 +12,7 @@ unit Nghttp2.Server;
 //  accepted connection. Streams multiplex within that connection thread.
 //
 //  Whether they multiplex serially or in parallel is the host's choice, made
-//  through THorseNghttp2Config.AsyncDispatch:
+//  through TNghttp2Config.AsyncDispatch:
 //
 //    False (default) — OnRequest runs inline on the connection thread. One
 //      request at a time per connection, so a slow route blocks every other
@@ -73,7 +73,7 @@ uses
   Nghttp2.Tls;
 
 type
-  THorseNghttp2Config = record
+  TNghttp2Config = record
     Port:                 Word;
     ListenBacklog:        Integer;
     RecvBufferSize:       Integer;
@@ -111,8 +111,15 @@ type
       accepts and no handoff is needed. }
     EngineThreads:        Integer;
     // TLS + ALPN fields intentionally omitted in v1 — h2c only.
-    class function Default: THorseNghttp2Config; static;
+    class function Default: TNghttp2Config; static;
   end;
+
+  { Pre-1.6.0 name. The Horse prefix was a leftover from where this record was
+    written; nothing here has ever depended on Horse. An ALIAS, so a variable
+    declared with either name is the same record type and assigns freely to the
+    other. REMOVED IN 2.0.0. }
+  THorseNghttp2Config = TNghttp2Config
+    deprecated 'Renamed to TNghttp2Config. Removed in 2.0.0.';
 
   TNghttp2OnRequestProc = Nghttp2.Session.TNghttp2OnRequestProc;
 
@@ -376,7 +383,7 @@ type
   // ─── Server ───────────────────────────────────────────────────────────
   TNghttp2Server = class
   private
-    FConfig:         THorseNghttp2Config;
+    FConfig:         TNghttp2Config;
     FOnRequest:      TNghttp2OnRequestProc;
     { INBOUND-1 — handed to every new session. Plain-proc rather than
       `of object` for the same reason OnRequest is: the host wires a
@@ -469,7 +476,7 @@ type
     destructor  Destroy; override;
 
     // Bind, listen, spawn the accept thread. Returns immediately.
-    procedure Start(const AConfig: THorseNghttp2Config);
+    procedure Start(const AConfig: TNghttp2Config);
     // Close listener; accept loop exits; live connections keep running.
     procedure StopAcceptingNewConnections;
     // Hard-close every live connection socket.
@@ -555,9 +562,9 @@ begin
     WriteLn(AMsg);
 end;
 
-// ─── THorseNghttp2Config ─────────────────────────────────────────────────
+// ─── TNghttp2Config ─────────────────────────────────────────────────
 
-class function THorseNghttp2Config.Default: THorseNghttp2Config;
+class function TNghttp2Config.Default: TNghttp2Config;
 begin
   Result.Port                 := 9200;
   { FIX-BACKLOG (2026-08-17). Was 128, which silently lost connections under
@@ -1641,7 +1648,7 @@ begin
   TInterlocked.Decrement(FActiveRequests);
 end;
 
-procedure TNghttp2Server.Start(const AConfig: THorseNghttp2Config);
+procedure TNghttp2Server.Start(const AConfig: TNghttp2Config);
 begin
   if FListener <> INVALID_SOCKET_HANDLE then
     raise Exception.Create('TNghttp2Server: already listening');

@@ -10,13 +10,13 @@ unit Nghttp2.Grpc.Registry;
 //
 //  Two registration styles, both routed to the same internal storage:
 //
-//  1. **Procedural (M4a)** — `THorseGrpc.RegisterMethod(path, ReqClass,
+//  1. **Procedural (M4a)** — `TGrpcRegistry.RegisterMethod(path, ReqClass,
 //     RespClass, handler)` — explicit per-method registration with a
 //     `procedure(AReq, AResp: TObject) of object` handler that mutates the
 //     dispatcher-created response instance. Backward-compatible; no ARC
 //     gymnastics; works on Delphi + FPC.
 //
-//  2. **IInvokable (M4c)** — `THorseGrpc.RegisterService<IGreeter>(impl)` —
+//  2. **IInvokable (M4c)** — `TGrpcRegistry.RegisterService<IGreeter>(impl)` —
 //     walks the interface via RTTI, extracts path from `[TGrpcService]`
 //     attribute + method name, extracts request/response classes from
 //     method signature, and wires each method through
@@ -156,12 +156,12 @@ type
     IsClientStream: Boolean;
   end;
 
-  EHorseGrpcRegistry = class(Exception);
+  EGrpcRegistry = class(Exception);
 
   { Internal — one wrapper instance per registered interface method.
     Holds a strong ref to the service interface (which has ARC disabled
     per horse-grpc SKILL §2) and the TRttiMethod for invocation.
-    Owned by THorseGrpc.FWrappers, freed on Shutdown.
+    Owned by TGrpcRegistry.FWrappers, freed on Shutdown.
 
     GENERIC IN T ON PURPOSE — do not "simplify" this back to a plain
     `FIntf: IInterface` field. Erasing the interface type before building
@@ -188,8 +188,8 @@ type
   end;
 
   { Process-wide singleton via class methods + class vars.
-    Same shape as THorseProtobufRtti (see Nghttp2.Protobuf.Rtti.pas). }
-  THorseGrpc = class
+    Same shape as TProtobufRtti (see Nghttp2.Protobuf.Rtti.pas). }
+  TGrpcRegistry = class
   strict private
     class var FRegistry: TDictionary<string, TGrpcMethodInfo>;
     class var FWrappers: TObjectList<TObject>;   // holds TGrpcInvokableWrapper<T> of assorted T
@@ -200,7 +200,7 @@ type
       handed to each wrapper is owned by the context's pool and is used on
       every later dispatch, so a local context freed at the end of
       registration leaves every FMethod dangling. Same shape as
-      THorseProtobufRtti.FContext. }
+      TProtobufRtti.FContext. }
     class var FCtx:      TRttiContext;
     class procedure LazyInit;
     { Internal — invariant checks + insertion under the already-held lock.
@@ -209,17 +209,17 @@ type
     class procedure InsertLocked(const AInfo: TGrpcMethodInfo);
   public
     { M4a — Register a single method with a procedural handler. Called once
-      at startup per method. Raises EHorseGrpcRegistry on invalid input
+      at startup per method. Raises EGrpcRegistry on invalid input
       (nil handler, non-slash-prefixed path, duplicate registration).
 
       Example:
-        THorseGrpc.RegisterMethod(
+        TGrpcRegistry.RegisterMethod(
           '/users.UserService/GetUser',
           TUserRequest, TUserResponse,
           FUserServiceInstance.GetUser); }
     { Registers a server-streaming method (M6a).
 
-        THorseGrpc.RegisterServerStream(
+        TGrpcRegistry.RegisterServerStream(
           '/greeter.Greeter/ListGreetings',
           TGreetRequest, TGreetReply,
           GreeterImpl.ListGreetings);
@@ -270,9 +270,9 @@ type
       impl to prevent auto-destruction during dispatch (horse-grpc SKILL §2).
 
       Example:
-        THorseGrpc.RegisterService<IGreeter>(TGreeterServiceImpl.Create);
+        TGrpcRegistry.RegisterService<IGreeter>(TGreeterServiceImpl.Create);
 
-      Raises EHorseGrpcRegistry on invalid input (missing attribute, bad
+      Raises EGrpcRegistry on invalid input (missing attribute, bad
       method signature, duplicate path). Partial registration is possible
       if failure occurs mid-walk — call Shutdown then re-register. }
     class procedure RegisterService<T: IInvokable>(const AImpl: T);
@@ -287,6 +287,16 @@ type
     { Explicit shutdown — rarely needed; finalization does this too. }
     class procedure Shutdown;
   end;
+
+  { Pre-1.6.0 names. The Horse prefix was a leftover from where these units
+    were written; nothing here has ever depended on Horse. ALIASES, not
+    subclasses, so `TGrpcRegistry.RegisterService<T>` still resolves to the
+    real generic class method and `except on E: EHorseGrpcRegistry` still
+    catches what this unit raises. REMOVED IN 2.0.0. }
+  THorseGrpc = TGrpcRegistry
+    deprecated 'Renamed to TGrpcRegistry. Removed in 2.0.0.';
+  EHorseGrpcRegistry = EGrpcRegistry
+    deprecated 'Renamed to EGrpcRegistry. Removed in 2.0.0.';
 
 implementation
 
@@ -339,16 +349,16 @@ begin
   LResult := FMethod.Invoke(TValue.From<T>(FIntf), LArgs);
 
   if LResult.IsEmpty or not LResult.IsObject then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'RegisterService: method %s did not return a TObject instance',
       [FMethod.Name]);
 
   Result := LResult.AsObject;
 end;
 
-// ── THorseGrpc ────────────────────────────────────────────────────────────
+// ── TGrpcRegistry ────────────────────────────────────────────────────────────
 
-class procedure THorseGrpc.LazyInit;
+class procedure TGrpcRegistry.LazyInit;
 begin
   if FReady then Exit;
   if FLock = nil then
@@ -364,7 +374,7 @@ begin
   end;
 end;
 
-class procedure THorseGrpc.Shutdown;
+class procedure TGrpcRegistry.Shutdown;
 begin
   if not FReady then Exit;
   FLock.Enter;
@@ -383,15 +393,15 @@ begin
   FLock := nil;
 end;
 
-class procedure THorseGrpc.InsertLocked(const AInfo: TGrpcMethodInfo);
+class procedure TGrpcRegistry.InsertLocked(const AInfo: TGrpcMethodInfo);
 begin
   if FRegistry.ContainsKey(AInfo.Path) then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'RegisterMethod: %s already registered — duplicate registration', [AInfo.Path]);
   FRegistry.Add(AInfo.Path, AInfo);
 end;
 
-class procedure THorseGrpc.RegisterMethod(
+class procedure TGrpcRegistry.RegisterMethod(
   const APath:    string;
   ARequestClass:  TClass;
   AResponseClass: TClass;
@@ -400,17 +410,17 @@ var
   LInfo: TGrpcMethodInfo;
 begin
   if APath = '' then
-    raise EHorseGrpcRegistry.Create('RegisterMethod: APath cannot be empty');
+    raise EGrpcRegistry.Create('RegisterMethod: APath cannot be empty');
   if (Length(APath) < 2) or (APath[1] <> '/') then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'RegisterMethod: APath %s must start with "/" and follow /<Service>/<Method> form',
       [APath]);
   if ARequestClass = nil then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterMethod(%s): ARequestClass is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterMethod(%s): ARequestClass is nil', [APath]);
   if AResponseClass = nil then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterMethod(%s): AResponseClass is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterMethod(%s): AResponseClass is nil', [APath]);
   if not Assigned(AHandler) then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterMethod(%s): AHandler is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterMethod(%s): AHandler is nil', [APath]);
 
   LazyInit;
   FLock.Enter;
@@ -431,7 +441,7 @@ begin
   end;
 end;
 
-class procedure THorseGrpc.RegisterServerStream(
+class procedure TGrpcRegistry.RegisterServerStream(
   const APath:    string;
   ARequestClass:  TClass;
   AResponseClass: TClass;
@@ -440,17 +450,17 @@ var
   LInfo: TGrpcMethodInfo;
 begin
   if APath = '' then
-    raise EHorseGrpcRegistry.Create('RegisterServerStream: APath cannot be empty');
+    raise EGrpcRegistry.Create('RegisterServerStream: APath cannot be empty');
   if (Length(APath) < 2) or (APath[1] <> '/') then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'RegisterServerStream: APath %s must start with "/" and follow /<Service>/<Method> form',
       [APath]);
   if ARequestClass = nil then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterServerStream(%s): ARequestClass is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterServerStream(%s): ARequestClass is nil', [APath]);
   if AResponseClass = nil then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterServerStream(%s): AResponseClass is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterServerStream(%s): AResponseClass is nil', [APath]);
   if not Assigned(AHandler) then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterServerStream(%s): AHandler is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterServerStream(%s): AHandler is nil', [APath]);
 
   LazyInit;
   FLock.Enter;
@@ -471,7 +481,7 @@ begin
   end;
 end;
 
-class procedure THorseGrpc.RegisterService<T>(const AImpl: T);
+class procedure TGrpcRegistry.RegisterService<T>(const AImpl: T);
 var
   LIntfType:  TRttiInterfaceType;
   LMethods:   TArray<TRttiMethod>;
@@ -485,7 +495,7 @@ var
   LInfo:      TGrpcMethodInfo;
 begin
   if TypeInfo(T) = nil then
-    raise EHorseGrpcRegistry.Create(
+    raise EGrpcRegistry.Create(
       'RegisterService<T>: no RTTI for T (compile with {$M+} on the interface unit)');
 
   LazyInit;
@@ -506,7 +516,7 @@ begin
     end;
 
   if LSvcName = '' then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'RegisterService<T>: interface %s lacks a [TGrpcService(''name'')] attribute ' +
       '(on FPC, also check the unit declaring it carries the {$RTTI EXPLICIT ...} directive)',
       [LIntfType.Name]);
@@ -516,7 +526,7 @@ begin
     nothing and answering UNIMPLEMENTED to every call at run time. }
   LMethods := LIntfType.GetDeclaredMethods;
   if Length(LMethods) = 0 then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       'RegisterService<T>: interface %s exposes no methods via RTTI — ' +
       'declare it in a unit with {$M+} (and, on FPC, {$RTTI EXPLICIT METHODS([vcPublic])})',
       [LIntfType.Name]);
@@ -526,15 +536,15 @@ begin
     { Signature validation — exactly one class parameter + class return type. }
     LParams := LMethod.GetParameters;
     if Length(LParams) <> 1 then
-      raise EHorseGrpcRegistry.CreateFmt(
+      raise EGrpcRegistry.CreateFmt(
         'RegisterService(%s.%s): expected 1 parameter, got %d — must be `function %s(const ARequest: TRequestClass): TResponseClass`',
         [LIntfType.Name, LMethod.Name, Length(LParams), LMethod.Name]);
     if (LParams[0].ParamType = nil) or (LParams[0].ParamType.TypeKind <> tkClass) then
-      raise EHorseGrpcRegistry.CreateFmt(
+      raise EGrpcRegistry.CreateFmt(
         'RegisterService(%s.%s): parameter must be a TObject subclass',
         [LIntfType.Name, LMethod.Name]);
     if (LMethod.ReturnType = nil) or (LMethod.ReturnType.TypeKind <> tkClass) then
-      raise EHorseGrpcRegistry.CreateFmt(
+      raise EGrpcRegistry.CreateFmt(
         'RegisterService(%s.%s): return type must be a TObject subclass',
         [LIntfType.Name, LMethod.Name]);
 
@@ -579,18 +589,18 @@ procedure ValidateStreamPath(const AKind, APath: string;
   ARequestClass, AResponseClass: TClass);
 begin
   if APath = '' then
-    raise EHorseGrpcRegistry.CreateFmt('%s: APath cannot be empty', [AKind]);
+    raise EGrpcRegistry.CreateFmt('%s: APath cannot be empty', [AKind]);
   if (Length(APath) < 2) or (APath[1] <> '/') then
-    raise EHorseGrpcRegistry.CreateFmt(
+    raise EGrpcRegistry.CreateFmt(
       '%s: APath %s must start with "/" and follow /<Service>/<Method> form',
       [AKind, APath]);
   if ARequestClass = nil then
-    raise EHorseGrpcRegistry.CreateFmt('%s(%s): ARequestClass is nil', [AKind, APath]);
+    raise EGrpcRegistry.CreateFmt('%s(%s): ARequestClass is nil', [AKind, APath]);
   if AResponseClass = nil then
-    raise EHorseGrpcRegistry.CreateFmt('%s(%s): AResponseClass is nil', [AKind, APath]);
+    raise EGrpcRegistry.CreateFmt('%s(%s): AResponseClass is nil', [AKind, APath]);
 end;
 
-class procedure THorseGrpc.RegisterClientStream(
+class procedure TGrpcRegistry.RegisterClientStream(
   const APath:    string;
   ARequestClass:  TClass;
   AResponseClass: TClass;
@@ -600,7 +610,7 @@ var
 begin
   ValidateStreamPath('RegisterClientStream', APath, ARequestClass, AResponseClass);
   if not Assigned(AHandler) then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterClientStream(%s): AHandler is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterClientStream(%s): AHandler is nil', [APath]);
 
   LazyInit;
   FLock.Enter;
@@ -621,7 +631,7 @@ begin
   end;
 end;
 
-class procedure THorseGrpc.RegisterBidiStream(
+class procedure TGrpcRegistry.RegisterBidiStream(
   const APath:    string;
   ARequestClass:  TClass;
   AResponseClass: TClass;
@@ -631,7 +641,7 @@ var
 begin
   ValidateStreamPath('RegisterBidiStream', APath, ARequestClass, AResponseClass);
   if not Assigned(AHandler) then
-    raise EHorseGrpcRegistry.CreateFmt('RegisterBidiStream(%s): AHandler is nil', [APath]);
+    raise EGrpcRegistry.CreateFmt('RegisterBidiStream(%s): AHandler is nil', [APath]);
 
   LazyInit;
   FLock.Enter;
@@ -655,7 +665,7 @@ begin
   end;
 end;
 
-class function THorseGrpc.IsInboundStreaming(const APath: string): Boolean;
+class function TGrpcRegistry.IsInboundStreaming(const APath: string): Boolean;
 var
   LInfo: TGrpcMethodInfo;
 begin
@@ -665,7 +675,7 @@ begin
   Result := TryGet(APath, LInfo) and LInfo.IsClientStream;
 end;
 
-class function THorseGrpc.TryGet(const APath: string; out AInfo: TGrpcMethodInfo): Boolean;
+class function TGrpcRegistry.TryGet(const APath: string; out AInfo: TGrpcMethodInfo): Boolean;
 begin
   if not FReady then Exit(False);
   FLock.Enter;
@@ -676,7 +686,7 @@ begin
   end;
 end;
 
-class function THorseGrpc.Count: Integer;
+class function TGrpcRegistry.Count: Integer;
 begin
   if not FReady then Exit(0);
   FLock.Enter;
@@ -691,6 +701,6 @@ initialization
   // FReady starts False by class-var default; LazyInit bootstraps on first use.
 
 finalization
-  THorseGrpc.Shutdown;
+  TGrpcRegistry.Shutdown;
 
 end.

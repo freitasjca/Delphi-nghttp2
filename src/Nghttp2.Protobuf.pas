@@ -26,7 +26,7 @@ unit Nghttp2.Protobuf;
 //    3. RTTI-driven message-class scanner + serialise/deserialise
 //       — DEFERRED to M1b (next session). See horse-grpc SKILL.md for the
 //       target API: [ProtoMember(N)] attributes on `published` properties,
-//       `THorseProtobufRtti` singleton, cross-compiler attribute discovery.
+//       `TProtobufRtti` singleton, cross-compiler attribute discovery.
 //
 //  This file dual-compiles on Delphi (dcc32/dcc64) and FPC/Lazarus (fpc).
 //  All I/O goes through TEncoding.UTF8 for string fields regardless of the

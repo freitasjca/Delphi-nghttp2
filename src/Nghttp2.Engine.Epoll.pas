@@ -7,7 +7,7 @@ unit Nghttp2.Engine.Epoll;
 //  Event-loop connection driver for Linux. Many connections per thread,
 //  instead of TNghttp2ConnectionThread's one thread each.
 //
-//  Enabled by linking this unit AND setting THorseNghttp2Config.UseEventLoop.
+//  Enabled by linking this unit AND setting TNghttp2Config.UseEventLoop.
 //  Linking alone changes nothing; the unit registers itself through
 //  Nghttp2EngineFactory in its initialization, and Nghttp2.Server never names
 //  it. On any non-Linux target the whole unit compiles to nothing, so it is

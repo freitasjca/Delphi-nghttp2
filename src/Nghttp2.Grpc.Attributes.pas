@@ -7,7 +7,7 @@ unit Nghttp2.Grpc.Attributes;
 //  M4c (2026-08-09): attribute types for the IInvokable-based ergonomic API.
 //
 //  `[TGrpcService('greeter.Greeter')]` marks an interface as a gRPC service.
-//  `THorseGrpc.RegisterService<T>` reads this attribute to compose method
+//  `TGrpcRegistry.RegisterService<T>` reads this attribute to compose method
 //  paths as `/<Name>/<MethodName>` per gRPC-over-HTTP/2 spec.
 //
 //  Naming: T-prefix, `Attribute` suffix. Delphi strips ONLY the `Attribute`
