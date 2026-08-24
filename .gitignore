@@ -57,3 +57,6 @@ desktop.ini
 # FPC build output
 .fpc-out/
 tests/interlocked_check
+
+# Test-runner output (run-tests.bat writes one per stage)
+*.buildlog

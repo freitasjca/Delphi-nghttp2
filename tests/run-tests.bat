@@ -1,0 +1,132 @@
+@echo off
+setlocal enabledelayedexpansion
+REM ===========================================================================
+REM  run-tests.bat — build and run this library's test programs with dcc64.
+REM
+REM  The Windows counterpart to build-codec-fpc.sh. Same stages, same gating:
+REM
+REM    1  Nghttp2ProtobufTests            build + run   (gates)
+REM    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
+REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
+REM
+REM  Exists because until 2026-08-24 these were compiled by hand, every time,
+REM  from a command line nobody had written down. A regression suite that only
+REM  runs when somebody remembers is one refactor away from being decorative —
+REM  and stage 2 is what stops five malformed-input defects coming back.
+REM
+REM  Usage:
+REM    cd tests
+REM    run-tests.bat
+REM
+REM  Override Delphi discovery:
+REM    set DELPHI_ROOT=C:\Program Files ^(x86^)\Embarcadero\Studio\23.0
+REM
+REM  Exit code: number of failing stages. 0 means everything passed.
+REM
+REM  ---------------------------------------------------------------------
+REM  NO PARENTHESISED BLOCKS ANYWHERE IN THIS FILE.
+REM
+REM  Delphi lives under "C:\Program Files (x86)\...". cmd matches parens BEFORE
+REM  expanding variables, so any %VAR% holding that path closes an ( ) block
+REM  early and the script fails in a way that looks nothing like its cause. It
+REM  is the variable's VALUE that breaks it, not its name. Every branch here
+REM  uses goto, and every path variable is read with delayed expansion !VAR!.
+REM  The same rule, and the same reason, is documented at length in
+REM  horse-provider-nghttp2\scripts\build-dcc-fixed.bat.
+REM
+REM  -B on every compile, deliberately. A .dcu built with different defines is
+REM  NOT invalidated by changing them — dcc compares timestamps, not the define
+REM  set — and the failure is silent: you measure or test the wrong binary with
+REM  no diagnostic. These suites are small; a full build costs under a second.
+REM ===========================================================================
+
+set "FAILED=0"
+
+REM -- Locate dcc64 ----------------------------------------------------------
+set "DCC="
+if not "%DELPHI_ROOT%"=="" if exist "%DELPHI_ROOT%\bin\dcc64.exe" set "DCC=%DELPHI_ROOT%\bin\dcc64.exe"
+if not "%BDS%"=="" if exist "%BDS%\bin\dcc64.exe" set "DCC=%BDS%\bin\dcc64.exe"
+if not defined DCC for /f "delims=" %%I in ('where dcc64.exe 2^>nul') do if not defined DCC set "DCC=%%I"
+if not defined DCC goto :no_dcc
+
+echo dcc64:  !DCC!
+echo Source: ..\src
+echo.
+
+REM -- Stages ----------------------------------------------------------------
+set "STAGE=Nghttp2ProtobufTests"
+set "GATES=1"
+call :build_run
+
+set "STAGE=Nghttp2ProtobufNegativeTests"
+set "GATES=1"
+call :build_run
+
+set "STAGE=Nghttp2AllocBench"
+set "GATES=0"
+call :build_run
+
+echo.
+echo ===========================================================================
+if "!FAILED!"=="0" goto :all_ok
+echo  FAILED  - !FAILED! stage^(s^) did not pass
+exit /b !FAILED!
+
+:all_ok
+echo  ALL STAGES PASSED
+exit /b 0
+
+REM ===========================================================================
+:build_run
+echo -- !STAGE! ---------------------------------------------------------------
+if not exist "!STAGE!.dpr" goto :br_missing
+
+"!DCC!" -CC -B -U"..\src" "!STAGE!.dpr" > "!STAGE!.buildlog" 2>&1
+if errorlevel 1 goto :br_buildfail
+if not exist "!STAGE!.exe" goto :br_buildfail
+
+"!STAGE!.exe" < nul
+set "RC=!errorlevel!"
+REM The codec suite ends on a ReadLn prompt with no trailing newline, so
+REM without this the verdict below lands on the same row as it.
+echo.
+
+if "!GATES!"=="0" goto :br_report
+if not "!RC!"=="0" goto :br_runfail
+echo    PASS  !STAGE!
+goto :eof
+
+:br_report
+echo    ^(report only - exit code !RC! ignored by design; this stage measures
+echo     a NUMBER, and gating it would mean inventing a threshold^)
+goto :eof
+
+:br_runfail
+echo    FAIL  !STAGE! - !RC! check^(s^) failed
+set /a FAILED+=1
+goto :eof
+
+:br_buildfail
+echo    FAIL  !STAGE! did not compile
+findstr /C:"Error" /C:"Fatal" "!STAGE!.buildlog"
+echo.
+echo    If that says F2039 "Could not create output file", the compile
+echo    SUCCEEDED and only the write failed: the exe is still running and
+echo    holding its own image. Nothing is wrong with the source.
+echo        taskkill /IM !STAGE!.exe /F
+echo.
+echo    Full log: !STAGE!.buildlog
+set /a FAILED+=1
+goto :eof
+
+:br_missing
+echo    SKIP  !STAGE!.dpr not present
+goto :eof
+
+REM ===========================================================================
+:no_dcc
+echo ERROR: dcc64.exe not found.
+echo        Set DELPHI_ROOT, e.g.
+echo            set DELPHI_ROOT=C:\Program Files ^(x86^)\Embarcadero\Studio\23.0
+echo        or run this from a shell where rsvars.bat has been called.
+exit /b 2

@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  build-codec-fpc.sh
-#  Compile + run Nghttp2ProtobufTests under FPC, then compile (not run) the
-#  standalone samples/grpc-server. Both need trunk for the same reason, and
-#  both need the same -Fu list, which is why they share this script.
+#  Compile + run the codec suites under FPC, then compile (not run) the
+#  standalone samples/grpc-server. Everything here needs trunk for the same
+#  reason and the same -Fu list, which is why it all shares one script.
+#
+#  Stages:
+#    1  Nghttp2ProtobufTests            build + run   (gates)
+#    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
+#    3  Nghttp2AllocBench               build + run   (reports, never gates)
+#    4  samples/grpc-server             compile only  (gates)
+#    5  samples/grpc-server, old define compile only  (gates back-compat)
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -120,6 +127,87 @@ if [[ $RC -eq 0 ]]; then
   echo "codec suite: PASSED"
 else
   echo "codec suite: FAILED (exit $RC)"
+fi
+
+# ── negative suite — malformed input must be REJECTED ────────────────────────
+# Added 2026-08-24 with the suite itself. This is the gate that stops the five
+# defects of that date coming back, and a regression suite nobody runs
+# automatically is one refactor away from being decorative — which is exactly
+# why it lives here rather than in a README instruction.
+#
+# -dNGHTTP2_GRPC_NO_FFI is required, for a different reason than the sample
+# below needs it. The suite tests StripGrpcPrefix, which lives in
+# Nghttp2.Grpc.Dispatcher, whose implementation pulls in Nghttp2.Grpc.Registry,
+# which pulls in ffi.manager. Nothing here dispatches a gRPC call, so the define
+# severs that and libffi never has to be on the search path. Without it the
+# build dies on `PPU Invalid Version 207 expecting 208` from the distro's
+# libffi units — the same wrong-compiler trap the header describes, reached by a
+# different route.
+echo
+echo "── negative suite (malformed input) ─────────────────────────────────"
+NEG="$HERE/Nghttp2ProtobufNegativeTests.dpr"
+if [[ -f "$NEG" ]]; then
+  NOUT="$OUT/negative"
+  mkdir -p "$NOUT"
+  rm -f "$NOUT"/*.ppu "$NOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+       -FU"$NOUT" -FE"$NOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$NEG" > "$NOUT/build.log" 2>&1 && [[ -x "$NOUT/Nghttp2ProtobufNegativeTests" ]]; then
+    "$NOUT/Nghttp2ProtobufNegativeTests" < /dev/null
+    NRC=$?
+    if [[ $NRC -ne 0 ]]; then
+      echo "  negative suite: FAILED ($NRC checks)"
+      [[ $RC -eq 0 ]] && RC=1
+    else
+      echo "  negative suite: PASSED"
+    fi
+  else
+    echo "  FAIL  Nghttp2ProtobufNegativeTests.dpr did not compile"
+    grep -E "Error|Fatal" "$NOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $NOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2ProtobufNegativeTests.dpr not present"
+fi
+
+# ── allocation benchmark — reported, never a gate ────────────────────────────
+# Built and run so it cannot rot, but its exit code is deliberately ignored.
+# It measures allocations per operation, which is a NUMBER rather than a
+# pass/fail: a change there wants a human deciding whether it is an improvement
+# or a regression. Wiring it as a gate would mean picking a threshold, and a
+# threshold picked without a reason is just a future false alarm.
+#
+# What it IS good for automatically: proving it still builds and still produces
+# bit-identical counts run to run. If two consecutive runs ever disagree, the
+# harness is broken — see the file's own closing note.
+echo
+echo "── allocation benchmark (report only, not a gate) ───────────────────"
+BENCH="$HERE/Nghttp2AllocBench.dpr"
+if [[ -f "$BENCH" ]]; then
+  ABOUT="$OUT/allocbench"
+  mkdir -p "$ABOUT"
+  rm -f "$ABOUT"/*.ppu "$ABOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$ABOUT" -FE"$ABOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$BENCH" > "$ABOUT/build.log" 2>&1 && [[ -x "$ABOUT/Nghttp2AllocBench" ]]; then
+    # The counting shim is Delphi-only; on FPC the program says so and exits 0.
+    # Building it here still has value — it proves the message path compiles
+    # and that the message stays accurate.
+    "$ABOUT/Nghttp2AllocBench" < /dev/null | sed 's/^/  /'
+    echo "  (informational — for real numbers use -gh, or run the Delphi build)"
+  else
+    echo "  FAIL  Nghttp2AllocBench.dpr did not compile"
+    grep -E "Error|Fatal" "$ABOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $ABOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2AllocBench.dpr not present"
 fi
 
 # ── samples/grpc-server — compile only ───────────────────────────────────────
