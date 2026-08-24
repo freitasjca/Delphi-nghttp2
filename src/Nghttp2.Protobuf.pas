@@ -104,14 +104,26 @@ type
     session). }
   TProtoWriter = class
   strict private
-    FBuffer: TBytesStream;
+    { FIX-PROTO-ALLOC-1. Was a TBytesStream, which cost 8192 bytes on the
+      first byte written: TBytesStream.Realloc (System.Classes) rounds every
+      capacity request up to MemoryDelta = $2000, and it overrides
+      TMemoryStream.Realloc with the identical rounding, so neither class
+      avoids the floor. Measured by Nghttp2AllocBench: encoding a message with
+      one integer field allocated 8306 bytes against 160 to decode it, and a
+      50-byte gRPC response therefore cost ~166x its own size in allocator
+      traffic.
+
+      A plain TBytes grown from PROTO_WRITER_INITIAL_CAPACITY has no such
+      floor, and keeps the change inside this class - no API change, no
+      lifetime change, and each Serialize still gets its own writer, so no
+      threading question arises. }
+    FBuf: TBytes;
+    FLen: Integer;      // bytes written; Length(FBuf) is the capacity
+    procedure EnsureCapacity(AExtra: Integer);
     procedure WriteRawByte(AByte: Byte); inline;
     procedure WriteRawBytes(const ABytes: PByte; ALen: Integer); inline;
     function GetSize: Int64;
   public
-    constructor Create;
-    destructor Destroy; override;
-
     procedure Reset;
     function ToBytes: TBytes;
     property Size: Int64 read GetSize;
@@ -219,6 +231,20 @@ procedure ParseTag(ATag: UInt32; out AFieldNumber: Integer; out AWireType: TProt
 
 implementation
 
+const
+  { Starting capacity of a TProtoWriter buffer, doubled as needed.
+
+    256 rather than something smaller because it covers a typical gRPC message
+    in ONE allocation - the common case is tens to a few hundred bytes - and
+    rather than something larger because the whole point of FIX-PROTO-ALLOC-1
+    is that a small message must not pay for space it will never use. It is
+    32x below the 8192-byte floor this replaced.
+
+    Re-measure with Delphi-nghttp2/tests/Nghttp2AllocBench.dpr before changing
+    it: that tool reports allocations per operation, which has zero variance,
+    so a change here is judged on an exact number rather than on timing. }
+  PROTO_WRITER_INITIAL_CAPACITY = 256;
+
 // ── TGrpcMessageAttribute / TGrpcServiceAttribute ───────────────────────────
 
 constructor TGrpcMessageAttribute.Create;
@@ -295,46 +321,76 @@ end;
 
 // ── TProtoWriter ─────────────────────────────────────────────────────────────
 
-constructor TProtoWriter.Create;
-begin
-  inherited Create;
-  FBuffer := TBytesStream.Create;
-end;
+{ No constructor body is needed: FBuf starts nil and FLen zero, and the first
+  write allocates. A writer that is created and never written costs nothing,
+  which the TBytesStream version could not manage. No destructor either - FBuf
+  is a managed field and is released with the instance. }
 
-destructor TProtoWriter.Destroy;
+procedure TProtoWriter.EnsureCapacity(AExtra: Integer);
+var
+  LNeeded, LNewCap: Integer;
 begin
-  FBuffer.Free;
-  inherited;
+  LNeeded := FLen + AExtra;
+  if LNeeded <= Length(FBuf) then Exit;
+
+  { Grow by max(2 x current, needed) rather than doubling repeatedly until it
+    fits. Repeated doubling OVERSHOOTS a single large write: measured, a
+    4099-byte requirement climbed 256->512->...->8192 and landed on 8192 - the
+    very figure FIX-PROTO-ALLOC-1 set out to remove - while also paying the
+    initial 256 on the way. Taking the larger of one doubling and the exact
+    requirement keeps growth amortised for streams of small writes and sizes a
+    single big write exactly. }
+  LNewCap := Length(FBuf);
+  if LNewCap = 0 then
+    LNewCap := PROTO_WRITER_INITIAL_CAPACITY
+  else if LNewCap <= MaxInt div 2 then
+    { Guarded: past half the Integer range doubling overflows to a negative,
+      which would reach SetLength as a garbage size rather than as an error.
+      Leaving the capacity alone lets the exact-requirement line below take
+      over - a message that large has bigger problems than one extra realloc. }
+    LNewCap := LNewCap * 2;
+
+  if LNewCap < LNeeded then
+    LNewCap := LNeeded;
+
+  SetLength(FBuf, LNewCap);
 end;
 
 procedure TProtoWriter.Reset;
 begin
-  FBuffer.Size := 0;
-  FBuffer.Position := 0;
+  { Capacity is deliberately NOT released. The old TBytesStream.Size := 0 went
+    through Realloc(0), which frees the buffer outright, so a reused writer
+    paid the full allocation again on its next write. Keeping the array means
+    reuse actually buys something. }
+  FLen := 0;
 end;
 
 function TProtoWriter.GetSize: Int64;
 begin
-  Result := FBuffer.Size;
+  Result := FLen;
 end;
 
 function TProtoWriter.ToBytes: TBytes;
 begin
-  // TBytesStream.Bytes returns the internal buffer — copy to trim to actual Size.
-  SetLength(Result, FBuffer.Size);
-  if FBuffer.Size > 0 then
-    Move(FBuffer.Bytes[0], Result[0], FBuffer.Size);
+  // Trim to what was actually written — the buffer is usually larger.
+  SetLength(Result, FLen);
+  if FLen > 0 then
+    Move(FBuf[0], Result[0], FLen);
 end;
 
 procedure TProtoWriter.WriteRawByte(AByte: Byte);
 begin
-  FBuffer.WriteBuffer(AByte, 1);
+  EnsureCapacity(1);
+  FBuf[FLen] := AByte;
+  Inc(FLen);
 end;
 
 procedure TProtoWriter.WriteRawBytes(const ABytes: PByte; ALen: Integer);
 begin
-  if ALen > 0 then
-    FBuffer.WriteBuffer(ABytes^, ALen);
+  if ALen <= 0 then Exit;
+  EnsureCapacity(ALen);
+  Move(ABytes^, FBuf[FLen], ALen);
+  Inc(FLen, ALen);
 end;
 
 procedure TProtoWriter.WriteVarint(AValue: UInt64);
