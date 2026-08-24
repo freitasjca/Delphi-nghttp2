@@ -62,9 +62,48 @@ unit Nghttp2.Engine.Iocp;
 //     different semantics and would let an unrelated process steal the port.
 //     So this engine takes the fallback the interface already documents:
 //     the server keeps its listener and accept thread, and hands sockets over
-//     through HandOff. AcceptEx would allow engine-owned accepts later; it is
-//     not needed to make the driver work and would add a second overlapped
-//     path before the first one has been measured.
+//     through HandOff.
+//
+//     An earlier version of this note said "AcceptEx would allow engine-owned
+//     accepts later". That is WRONG as stated, and the correction matters
+//     because the sentence was being read as a ready-made plan.
+//
+//     A completion port is associated with the underlying socket, not with a
+//     descriptor, and the association is permanent and singular. One listener
+//     can therefore feed exactly ONE of the N private ports above, so every
+//     AcceptEx completion lands on one loop no matter how many are posted.
+//     Duplicating the listener with WSADuplicateSocket does not escape it
+//     either: the duplicate shares the underlying socket, so the second
+//     association is expected to be refused. AcceptEx would remove the
+//     dedicated accept thread and its blocking accept(), which is worth
+//     something under burst connects — but it does NOT make each loop admit
+//     its own connections, and it does not remove the funnel.
+//
+//     Engine-owned accepts on Windows require giving up decision 1 and moving
+//     to ONE shared port with N threads, which is how dext does it
+//     (Dext.Server.Iocp: one CreateIoCompletionPort, 10 outstanding AcceptEx,
+//     N workers on that port). That buys kernel load balancing and costs the
+//     per-loop thread affinity this pump was validated against. It is a real
+//     trade, not a free upgrade, and it needs its own measurement.
+//
+//     FIX-IOCP-ADMIT-1 (2026-08-24) was tried here and REVERTED. It called
+//     AdmitPending on the completion path as well as on the timeout and wake
+//     branches, mirroring what Nghttp2.Engine.Epoll's RunLoop does every
+//     cycle. Six A/B runs on Windows/Delphi 12 never reproduced the accept
+//     stall it was meant to fix: 0 of 800 ramp connections and 0 of 400
+//     probes, either binary, worst case 165 ms against a recorded 69 000 ms.
+//
+//     It also appeared to cost 9-23% throughput, and that WAS WRONG — a null
+//     control (this file rebuilt after the revert, byte-identical codegen to
+//     the original, A/B'd against it) differed by 6.2%, and five runs of
+//     identical code spread 17%. The harness cannot resolve a difference that
+//     size. Reverted on the zero-benefit finding alone.
+//
+//     The reasoning still looks sound and the asymmetry with the epoll loop is
+//     real, so this is unproven rather than wrong — see
+//     docs/nghttp2-performance-backlog.md. Do not re-apply it without a
+//     harness that first demonstrates the stall, and run a null control before
+//     believing any throughput delta this rig reports.
 //
 //  ── Imports are declared locally, on purpose ──
 //
