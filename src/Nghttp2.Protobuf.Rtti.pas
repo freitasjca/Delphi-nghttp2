@@ -163,6 +163,10 @@ type
     instances. Uses TProtobufRtti for field discovery and
     Nghttp2.Protobuf for wire I/O. Stateless — all methods are class-level. }
   TProtoSerializer = class
+  private
+    { Carries the body Deserialize used to have. Deserialize is now a thin
+      depth-guarding wrapper around it - see FIX-PROTO-DEPTH-1. }
+    class procedure DeserializeCore(const AData: TBytes; AObj: TObject);
   public
     { Serialize the published-property state of AObj into proto3 bytes.
       AObj MUST be a class instance with at least one `[ProtoMember]`
@@ -178,6 +182,26 @@ type
   end;
 
 implementation
+
+const
+  { FIX-PROTO-DEPTH-1. Maximum nesting of submessages accepted while decoding.
+
+    Deserialize recurses once per nested submessage. Depth is driven by the
+    message SCHEMA, so it is only unbounded when a user's message type refers
+    to itself - which is ordinary in protobuf, since trees and linked
+    structures are expressed exactly that way. Given such a type, a crafted
+    payload of nothing but nested length prefixes drives recursion until the
+    stack is exhausted, and stack exhaustion is not catchable.
+
+    100 matches the default that mainstream protobuf implementations use. Real
+    messages do not approach it; a payload that does is an attack or a bug. }
+  PROTO_MAX_DEPTH = 100;
+
+threadvar
+  { Per-thread because serialization runs concurrently on gRPC worker threads
+    and each has its own recursion. A class var would let one thread's nesting
+    reject another thread's legitimate message. }
+  GDeserializeDepth: Integer;
 
 // ── TProtobufRtti ───────────────────────────────────────────────────────
 
@@ -646,6 +670,24 @@ begin
 end;
 
 class procedure TProtoSerializer.Deserialize(const AData: TBytes; AObj: TObject);
+begin
+  { The counter is incremented BEFORE the test so that the outermost call sees
+    depth 1, and decremented in a finally so an exception thrown anywhere in
+    the tree unwinds it correctly - otherwise one malformed message would
+    poison every later decode on that thread. }
+  Inc(GDeserializeDepth);
+  try
+    if GDeserializeDepth > PROTO_MAX_DEPTH then
+      raise EProtoDecodeError.CreateFmt(
+        'Proto decode aborted: submessage nesting exceeded %d levels.',
+        [PROTO_MAX_DEPTH]);
+    DeserializeCore(AData, AObj);
+  finally
+    Dec(GDeserializeDepth);
+  end;
+end;
+
+class procedure TProtoSerializer.DeserializeCore(const AData: TBytes; AObj: TObject);
 var
   LInfo:       TProtoTypeInfo;
   LReader:     TProtoReader;
