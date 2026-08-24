@@ -33,6 +33,13 @@ unit Nghttp2.Grpc.Dispatcher;
 interface
 
 uses
+{$IF DEFINED(FPC)}
+  SysUtils,          { TBytes - needed in the INTERFACE for StripGrpcPrefix.
+                       Pascal has no transitive imports: Nghttp2.Types using
+                       SysUtils does not make TBytes visible here. }
+{$ELSE}
+  System.SysUtils,
+{$IFEND}
   Nghttp2.Types;
 
 type
@@ -65,13 +72,23 @@ const
   GRPC_STATUS_UNIMPLEMENTED    = 12;
   GRPC_STATUS_INTERNAL         = 13;
 
+{ Exposed for the negative-test suite (Nghttp2ProtobufNegativeTests). It parses
+  the 5-byte prefix off an attacker-controlled buffer and is the one place a
+  malformed length can do damage, so it needs direct tests; reaching it through
+  TryDispatch would mean stubbing INghttp2Stream for no added coverage. Pure
+  function, no state - exposing it costs nothing. }
+function StripGrpcPrefix(const AData: TBytes; out ABody: TBytes;
+  out AError: string): Boolean;
+
 implementation
 
 uses
 {$IF DEFINED(FPC)}
-  SysUtils, Classes, StrUtils,
+  { SysUtils moved to the interface uses - TBytes appears in StripGrpcPrefix's
+    signature now. Not repeated here. }
+  Classes, StrUtils,
 {$ELSE}
-  System.SysUtils, System.Classes, System.StrUtils,
+  System.Classes, System.StrUtils,
 {$IFEND}
   Nghttp2.Protobuf,
   Nghttp2.Protobuf.Rtti,
@@ -101,7 +118,32 @@ begin
              (UInt32(AData[2]) shl 16) or
              (UInt32(AData[3]) shl 8)  or
               UInt32(AData[4]);
-  if Length(AData) < 5 + Integer(LMsgLen) then
+
+  { FIX-GRPC-LEN-1. The cap MUST be tested before any signed arithmetic on
+    LMsgLen, and this ordering is the fix rather than an optimisation.
+
+    The truncation check below used to read `Length(AData) < 5 + Integer(LMsgLen)`.
+    LMsgLen is wire-supplied and unsigned, so a prefix of 00 FF FF FF FF makes
+    Integer(LMsgLen) = -1 and the expression evaluates to 4 - the guard passes
+    for any buffer of 4 bytes or more. SetLength then sees the UNSIGNED value
+    and attempts a 4 GB allocation, and if that succeeds the Move reads 4 GB
+    past the end of a ten-byte buffer. Remotely triggerable by a ten-byte
+    request; an upstream body-size limit does not help, because the body is
+    tiny and it is the header that lies.
+
+    Testing the cap first bounds LMsgLen to 4 MB, after which Integer(LMsgLen)
+    is provably safe. The same constant already guarded the STREAMING path in
+    Nghttp2.Grpc.StreamReader; only the unary path was unprotected, which is
+    exactly the two-copies-of-one-format asymmetry the comment below warns
+    about. }
+  if LMsgLen > GRPC_MAX_MESSAGE_BYTES then
+  begin
+    AError := Format('gRPC message length %u exceeds the %d-byte maximum',
+                     [LMsgLen, GRPC_MAX_MESSAGE_BYTES]);
+    Exit;
+  end;
+
+  if Length(AData) - 5 < Integer(LMsgLen) then
   begin
     AError := Format('gRPC frame truncated: header says %u bytes, buffer has %d',
                      [LMsgLen, Length(AData) - 5]);

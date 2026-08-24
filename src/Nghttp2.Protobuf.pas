@@ -570,7 +570,19 @@ end;
 
 procedure TProtoReader.EnsureBytesAvailable(ACount: Integer);
 begin
-  if FPos + ACount > Length(FData) then
+  { FIX-PROTO-BOUNDS-1. Compare against what REMAINS, never `FPos + ACount`.
+
+    The addition form overflows: ReadLenBytes admits any length up to MaxInt,
+    and MaxInt + any positive FPos wraps to a negative Integer, which is
+    happily "not greater than" the buffer length - so the guard passes and the
+    caller goes on to SetLength a 2 GB array and Move into it from a buffer
+    that is nowhere near that size. Length(FData) - FPos cannot overflow
+    because both operands are non-negative and FPos <= Length(FData) is an
+    invariant of every mutation in this class.
+
+    The negative-ACount test is not redundant: a future caller passing a
+    computed length could otherwise walk FPos backwards past zero. }
+  if (ACount < 0) or (ACount > Length(FData) - FPos) then
     raise EProtoDecodeError.CreateFmt(
       'Proto decode overrun: needed %d more bytes at position %d, buffer length %d.',
       [ACount, FPos, Length(FData)]);
@@ -654,11 +666,17 @@ end;
 
 procedure TProtoReader.SkipField(AWireType: TProtoWireType);
 begin
+  { FIX-PROTO-BOUNDS-2. The fixed-width branches used to advance FPos with no
+    bounds check. Past the end, Eof becomes True and a `while not Eof` decode
+    loop simply STOPS - so a truncated fixed32/fixed64 field was silently
+    accepted as a well-formed message rather than rejected. It never corrupted
+    memory, because the next read would have caught it, but "silently accepts
+    malformed input" is the wrong default for a parser fed from the network. }
   case AWireType of
     pwVarint:   ReadVarint;                 // consume without storing
-    pwFixed64:  Inc(FPos, 8);
+    pwFixed64:  begin EnsureBytesAvailable(8); Inc(FPos, 8); end;
     pwLen:      ReadLenBytes;               // consume length + data
-    pwFixed32:  Inc(FPos, 4);
+    pwFixed32:  begin EnsureBytesAvailable(4); Inc(FPos, 4); end;
   else
     raise EProtoDecodeError.CreateFmt('Cannot skip unknown wire type %d.', [Ord(AWireType)]);
   end;
