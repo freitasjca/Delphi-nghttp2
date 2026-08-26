@@ -200,6 +200,34 @@ type
     FPendingSock: TList<TSocketHandle>;
     FPendingAddr: TStringList;
 
+    { LOOP-STATS. Why the loop woke, counted by cause. Set NGHTTP2_LOOP_STATS=1
+      to have the totals printed at Stop.
+
+      Added 2026-08-26 to answer one question with a number instead of a
+      hypothesis: the engine runs the 94-check suite in 183 ms against the
+      thread driver's 55-84 ms, and that ~99 ms gap was long attributed to the
+      zero-byte receive costing one extra recv per read. It cannot be: 94 extra
+      recv calls at even a generous 5 us is 0.47 ms, 0.5% of the gap.
+
+      IOCP_WAIT_MS is 50, and 99 / 50 is about two. If the loop is falling
+      through to its poll timeout even twice in a run, that alone is the whole
+      difference — and it would be a wake-path problem, not a receive-path one.
+      These counters distinguish the two without guessing. }
+    FTimeoutExits:    Integer;
+    FWakeExits:       Integer;
+    FCompletionExits: Integer;
+    { Split by which probe completed. The idle run (no client at all) recorded
+      ZERO completions, so the spin needs a connection; a traffic run recorded
+      173 million for a 106-request suite and kept going ~19 s after the client
+      finished. These two say which side re-arms: a zero-byte WSASend completes
+      the instant the socket is writable, so a pump reporting WantsWritable
+      forever spins the loop — which UpdateInterest's own comment predicts. A
+      zero-byte WSARecv on a peer-closed socket completes immediately and
+      forever too, if the connection is never retired. Different fixes. }
+    FReadCompletions:  Integer;
+    FWriteCompletions: Integer;
+    FRetired:          Integer;
+
     FLiveCount: Integer;          // published for LiveConnections
     FIdleCount: Integer;
 
@@ -277,6 +305,13 @@ const
 
   WSA_IO_PENDING_ = 997;   // ERROR_IO_PENDING
   TIMERR_NOERROR  = 0;     // timeBeginPeriod success
+
+var
+  { LOOP-STATS. Env var rather than a property, for the same reason
+    NGHTTP2_PUMP_TRACE and NGHTTP2_DRAIN_DEBUG are: it can be switched on for a
+    single run of an existing suite without changing any test program, script or
+    harness. Costs one boolean test per Stop when off. }
+  GLoopStats: Boolean = False;
 
 type
   TWsaBufRec = record
@@ -628,6 +663,32 @@ begin
     // sent more, which under TLS it may never do.
   until (not AConn.Pump.HasBufferedInput) or (LPasses >= 32);
 
+  { FIX-IOCP-FINISHED-1. Retire a pump that reports Finished, exactly as
+    Nghttp2.Engine.Epoll.ServiceConnection does at its own line ~635. This
+    engine never called Finished at all, and the omission is not cosmetic.
+
+    After a peer half-closes, RunOnce sets FPeerClosed and thereafter SKIPS the
+    read entirely (Nghttp2.Server.pas ~1220), returning psContinue with nothing
+    to do. Neither psStop nor psAbort ever comes. So UpdateInterest below
+    re-armed a zero-byte WSARecv on a socket that EOF makes PERMANENTLY
+    readable — the probe completed instantly, serviced nothing, and re-armed.
+
+    Measured before this fix, 106-request suite, NGHTTP2_LOOP_STATS=1:
+    227,948,814 completions, 100% of them read-side, zero write-side, against
+    58 connections. An idle server with no client at all recorded ZERO, which
+    is what proved it needs a connection rather than being a poll artefact.
+    Graceful drain also took 4,190 ms against 205 ms idle — a spinning loop
+    makes shutdown slow, which is how it first became visible.
+
+    Finished is the pump's own answer to "may the engine retire this", and it
+    guards the TLS-handshake false positive that a naive `not ShouldContinue`
+    would trip. Ask it rather than re-deriving the condition here. }
+  if AConn.Pump.Finished then
+  begin
+    RetireConnection(AConn, True);
+    Exit;
+  end;
+
   UpdateInterest(AConn);
 end;
 
@@ -635,6 +696,7 @@ procedure TNghttp2IocpLoop.RetireConnection(AConn: TNghttp2IocpConn;
   ASendFarewell: Boolean);
 begin
   if AConn.Closing then Exit;
+  TInterlocked.Increment(FRetired);                    { LOOP-STATS }
   AConn.Closing := True;
   // Paired with the subtraction in SweepClosing. The early exit above makes
   // this exactly one increment per connection. Interlocked because CloseAll
@@ -744,6 +806,7 @@ begin
     begin
       // Timeout, or the port failed. Neither is a connection event; fall
       // through to the housekeeping below.
+      TInterlocked.Increment(FTimeoutExits);            { LOOP-STATS }
       AdmitPending;
       SweepClosing;
       Continue;
@@ -753,6 +816,7 @@ begin
 
     if LKey = IOCP_KEY_WAKE then
     begin
+      TInterlocked.Increment(FWakeExits);               { LOOP-STATS }
       // A worker staged a response, or a socket was handed over.
       AdmitPending;
 
@@ -783,6 +847,8 @@ begin
       Continue;
     end;
 
+    TInterlocked.Increment(FCompletionExits);          { LOOP-STATS }
+
     LConn := TNghttp2IocpConn(LKey);
     if LConn = nil then Continue;
 
@@ -790,9 +856,15 @@ begin
     // UpdateInterest can re-arm it. Identify by OVERLAPPED address — the
     // connection owns exactly two, so the comparison is unambiguous.
     if LOvl = @LConn.FReadOvl then
-      LConn.FReadPosted := False
+    begin
+      LConn.FReadPosted := False;
+      TInterlocked.Increment(FReadCompletions);        { LOOP-STATS }
+    end
     else if LOvl = @LConn.FWriteOvl then
+    begin
       LConn.FWritePosted := False;
+      TInterlocked.Increment(FWriteCompletions);       { LOOP-STATS }
+    end;
 
     if not LOk then
     begin
@@ -905,9 +977,45 @@ end;
 procedure TNghttp2IocpEngine.Stop;
 var
   I: Integer;
+  LTimeout, LWake, LCompletion: Integer;
+  LRead, LWrite, LRetired, LStillLive: Integer;
 begin
   for I := 0 to High(FLoops) do
     FLoops[I].Stop;
+
+  { LOOP-STATS. After Stop, so every loop thread has finished and the counters
+    are settled — reading them mid-run would race and, worse, invite conclusions
+    from a partial sample. IsConsole because a VCL or service host has no stdout
+    and WriteLn would raise there. }
+  if GLoopStats and IsConsole then
+  begin
+    LTimeout := 0; LWake := 0; LCompletion := 0;
+    LRead := 0; LWrite := 0; LRetired := 0; LStillLive := 0;
+    for I := 0 to High(FLoops) do
+    begin
+      Inc(LTimeout,    FLoops[I].FTimeoutExits);
+      Inc(LWake,       FLoops[I].FWakeExits);
+      Inc(LCompletion, FLoops[I].FCompletionExits);
+      Inc(LRead,       FLoops[I].FReadCompletions);
+      Inc(LWrite,      FLoops[I].FWriteCompletions);
+      Inc(LRetired,    FLoops[I].FRetired);
+      Inc(LStillLive,  FLoops[I].FConns.Count);
+    end;
+    WriteLn;
+    WriteLn('[loop-stats] IOCP loop wakeups by cause, ', Length(FLoops), ' loop(s)');
+    WriteLn('[loop-stats]   completion : ', LCompletion);
+    WriteLn('[loop-stats]   wake       : ', LWake);
+    WriteLn('[loop-stats]     of which read  : ', LRead);
+    WriteLn('[loop-stats]     of which write : ', LWrite);
+    WriteLn('[loop-stats]   TIMEOUT    : ', LTimeout,
+            '   <- each one costs up to IOCP_WAIT_MS (', IOCP_WAIT_MS, ' ms)');
+    WriteLn('[loop-stats]   retired    : ', LRetired,
+            '    still holding connections at Stop: ', LStillLive);
+    WriteLn('[loop-stats] A handful of timeouts explains a 99 ms suite gap on its');
+    WriteLn('[loop-stats] own. Near zero means the gap is something else again -');
+    WriteLn('[loop-stats] but either way it is not the zero-byte receive, which');
+    WriteLn('[loop-stats] accounts for under 0.5% of it. See backlog item 2.');
+  end;
   if FTimerPeriodSet then
   begin
     TimerEndPeriod(1);
@@ -969,6 +1077,7 @@ initialization
   // makes UseEventLoop resolve to IOCP. Nothing references it, so a build that
   // does not want it simply leaves it out.
   Nghttp2EngineFactory := CreateIocpEngine;
+  GLoopStats := GetEnvironmentVariable('NGHTTP2_LOOP_STATS') = '1';   { LOOP-STATS }
 
 {$IFEND}
 
