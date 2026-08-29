@@ -9,6 +9,12 @@ REM    1  Nghttp2ProtobufTests            build + run   (gates)
 REM    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
 REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
 REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
+REM    5  ProtogenParserTests             build + run   (gates) - in
+REM                                                     ..\tools\protogen
+REM
+REM  The protoc oracle (C1b) is NOT run here. It is a bash script, and the
+REM  Windows story for it is `wsl bash protoc-oracle.sh` or running it from the
+REM  Linux side. Its verdicts are platform-independent, so once is enough.
 REM
 REM  Stage 4 is gated even though it is a "report", and that is not an
 REM  inconsistency: the program itself decides. It exits 0 when it finds
@@ -55,6 +61,9 @@ REM  no diagnostic. These suites are small; a full build costs under a second.
 REM ===========================================================================
 
 set "FAILED=0"
+REM Unit search path for :build_run. Every stage in tests\ wants ..\src; the
+REM protogen stage overrides it and restores this afterwards.
+set "STAGEUNITS=..\src"
 
 REM -- Locate dcc64 ----------------------------------------------------------
 set "DCC="
@@ -84,6 +93,27 @@ set "STAGE=Nghttp2ProtobufConformance"
 set "GATES=1"
 call :build_run
 
+REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
+REM    the one stage that changes directory. Its units are pure RTL and pull in
+REM    no Nghttp2 unit, so STAGEUNITS is "." rather than ..\src -- if it ever
+REM    stops compiling that way, something has coupled the generator to the
+REM    codec, which is worth discovering here.
+if not exist "..\tools\protogen\ProtogenParserTests.dpr" goto :no_protogen
+pushd "..\tools\protogen"
+set "STAGE=ProtogenParserTests"
+set "GATES=1"
+set "STAGEUNITS=."
+call :build_run
+popd
+set "STAGEUNITS=..\src"
+goto :after_protogen
+
+:no_protogen
+echo -- ProtogenParserTests ---------------------------------------------------------------
+echo    SKIP  ..\tools\protogen not present
+
+:after_protogen
+
 echo.
 echo ===========================================================================
 if "!FAILED!"=="0" goto :all_ok
@@ -99,7 +129,7 @@ REM ===========================================================================
 echo -- !STAGE! ---------------------------------------------------------------
 if not exist "!STAGE!.dpr" goto :br_missing
 
-"!DCC!" -CC -B -U"..\src" "!STAGE!.dpr" > "!STAGE!.buildlog" 2>&1
+"!DCC!" -CC -B -U"!STAGEUNITS!" "!STAGE!.dpr" > "!STAGE!.buildlog" 2>&1
 if errorlevel 1 goto :br_buildfail
 if not exist "!STAGE!.exe" goto :br_buildfail
 

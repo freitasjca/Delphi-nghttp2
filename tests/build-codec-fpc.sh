@@ -13,6 +13,9 @@
 #                                                      a BROKEN probe)
 #    4  samples/grpc-server             compile only  (gates)
 #    5  samples/grpc-server, old define compile only  (gates back-compat)
+#    6  protogen parser tests (C1)      build + run   (gates)
+#    7  protoc oracle (C1b)             run           (gates if protoc is
+#                                                      present; skips if not)
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -351,6 +354,87 @@ if [[ -f "$SAMPLE" ]]; then
 else
   echo
   echo "  SKIP  samples/grpc-server not present"
+fi
+
+# ── 6 · protogen parser (C1) ────────────────────────────────────────────────
+# The .proto parser behind the code generator. Nothing else in this script
+# touches it, and until it was wired in here it only ran when somebody
+# remembered to - the "regression suite that is one refactor away from being
+# decorative" that run-tests.bat's own header warns about.
+#
+# Its units are pure RTL (SysUtils / Classes / Generics.Collections) and pull
+# in no Nghttp2 unit at all, so $SRC is deliberately NOT on the path: if this
+# ever fails to compile without it, something has coupled the generator to the
+# codec and that is worth finding out about here rather than later.
+#
+# Own -FU directory for the reason stated at stage 1: FPC compares timestamps,
+# not defines, so sharing a unit dir silently reuses .ppu files built with
+# other flags.
+echo
+echo "── protogen parser tests (C1) ────────────────────────────────────────"
+PROTOGEN="$HERE/../tools/protogen"
+if [[ -f "$PROTOGEN/ProtogenParserTests.dpr" ]]; then
+  PGOUT="$OUT/protogen"
+  mkdir -p "$PGOUT"
+  rm -f "$PGOUT"/*.ppu "$PGOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PGOUT" -FE"$PGOUT" \
+       -Fu"$PROTOGEN" \
+       $TRUNK_UNIT_PATHS \
+       "$PROTOGEN/ProtogenParserTests.dpr" > "$PGOUT/build.log" 2>&1 \
+     && [[ -x "$PGOUT/ProtogenParserTests" ]]; then
+    "$PGOUT/ProtogenParserTests" < /dev/null | sed 's/^/  /'
+    PG_RC=${PIPESTATUS[0]}
+    if [[ "$PG_RC" -eq 0 ]]; then
+      echo "  parser tests: PASSED"
+    else
+      echo "  FAIL  protogen parser tests"
+      RC=1
+    fi
+  else
+    echo "  FAIL  ProtogenParserTests.dpr did not compile"
+    grep -E "Error|Fatal" "$PGOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PGOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  tools/protogen not present"
+fi
+
+# ── 7 · protoc oracle (C1b) ─────────────────────────────────────────────────
+# Differential test against the reference implementation. Kept OPTIONAL on the
+# protoc side and gating on ours: protoc is an extra install (pip install
+# grpcio-tools), so a machine without it skips rather than fails - unlike the
+# parser tests above, which need nothing this script does not already have.
+#
+# That asymmetry is deliberate. protoc-oracle.sh itself FAILS when protoc is
+# missing, because a differential test that silently did not run is worse than
+# no test; here we make the decision to run it at all, and record the skip.
+echo
+echo "── protoc oracle (C1b, needs protoc or grpcio-tools) ─────────────────"
+if [[ -x "$PROTOGEN/protoc-oracle.sh" ]] || [[ -f "$PROTOGEN/protoc-oracle.sh" ]]; then
+  ORACLE_AVAILABLE=0
+  if command -v protoc > /dev/null 2>&1; then ORACLE_AVAILABLE=1; fi
+  if [[ -x "$PROTOGEN/.venv/bin/python" ]] \
+     && "$PROTOGEN/.venv/bin/python" -c 'import grpc_tools.protoc' > /dev/null 2>&1; then
+    ORACLE_AVAILABLE=1
+  fi
+  if python3 -c 'import grpc_tools.protoc' > /dev/null 2>&1; then ORACLE_AVAILABLE=1; fi
+
+  if [[ "$ORACLE_AVAILABLE" -eq 1 ]]; then
+    if bash "$PROTOGEN/protoc-oracle.sh" 2>&1 | sed 's/^/  /'; then
+      echo "  oracle: CLEAN"
+    else
+      echo "  FAIL  protoc oracle reported a disagreement"
+      RC=1
+    fi
+  else
+    echo "  SKIP  no protoc and no grpc_tools — install with:"
+    echo "          python3 -m venv $PROTOGEN/.venv"
+    echo "          $PROTOGEN/.venv/bin/python -m pip install grpcio-tools"
+  fi
+else
+  echo "  SKIP  protoc-oracle.sh not present"
 fi
 
 exit $RC

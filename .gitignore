@@ -60,3 +60,12 @@ tests/interlocked_check
 
 # Test-runner output (run-tests.bat writes one per stage)
 *.buildlog
+
+# protogen (tools/protogen) build + tooling output
+# .venv is a 46 MB Python virtualenv holding grpcio-tools for the protoc
+# oracle; .oracle-out holds the generated corpus and a compiled ProtogenCheck.
+# Both are reproducible from protoc-oracle.sh and neither belongs in history.
+tools/protogen/.venv/
+tools/protogen/.oracle-out/
+tools/protogen/ProtogenParserTests
+tools/protogen/ProtogenCheck
