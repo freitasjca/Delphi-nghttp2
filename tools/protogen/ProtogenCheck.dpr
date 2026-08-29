@@ -68,14 +68,23 @@ begin
     except
       { The two refusal types are the parser doing its job. Everything else is
         the parser falling over, and must not be reported as a refusal. }
+      { The construct is printed in [brackets] as its own field so a corpus run
+        can tally refusals BY CAUSE without parsing prose. That tally is the
+        whole point of C1c: "how many schemas do we turn away" is far less
+        actionable than "which feature turned them away". }
       on E: EProtoParseError do
       begin
-        WriteLn(Format('REFUSE  %s  %s', [ExtractFileName(LPath), E.Message]));
+        WriteLn(Format('REFUSE  %s  [%s]  %s',
+          [ExtractFileName(LPath), E.Construct, E.Message]));
         ExitCode := 1;
       end;
       on E: EProtoLexError do
       begin
-        WriteLn(Format('REFUSE  %s  %s', [ExtractFileName(LPath), E.Message]));
+        // No Construct on a lex error — the input was not well-formed enough
+        // to name one. Tagged so a corpus tally can separate malformed input
+        // from a deliberate feature refusal.
+        WriteLn(Format('REFUSE  %s  [lex]  %s',
+          [ExtractFileName(LPath), E.Message]));
         ExitCode := 1;
       end;
       on E: Exception do

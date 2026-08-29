@@ -49,10 +49,39 @@
 #    TRUNK_FPC     fpc binary (default /usr/local/fpc-trunk/bin/fpc)
 #    TRUNK_UNITS   its unit tree
 #
+#  ── Two modes ──
+#
+#    bash protoc-oracle.sh                  built-in corpus (C1b, gates)
+#    bash protoc-oracle.sh --corpus <dir>   an outside corpus (C1c, surveys)
+#
+#  Corpus mode exists to answer the question decision 6.1 ASSUMED the answer
+#  to: does "reject loudly" leave a usable tool? The built-in corpus cannot
+#  answer it, because it was built around the refusals — 8 gaps out of 17 says
+#  nothing about real schemas. Point this at protos someone else wrote.
+#
+#  It reports rather than gates: a foreign schema carries no declared
+#  expectation, so only a BUG (protoc REJECT + us ACCEPT) or a CRASH fails the
+#  run. The deliverable is the GAP TALLY BY CAUSE at the end — "which feature
+#  turned schemas away" is actionable in a way that "how many" is not.
+#
+#  Good first corpus, already on disk after `pip install grpcio-tools`:
+#    <venv>/lib/python*/site-packages/grpc_tools/_proto
+#  That ships google/protobuf/*.proto — the well-known types, written by the
+#  protobuf authors — plus descriptor.proto. Real files, not toys.
+#
 #  Exit code: number of BUG cells plus setup failures. 0 = clean.
 # =============================================================================
 
 set -uo pipefail
+
+CORPUS_DIR=""
+if [[ "${1:-}" == "--corpus" ]]; then
+  CORPUS_DIR="${2:-}"
+  if [[ -z "$CORPUS_DIR" || ! -d "$CORPUS_DIR" ]]; then
+    echo "FATAL: --corpus needs a directory. Got: ${2:-<nothing>}"
+    exit 1
+  fi
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="$HERE/.oracle-out"
@@ -237,6 +266,87 @@ do
     echo "the repo's own schema - must never regress" > "$CORPUS/$base.note"
   fi
 done
+
+# ── Corpus mode (C1c) ────────────────────────────────────────────────────────
+# Surveys someone else's schemas. Reports; gates only on BUG and CRASH, since a
+# foreign file carries no declared expectation.
+if [[ -n "$CORPUS_DIR" ]]; then
+  echo "corpus: $CORPUS_DIR"
+  echo
+
+  mapfile -t FILES < <(find "$CORPUS_DIR" -name '*.proto' -type f | sort)
+  if [[ ${#FILES[@]} -eq 0 ]]; then
+    echo "FATAL: no .proto files under $CORPUS_DIR"
+    exit 1
+  fi
+
+  N_OK=0; N_GAP=0; N_BUG=0; N_CRASH=0; N_BOTHREJ=0
+  TALLY="$WORK/tally.txt"; : > "$TALLY"
+
+  printf "%-44s %-8s %-8s %-6s %s\n" FILE PROTOC OURS CELL "REFUSED BECAUSE"
+  printf "%-44s %-8s %-8s %-6s %s\n" \
+    "--------------------------------------------" "--------" "--------" "------" "---------------"
+
+  for f in "${FILES[@]}"; do
+    rel="${f#$CORPUS_DIR/}"
+    [[ ${#rel} -gt 44 ]] && rel="...${rel: -41}"
+
+    # -I both the corpus root and the file's own directory, so intra-corpus
+    # imports resolve. protoc supplies the well-known types itself.
+    if $PROTOC_CMD -I "$CORPUS_DIR" -I "$(dirname "$f")" -o /dev/null "$f" \
+         > "$WORK/c.protoc.log" 2>&1; then pv=ACCEPT; else pv=REJECT; fi
+
+    "$CHECK" "$f" > "$WORK/c.ours.log" 2>&1
+    case $? in 0) ov=ACCEPT ;; 1) ov=REFUSE ;; *) ov=ERROR ;; esac
+
+    why=""
+    if [[ "$ov" == "REFUSE" ]]; then
+      why=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$WORK/c.ours.log" | head -1)
+      [[ -z "$why" ]] && why="(unlabelled)"
+    fi
+
+    if   [[ "$ov" == "ERROR"  ]]; then cell=CRASH; N_CRASH=$((N_CRASH+1))
+    elif [[ "$pv" == "REJECT" && "$ov" == "ACCEPT" ]]; then cell=BUG; N_BUG=$((N_BUG+1))
+    elif [[ "$pv" == "REJECT" ]]; then cell=both; N_BOTHREJ=$((N_BOTHREJ+1))
+    elif [[ "$ov" == "REFUSE" ]]; then cell=gap;  N_GAP=$((N_GAP+1)); echo "$why" >> "$TALLY"
+    else cell=ok; N_OK=$((N_OK+1)); fi
+
+    printf "%-44s %-8s %-8s %-6s %s\n" "$rel" "$pv" "$ov" "$cell" "$why"
+    if [[ "$cell" == "BUG" || "$cell" == "CRASH" ]]; then
+      sed 's/^/      /' "$WORK/c.ours.log" | head -3
+    fi
+  done
+
+  TOTAL=${#FILES[@]}
+  echo
+  echo "=============================================================="
+  printf "  %d files:  %d accepted  ·  %d gap  ·  %d both-reject  ·  %d BUG  ·  %d CRASH\n" \
+    "$TOTAL" "$N_OK" "$N_GAP" "$N_BOTHREJ" "$N_BUG" "$N_CRASH"
+  echo "=============================================================="
+
+  if [[ $N_GAP -gt 0 ]]; then
+    echo
+    echo "  Gaps by cause — THIS is the C1c deliverable:"
+    echo
+    sort "$TALLY" | uniq -c | sort -rn | while read -r n cause; do
+      pct=$(( n * 100 / TOTAL ))
+      printf "    %4d  (%2d%% of corpus)  %s\n" "$n" "$pct" "$cause"
+    done
+    echo
+    echo "  Read it against plan section 6.1. A cause near the top that is NOT"
+    echo "  structural — nested declarations especially, which the codec could"
+    echo "  already handle if the generator had a flattening rule — argues for"
+    echo "  supporting it before C2 rather than after."
+  fi
+
+  echo
+  if [[ $((N_BUG + N_CRASH)) -eq 0 ]]; then
+    echo "  No BUG and no CRASH: every schema protoc rejected, we refused too."
+    exit 0
+  fi
+  echo "  $((N_BUG + N_CRASH)) case(s) need attention — see above."
+  exit $((N_BUG + N_CRASH))
+fi
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 printf "%-20s %-10s %-10s %-10s %s\n" CASE PROTOC OURS CELL NOTE
