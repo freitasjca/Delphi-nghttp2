@@ -280,8 +280,17 @@ if [[ -n "$CORPUS_DIR" ]]; then
     exit 1
   fi
 
-  N_OK=0; N_GAP=0; N_BUG=0; N_CRASH=0; N_BOTHREJ=0
+  N_OK=0; N_GAP=0; N_BUG=0; N_CRASH=0; N_BOTHREJ=0; N_NA=0
   TALLY="$WORK/tally.txt"; : > "$TALLY"
+
+  # Large corpora print only the rows that need looking at. A 4000-row table is
+  # not a report, and the tally at the end is the deliverable either way.
+  QUIET=0
+  if [[ ${#FILES[@]} -gt 200 ]]; then
+    QUIET=1
+    echo "  ${#FILES[@]} files — printing only gap / BUG / CRASH rows."
+    echo
+  fi
 
   printf "%-44s %-8s %-8s %-6s %s\n" FILE PROTOC OURS CELL "REFUSED BECAUSE"
   printf "%-44s %-8s %-8s %-6s %s\n" \
@@ -296,6 +305,18 @@ if [[ -n "$CORPUS_DIR" ]]; then
     if $PROTOC_CMD -I "$CORPUS_DIR" -I "$(dirname "$f")" -o /dev/null "$f" \
          > "$WORK/c.protoc.log" 2>&1; then pv=ACCEPT; else pv=REJECT; fi
 
+    # A protoc failure that is only UNRESOLVED IMPORTS is not a verdict on the
+    # schema, and must not be compared against ours. Our parser records imports
+    # and does not follow them, so it happily accepts a file whose dependency
+    # is missing - which would score as BUG, the one cell that is supposed to
+    # mean something. On a cross-referencing corpus that produces a flood of
+    # false positives indistinguishable from the real thing.
+    import_fail=0
+    if [[ "$pv" == "REJECT" ]] \
+       && grep -qE 'was not found or had errors|File not found' "$WORK/c.protoc.log"; then
+      import_fail=1
+    fi
+
     "$CHECK" "$f" > "$WORK/c.ours.log" 2>&1
     case $? in 0) ov=ACCEPT ;; 1) ov=REFUSE ;; *) ov=ERROR ;; esac
 
@@ -305,23 +326,39 @@ if [[ -n "$CORPUS_DIR" ]]; then
       [[ -z "$why" ]] && why="(unlabelled)"
     fi
 
-    if   [[ "$ov" == "ERROR"  ]]; then cell=CRASH; N_CRASH=$((N_CRASH+1))
+    if   [[ "$ov" == "ERROR" ]]; then cell=CRASH; N_CRASH=$((N_CRASH+1))
+    elif [[ $import_fail -eq 1 && "$ov" == "ACCEPT" ]]; then
+      # Not comparable. Counted separately so the denominator stays honest.
+      cell="n/a"; why="protoc could not resolve imports"; N_NA=$((N_NA+1))
+    elif [[ $import_fail -eq 1 ]]; then
+      # We refused on our own grounds; still a real gap regardless of protoc.
+      cell=gap; N_GAP=$((N_GAP+1)); echo "$why" >> "$TALLY"
     elif [[ "$pv" == "REJECT" && "$ov" == "ACCEPT" ]]; then cell=BUG; N_BUG=$((N_BUG+1))
     elif [[ "$pv" == "REJECT" ]]; then cell=both; N_BOTHREJ=$((N_BOTHREJ+1))
     elif [[ "$ov" == "REFUSE" ]]; then cell=gap;  N_GAP=$((N_GAP+1)); echo "$why" >> "$TALLY"
     else cell=ok; N_OK=$((N_OK+1)); fi
 
-    printf "%-44s %-8s %-8s %-6s %s\n" "$rel" "$pv" "$ov" "$cell" "$why"
+    if [[ $QUIET -eq 0 || "$cell" != "ok" ]]; then
+      printf "%-44s %-8s %-8s %-6s %s\n" "$rel" "$pv" "$ov" "$cell" "$why"
+    fi
     if [[ "$cell" == "BUG" || "$cell" == "CRASH" ]]; then
       sed 's/^/      /' "$WORK/c.ours.log" | head -3
     fi
   done
 
   TOTAL=${#FILES[@]}
+  # Percentages run over the COMPARABLE files only. Including n/a would
+  # understate every cause by whatever fraction protoc could not resolve.
+  COMPARABLE=$(( TOTAL - N_NA ))
+  [[ $COMPARABLE -lt 1 ]] && COMPARABLE=1
+
   echo
   echo "=============================================================="
   printf "  %d files:  %d accepted  ·  %d gap  ·  %d both-reject  ·  %d BUG  ·  %d CRASH\n" \
     "$TOTAL" "$N_OK" "$N_GAP" "$N_BOTHREJ" "$N_BUG" "$N_CRASH"
+  [[ $N_NA -gt 0 ]] && printf "  %d not comparable (protoc could not resolve imports) — excluded below\n" "$N_NA"
+  printf "  acceptance on comparable files: %d/%d (%d%%)\n" \
+    "$N_OK" "$COMPARABLE" $(( N_OK * 100 / COMPARABLE ))
   echo "=============================================================="
 
   if [[ $N_GAP -gt 0 ]]; then
@@ -329,9 +366,14 @@ if [[ -n "$CORPUS_DIR" ]]; then
     echo "  Gaps by cause — THIS is the C1c deliverable:"
     echo
     sort "$TALLY" | uniq -c | sort -rn | while read -r n cause; do
-      pct=$(( n * 100 / TOTAL ))
-      printf "    %4d  (%2d%% of corpus)  %s\n" "$n" "$pct" "$cause"
+      pct=$(( n * 100 / COMPARABLE ))
+      printf "    %4d  (%2d%% of comparable)  %s\n" "$n" "$pct" "$cause"
     done
+    echo
+    echo "  NOTE: this counts the FIRST refusal per file, not every unsupported"
+    echo "  feature in it — the parser raises on the first one. Each count is a"
+    echo "  LOWER BOUND, and a feature that co-occurs with an earlier-detected"
+    echo "  one is invisible here."
     echo
     echo "  Read it against plan section 6.1. A cause near the top that is NOT"
     echo "  structural — nested declarations especially, which the codec could"

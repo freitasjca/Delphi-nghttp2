@@ -267,14 +267,32 @@ begin
   LCol  := FCol;
   LCh   := Peek;
 
-  if CharInSet(LCh, ['A'..'Z', 'a'..'z', '_']) then
+  { A leading '.' starts a FULLY-QUALIFIED reference — `.google.protobuf.Timestamp`
+    is how a schema escapes package-relative lookup. Without this the dot came
+    back as a bare symbol, the parser saw a symbol where it wanted a type name,
+    and the file was refused with a construct of ".". }
+  if CharInSet(LCh, ['A'..'Z', 'a'..'z', '_', '.']) then
     FCurrent := ReadIdent
   else if CharInSet(LCh, ['0'..'9']) or
           (CharInSet(LCh, ['-', '+']) and CharInSet(Peek(1), ['0'..'9'])) then
     FCurrent := ReadNumber
   else if CharInSet(LCh, ['"', '''']) then
     FCurrent := ReadString
-  else if CharInSet(LCh, ['{', '}', '(', ')', '[', ']', '<', '>', '=', ';', ',', '.']) then
+  // ':' belongs here because of AGGREGATE OPTION VALUES — the form
+  //   option (google.api.http) = ... get: "/v1/..." ...
+  // where the value is a brace-delimited block of key: value pairs.
+  //
+  // Leaving it out is not a missing feature, it is a lexer that cannot read
+  // the file at all: the colon raised "unexpected character" and the whole
+  // schema was refused before the parser saw a single declaration. googleapis
+  // puts one of these on essentially every RPC, which is why a corpus run
+  // showed 44% of 7300 files failing to tokenise. The parser still SKIPS
+  // option bodies; it just has to be able to lex them first.
+  //
+  // Written with // rather than a brace comment ON PURPOSE: the literal
+  // example above contains braces, and a '}' inside a { } comment closes it
+  // early — which is exactly how this edit failed to compile the first time.
+  else if CharInSet(LCh, ['{', '}', '(', ')', '[', ']', '<', '>', '=', ';', ',', '.', ':']) then
   begin
     Advance;
     FCurrent := MakeToken(ptSymbol, LCh, LLine, LCol);

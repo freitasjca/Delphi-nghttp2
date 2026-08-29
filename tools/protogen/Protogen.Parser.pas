@@ -71,6 +71,7 @@ type
     procedure ExpectSymbol(const AValue: string);
     procedure ExpectIdentValue(const AValue: string);
     function  ExpectIdent: string;
+    function  ExpectQualifiedIdent: string;
     function  ExpectNumber: Integer;
 
     { Raises. AReason must explain the limitation, not merely restate it. }
@@ -199,6 +200,32 @@ begin
   NextTok;
 end;
 
+function TProtoParser.ExpectQualifiedIdent: string;
+begin
+  Result := ExpectIdent;
+  // A qualified TYPE name may be WRAPPED across lines, which googleapis does
+  // routinely because its enum paths are long:
+  //
+  //   google.ads.searchads360.v0.enums.SomeStatusEnum
+  //       .SomeStatus status = 1;
+  //
+  // Whitespace terminates an identifier token, so the tail arrives as a
+  // SEPARATE token. Left unstitched, the parser takes the tail as the field
+  // NAME and then finds the real name where '=' should be — reporting
+  // "expected '=' but found 'status'", which names the field and hides the
+  // cause. 37 files failed exactly that way in a googleapis run.
+  //
+  // Both wrap positions are handled: a trailing dot on the head
+  // ("Foo.<newline>Bar") and a leading dot on the tail ("Foo<newline>.Bar").
+  while (Tok.Kind = ptIdent)
+        and ( ((Length(Result) > 0) and (Result[Length(Result)] = '.'))
+              or ((Length(Tok.Value) > 0) and (Tok.Value[1] = '.')) ) do
+  begin
+    Result := Result + Tok.Value;
+    NextTok;
+  end;
+end;
+
 function TProtoParser.ExpectNumber: Integer;
 var
   LCode: Integer;
@@ -304,14 +331,25 @@ begin
 end;
 
 procedure TProtoParser.SkipOptionStatement;
+var
+  LDepth: Integer;
 begin
   { File- and message-level options do not affect what is emitted, so they are
     skipped rather than rejected. If one ever DOES affect output, it must
     become an explicit refusal here — silently ignoring an option that changes
     semantics is the failure mode this whole parser exists to avoid. }
   ExpectIdentValue('option');
-  while not (IsSymbol(';') or (Tok.Kind = ptEof)) do
+  // Depth-aware for the same reason as the rpc body above: the value may be an
+  // aggregate, and a ';' inside one does not end the statement. Cheap
+  // insurance — the same desync, one level up.
+  LDepth := 0;
+  while Tok.Kind <> ptEof do
+  begin
+    if IsSymbol('{') then Inc(LDepth)
+    else if IsSymbol('}') then Dec(LDepth)
+    else if IsSymbol(';') and (LDepth <= 0) then Break;
     NextTok;
+  end;
   ExpectSymbol(';');
 end;
 
@@ -453,7 +491,7 @@ begin
       'A map field needs a synthesised entry message per map. Model it as a ' +
       'repeated message with explicit key and value fields.');
 
-  LTypeName := ExpectIdent;
+  LTypeName := ExpectQualifiedIdent;
   LScalar   := ScalarFromKeyword(LTypeName);
 
   { The scalar check deliberately waits until the field NAME has been read,
@@ -607,6 +645,7 @@ end;
 procedure TProtoParser.ParseRpc(AService: TProtoServiceNode);
 var
   LRpc: TProtoRpcNode;
+  LDepth: Integer;
 begin
   LRpc := TProtoRpcNode.Create;
   try
@@ -620,7 +659,7 @@ begin
       LRpc.RequestStream := True;
       NextTok;
     end;
-    LRpc.RequestType := ExpectIdent;
+    LRpc.RequestType := ExpectQualifiedIdent;
     ExpectSymbol(')');
 
     ExpectIdentValue('returns');
@@ -631,16 +670,31 @@ begin
       LRpc.ResponseStream := True;
       NextTok;
     end;
-    LRpc.ResponseType := ExpectIdent;
+    LRpc.ResponseType := ExpectQualifiedIdent;
     ExpectSymbol(')');
 
-    // Either `;` or an options block `{ ... }`.
+    // Either a bare `;` or an options block, which must be skipped by BRACE
+    // DEPTH rather than by scanning for the first closing brace. An rpc body
+    // routinely contains an aggregate option value:
+    //
+    //   rpc Get(Req) returns (Resp) ...
+    //     option (google.api.http) = ... get: "/v1/..." ...
+    //
+    // and its inner closing brace is not the body's. Stopping at the first one
+    // leaves the parser mid-declaration, where it then fails against the NEXT
+    // rpc — which is why a googleapis corpus run reported 933 refusals whose
+    // "construct" was the word `rpc`, plus 546 bare `}`. One desync, thousands
+    // of files.
     if IsSymbol('{') then
     begin
-      NextTok;
-      while not (IsSymbol('}') or (Tok.Kind = ptEof)) do
+      LDepth := 0;
+      repeat
+        if IsSymbol('{') then Inc(LDepth)
+        else if IsSymbol('}') then Dec(LDepth)
+        else if Tok.Kind = ptEof then
+          Fail(Format('unterminated body for rpc %s', [QuotedStr(LRpc.Name)]));
         NextTok;
-      ExpectSymbol('}');
+      until LDepth = 0;
       if IsSymbol(';') then NextTok;
     end
     else
