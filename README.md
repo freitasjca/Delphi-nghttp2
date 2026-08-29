@@ -38,6 +38,8 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | **Memory-BIO TLS** — OpenSSL never touches the socket (event-loop prerequisite) | **✓** (validated 2026-08-16: Windows/Delphi 12, FPC 3.3.1, Linux64) |
 | **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
 | **gRPC layer** — protobuf codec, registry (procedural + `RegisterService<T>`), dispatcher, all four RPC shapes | **✓** (extracted from `horse-provider-nghttp2` 2026-08-23; the units never depended on Horse, only their names did) |
+| **`.proto` tooling** — parser, `ProtogenCheck` verdict CLI, `protoc` differential test (`tools/protogen`) | **✓ front end** (2026-08-29; 17 cases, 0 disagreements `protoc` would call a defect, vs libprotoc 35.1). See [`doc/protogen.md`](doc/protogen.md) |
+| **Code generation** — `.proto` → message, interface and service-skeleton units | planned — the parser above answers *whether* a schema is expressible; emitting the Pascal is the next step |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
@@ -223,12 +225,30 @@ src/
   Nghttp2.Grpc.StreamWriter.pas — IGrpcStreamWriter (server-streaming, bidi out)
   Nghttp2.Grpc.StreamReader.pas — IGrpcStreamReader (client-streaming, bidi in)
 
+tools/
+  protogen/                   — .proto parser, verdict CLI, and a differential
+                                test against protoc. Front end of a code
+                                generator; does not emit Pascal yet.
+
 samples/
   PingClient.dpr              — minimal HTTP/2 client
   grpc-server/                — a gRPC server on this library alone, no framework
   tests/                      — protocol-level and integration tests
 
 doc/                          — design docs, upstream notes, migration guides
+```
+
+### Working with `.proto` files
+
+Message and service classes are hand-written today, against a small set of RTTI
+rules that mostly fail **FPC-only** and name the wrong cause when they do.
+[`doc/protogen.md`](doc/protogen.md) has those rules, the proto3 subset this
+library can express, and what it refuses — plus `ProtogenCheck`, which answers
+that question for a given schema before you write anything:
+
+```bash
+ProtogenCheck service.proto
+# ACCEPT  service.proto  (3 message(s), 0 enum(s), 1 service(s))
 ```
 
 ---
