@@ -349,13 +349,79 @@ begin
   end;
 end;
 
-// ── 04 · the refusal corpus ─────────────────────────────────────────────────
+// ── 04 · nested declarations are hoisted, not refused ───────────────────────
+// The 52% gap from the C1c googleapis run. Pascal has no nested class scope,
+// so hierarchy is preserved as a NAME and the types are flattened to file
+// scope. What they are finally CALLED in Pascal is the emitter's decision —
+// this only fixes the identity.
+
+procedure TestNesting;
+var
+  F: TProtoFileNode;
+  M: TProtoMessageNode;
+  E: TProtoEnumNode;
+begin
+  Section('04  nested message / enum are hoisted with a qualified name');
+
+  F := Parse(
+    'syntax = "proto3";'#10 +
+    'package t;'#10 +
+    'message Outer {'#10 +
+    '  enum Status { STATUS_NONE = 0; STATUS_OK = 1; }'#10 +
+    '  message Inner {'#10 +
+    '    message Deep { int32 d = 1; }'#10 +
+    '    Deep deep = 1;'#10 +
+    '  }'#10 +
+    '  Status st = 1;'#10 +
+    '  Inner  in = 2;'#10 +
+    '}'#10 +
+    'message Sibling { int32 s = 1; }'#10);
+  try
+    { 4 messages: Outer, Outer.Inner, Outer.Inner.Deep, Sibling — all at file
+      scope now, none nested inside another node. }
+    Check('4 messages hoisted to file scope', F.Messages.Count = 4,
+      IntToStr(F.Messages.Count));
+    Check('1 enum hoisted', F.Enums.Count = 1, IntToStr(F.Enums.Count));
+
+    M := F.FindMessage('Outer');
+    Check('Outer found', M <> nil);
+    Check('  Outer.QualifiedName = "Outer"',
+      (M <> nil) and (M.QualifiedName = 'Outer'),
+      'got ' + M.QualifiedName);
+    Check('  Outer keeps its own 2 fields, not its children''s',
+      (M <> nil) and (M.Fields.Count = 2), IntToStr(M.Fields.Count));
+
+    M := F.FindMessage('Outer.Inner');
+    Check('Outer.Inner found by qualified name', M <> nil);
+    Check('  simple Name is still "Inner"',
+      (M <> nil) and (M.Name = 'Inner'));
+
+    { Two levels deep — the qualifier has to accumulate, not just record the
+      immediate parent. }
+    M := F.FindMessage('Outer.Inner.Deep');
+    Check('Outer.Inner.Deep found — qualifier accumulates', M <> nil);
+    Check('  its field survived the hoist',
+      (M <> nil) and (M.Fields.Count = 1) and (M.Fields[0].Name = 'd'));
+
+    E := F.FindEnum('Outer.Status');
+    Check('Outer.Status enum found by qualified name', E <> nil);
+    Check('  2 values', (E <> nil) and (E.Values.Count = 2));
+
+    M := F.FindMessage('Sibling');
+    Check('file-scope message unqualified',
+      (M <> nil) and (M.QualifiedName = 'Sibling'));
+  finally
+    F.Free;
+  end;
+end;
+
+// ── 05 · the refusal corpus ─────────────────────────────────────────────────
 
 procedure TestRefusals;
 const
   HDR = 'syntax = "proto3";'#10'package t;'#10;
 begin
-  Section('04  unsupported features must be refused, WITH a reason');
+  Section('05  unsupported features must be refused, WITH a reason');
 
   ExpectRefusal('sint32',
     HDR + 'message M { sint32 v = 1; }', 'sint32');
@@ -389,8 +455,9 @@ begin
     HDR + 'message M { google.protobuf.Timestamp t = 1; }',
     'google.protobuf.Timestamp');
 
-  ExpectRefusal('nested message',
-    HDR + 'message M { message Inner { int32 a = 1; } }', 'nested');
+  { Nested declarations are no longer refused — see TestNesting. Left as a
+    comment rather than deleted so the change is visible to anyone diffing
+    this corpus against the plan's 6.1 table. }
 
   ExpectRefusal('duplicate field number',
     HDR + 'message M { int32 a = 1; int32 b = 1; }', '1');
@@ -417,6 +484,7 @@ begin
     TestGreeter;
     TestEcho;
     TestSupportedExtras;
+    TestNesting;
     TestRefusals;
 
     WriteLn;

@@ -216,9 +216,18 @@ $HDR
 message M { optional int32 v = 1; }
 EOF
 
-add_case nested   refuse "deferred - Pascal has no nested class scope" <<EOF
+add_case nested   accept "hoisted to file scope with a qualified name" <<EOF
 $HDR
 message M { message Inner { int32 a = 1; } Inner i = 1; }
+EOF
+
+add_case nested_deep accept "qualifier accumulates through two levels" <<EOF
+$HDR
+message Outer {
+  enum Status { STATUS_NONE = 0; }
+  message Inner { message Deep { int32 d = 1; } Deep deep = 1; }
+  Status st = 1;
+}
 EOF
 
 add_case wellknown refuse "well-known types are not bundled" <<EOF

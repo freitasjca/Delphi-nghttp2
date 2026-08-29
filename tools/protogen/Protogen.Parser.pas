@@ -87,11 +87,15 @@ type
     procedure SkipFieldOptions;
     procedure SkipReserved;
     procedure ParseTopLevel;
-    procedure ParseMessage;
+    { AParentQualified is '' at file scope, or the enclosing message's
+      QualifiedName. Nested declarations are HOISTED to the file's lists with
+      the full path recorded — Pascal has no nested class scope to mirror them
+      into, so hierarchy is preserved as a NAME rather than as structure. }
+    procedure ParseMessage(const AParentQualified: string = '');
     procedure ParseMessageBody(AMsg: TProtoMessageNode);
     procedure ParseField(AMsg: TProtoMessageNode; AFieldLabel: TProtoLabel;
       ALabelLine, ALabelCol: Integer);
-    procedure ParseEnum;
+    procedure ParseEnum(const AParentQualified: string = '');
     procedure ParseService;
     procedure ParseRpc(AService: TProtoServiceNode);
     procedure CheckScalarSupported(AScalar: TProtoScalar;
@@ -380,7 +384,7 @@ end;
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
-procedure TProtoParser.ParseMessage;
+procedure TProtoParser.ParseMessage(const AParentQualified: string);
 var
   LMsg: TProtoMessageNode;
   LLine: Integer;
@@ -390,8 +394,16 @@ begin
   LMsg := TProtoMessageNode.Create;
   try
     LMsg.Name := ExpectIdent;
+    if AParentQualified = '' then
+      LMsg.QualifiedName := LMsg.Name
+    else
+      LMsg.QualifiedName := AParentQualified + '.' + LMsg.Name;
     LMsg.Line := LLine;
     ExpectSymbol('{');
+    { The body may declare more messages and enums, which recurse back here
+      and add THEMSELVES to the file's lists. So by the time this returns, any
+      children are already hoisted — and they land BEFORE their parent, which
+      is harmless: the emitter orders its own output. }
     ParseMessageBody(LMsg);
     ExpectSymbol('}');
   except
@@ -453,13 +465,22 @@ begin
       Refuse(Tok.Value,
         'Extensions are proto2. proto3 has no extension ranges.');
 
-    // ── Nested declarations: deferred, not structural ────────────────────
-    if IsIdent('message') or IsIdent('enum') then
-      Refuse(Tok.Value + ' (nested)',
-        'A nested declaration is a NAMING question, not a wire limitation: ' +
-        'the codec handles submessages fine, but Pascal has no nested class ' +
-        'scope to mirror Outer.Inner, so the generator would have to invent a ' +
-        'flattening rule. Declare it at file scope and reference it by name.');
+    { ── Nested declarations: HOISTED, not refused ──────────────────────────
+      Supported since the C1c corpus run, where nesting was 52% of 7300
+      googleapis schemas — far and away the largest gap, and the only large one
+      that needed no wire-format change. The child is parsed here and adds
+      itself to the file's lists carrying 'Parent.Child' as its QualifiedName;
+      Pascal gets a flat set of types with the hierarchy preserved as a name. }
+    if IsIdent('message') then
+    begin
+      ParseMessage(AMsg.QualifiedName);
+      Continue;
+    end;
+    if IsIdent('enum') then
+    begin
+      ParseEnum(AMsg.QualifiedName);
+      Continue;
+    end;
 
     // ── A field ──────────────────────────────────────────────────────────
     if IsIdent('repeated') then
@@ -552,7 +573,7 @@ end;
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 
-procedure TProtoParser.ParseEnum;
+procedure TProtoParser.ParseEnum(const AParentQualified: string);
 var
   LEnum: TProtoEnumNode;
   LVal: TProtoEnumValueNode;
@@ -563,6 +584,10 @@ begin
   LEnum := TProtoEnumNode.Create;
   try
     LEnum.Name := ExpectIdent;
+    if AParentQualified = '' then
+      LEnum.QualifiedName := LEnum.Name
+    else
+      LEnum.QualifiedName := AParentQualified + '.' + LEnum.Name;
     LEnum.Line := LLine;
     ExpectSymbol('{');
 

@@ -60,22 +60,45 @@ type
     Line:   Integer;
   end;
 
+  // NESTING. Declarations nested inside a message are HOISTED to file scope by
+  // the parser and carry the proto path that located them. An enum declared
+  // inside message Outer arrives as:
+  //
+  //     Name          = 'Inner'
+  //     QualifiedName = 'Outer.Inner'
+  //
+  // Both are kept because they answer different questions. QualifiedName is
+  // the identity — it is what a field's type reference resolves against, and
+  // it is unique within a file where Name is not. Name is what a reader
+  // called it.
+  //
+  // What the Pascal type is finally NAMED is deliberately not decided here:
+  // flattening 'Outer.Inner' to TOuterInner or TOuter_Inner is a question
+  // about the OUTPUT, and belongs to the emitter along with reserved-word
+  // renaming.
+  //
+  // Written with // because the natural illustration here is a proto snippet
+  // containing braces, and a '}' inside a { } comment closes it early. That
+  // has now broken this build three times in one session.
   TProtoEnumNode = class
   private
     FValues: TObjectList<TProtoEnumValueNode>;
   public
-    Name: string;
+    Name:          string;
+    QualifiedName: string;
     Line: Integer;
     constructor Create;
     destructor Destroy; override;
     property Values: TObjectList<TProtoEnumValueNode> read FValues;
   end;
 
+  { Also hoisted when nested — see the note on TProtoEnumNode. }
   TProtoMessageNode = class
   private
     FFields: TObjectList<TProtoFieldNode>;
   public
-    Name: string;
+    Name:          string;
+    QualifiedName: string;
     Line: Integer;
     constructor Create;
     destructor Destroy; override;
@@ -215,10 +238,17 @@ begin
   inherited Destroy;
 end;
 
+{ Qualified name first, then simple. Once nested declarations are hoisted, two
+  messages can legitimately share a simple Name ('Outer.Status' and
+  'Other.Status'), so a simple-name lookup is ambiguous by construction —
+  matching QualifiedName first means an exact path always wins over a guess. }
 function TProtoFileNode.FindMessage(const AName: string): TProtoMessageNode;
 var
   I: Integer;
 begin
+  for I := 0 to FMessages.Count - 1 do
+    if SameText(FMessages[I].QualifiedName, AName) then
+      Exit(FMessages[I]);
   for I := 0 to FMessages.Count - 1 do
     if SameText(FMessages[I].Name, AName) then
       Exit(FMessages[I]);
@@ -229,6 +259,9 @@ function TProtoFileNode.FindEnum(const AName: string): TProtoEnumNode;
 var
   I: Integer;
 begin
+  for I := 0 to FEnums.Count - 1 do
+    if SameText(FEnums[I].QualifiedName, AName) then
+      Exit(FEnums[I]);
   for I := 0 to FEnums.Count - 1 do
     if SameText(FEnums[I].Name, AName) then
       Exit(FEnums[I]);
