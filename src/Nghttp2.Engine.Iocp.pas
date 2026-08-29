@@ -497,11 +497,25 @@ end;
 
 procedure TNghttp2IocpLoop.Stop;
 begin
-  if TInterlocked.Exchange(FStopping, 1) <> 0 then Exit;
-  if FIocp <> 0 then
-    IocpPostStatus(FIocp, 0, IOCP_KEY_STOP, nil);
+  { FIX-IOCP-CLOSEALL-1. Guard on FThread, NOT on the stopping flag.
+
+    The old form was `if TInterlocked.Exchange(FStopping, 1) <> 0 then Exit`,
+    which conflates "already stopping" with "already joined". CloseAll now
+    raises FStopping from the shutdown caller's thread, so by the time Stop
+    runs the flag is normally already 1 — and the old guard would take the
+    early exit, skipping FThread.WaitFor and FreeAndNil entirely. That leaks
+    the TThread and, worse, lets Stop return while the loop thread is still
+    running, so the engine can be freed underneath it.
+
+    Guarding on FThread makes the join the thing that happens exactly once,
+    which is what actually needs to be idempotent. Setting FStopping twice is
+    harmless. This is what TNghttp2EngineLoop.Stop in the epoll engine has
+    always done. }
   if FThread <> nil then
   begin
+    TInterlocked.Exchange(FStopping, 1);
+    if FIocp <> 0 then
+      IocpPostStatus(FIocp, 0, IOCP_KEY_STOP, nil);
     FThread.WaitFor;
     FreeAndNil(FThread);
   end;
@@ -699,8 +713,13 @@ begin
   TInterlocked.Increment(FRetired);                    { LOOP-STATS }
   AConn.Closing := True;
   // Paired with the subtraction in SweepClosing. The early exit above makes
-  // this exactly one increment per connection. Interlocked because CloseAll
-  // can reach here from the shutdown caller's thread.
+  // this exactly one increment per connection. Interlocked is now belt-and-
+  // braces rather than load-bearing: before FIX-IOCP-CLOSEALL-1 the engine's
+  // CloseAll reached here from the shutdown caller's thread, and it no longer
+  // does — every caller is on the loop thread. Kept interlocked because
+  // FClosingCount is READ by SweepClosing's fast-path test and the cost is
+  // nil, but do not read this as a licence to re-introduce a cross-thread
+  // caller: the rest of this method is not thread-safe.
   TInterlocked.Increment(FClosingCount);
 
   if ASendFarewell then
@@ -737,11 +756,15 @@ begin
     Nothing is closing in steady state, so the counter turns an O(n) walk per
     completion into one integer test.
 
-    Exactly +1 per retire and -1 per free, both interlocked, because
-    TNghttp2Server.ForceCloseAllConnections reaches CloseAll on the SHUTDOWN
-    caller's thread and a retire can therefore land mid-walk. No update is
-    lost, so the count can never read low and strand a closing connection.
-    Reading high is harmless — it costs one redundant walk. }
+    Exactly +1 per retire and -1 per free, both interlocked. That was
+    originally load-bearing because TNghttp2Server.ForceCloseAllConnections
+    reached CloseAll on the SHUTDOWN caller's thread, so a retire could land
+    mid-walk; FIX-IOCP-CLOSEALL-1 removed that cross-thread path, and every
+    mutation of FConns and FClosingCount is now on the loop thread. The
+    interlocking is kept because it is free and because the failure mode it
+    guards against is silent: no update is lost, so the count can never read
+    low and strand a closing connection. Reading high is harmless — it costs
+    one redundant walk. }
   if TInterlocked.CompareExchange(FClosingCount, 0, 0) <= 0 then Exit;
 
   for I := FConns.Count - 1 downto 0 do
@@ -782,6 +805,18 @@ procedure TNghttp2IocpLoop.CloseAll;
 var
   I: Integer;
 begin
+  { LOOP THREAD ONLY. Its single caller is RunLoop's own teardown, below.
+
+    FIX-IOCP-CLOSEALL-1: TNghttp2IocpEngine.CloseAll used to call this from
+    the shutdown caller's thread, racing the loop thread's own appends
+    (AdmitSocket) and deletes (SweepClosing) on FConns. It now raises the stop
+    flag instead and lets RunLoop reach here on the way out. Do not add a
+    cross-thread caller — nothing in this method or in RetireConnection is
+    safe against a concurrent list mutation.
+
+    The Wake is retained though the loop is already awake when it gets here:
+    the extra completion packet is consumed harmlessly by the drain below, and
+    the call costs one post. }
   for I := 0 to FConns.Count - 1 do
     if not FConns[I].Closing then
       RetireConnection(FConns[I], False);
@@ -1045,8 +1080,35 @@ procedure TNghttp2IocpEngine.CloseAll;
 var
   I: Integer;
 begin
+  { FIX-IOCP-CLOSEALL-1. Called from the server's hard cutoff
+    (TNghttp2Server.ForceCloseAllConnections), on ANOTHER thread.
+
+    Do NOT walk a loop's FConns here. That list is owned by the loop thread,
+    which appends to it in AdmitSocket and deletes from it in SweepClosing;
+    the old form called TNghttp2IocpLoop.CloseAll cross-thread, and the reach
+    went two levels deep, because RetireConnection then calls PublishCounters,
+    which walks the same list again.
+
+    Raise the stop flag and wake instead. RunLoop's own teardown already calls
+    TNghttp2IocpLoop.CloseAll on the loop thread — the only thread allowed to
+    touch the pumps — and then drains the outstanding OVERLAPPEDs before any
+    connection object is freed. The retire path is therefore unchanged; only
+    the thread that runs it is.
+
+    Both callers of ForceCloseAllConnections proceed straight to Stop and wait
+    on LiveConnections, so making retirement asynchronous is safe for both:
+    RetireConnection calls PublishCounters on its way out, so FLiveCount still
+    reaches 0 from the loop thread's teardown.
+
+    Mirrors TNghttp2EpollEngine.CloseAll, which has carried this shape and the
+    reasoning for it since it was written. Fifth instance in this track of a
+    hazard one engine had solved and the other had not — diff the two
+    deliberately. }
   for I := 0 to High(FLoops) do
-    FLoops[I].CloseAll;
+  begin
+    TInterlocked.Exchange(FLoops[I].FStopping, 1);
+    FLoops[I].Wake;
+  end;
 end;
 
 function TNghttp2IocpEngine.LiveConnections: Integer;
