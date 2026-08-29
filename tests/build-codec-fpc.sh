@@ -9,6 +9,8 @@
 #    1  Nghttp2ProtobufTests            build + run   (gates)
 #    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
 #    3  Nghttp2AllocBench               build + run   (reports, never gates)
+#    3b Nghttp2ProtobufConformance      build + run   (reports; gates only on
+#                                                      a BROKEN probe)
 #    4  samples/grpc-server             compile only  (gates)
 #    5  samples/grpc-server, old define compile only  (gates back-compat)
 #
@@ -208,6 +210,51 @@ if [[ -f "$BENCH" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2AllocBench.dpr not present"
+fi
+
+# ── proto3 conformance probe — report only ───────────────────────────────────
+# C0a of plans/horse-grpc-codegen.md. Answers, per proto3 scalar type, whether
+# the RTTI serializer encodes it the way the spec says. Several types are
+# EXPECTED to deviate (uint32/uint64 confirmed by source reading), which is why
+# this cannot live in stage 1: known gaps there would take the 75/75 gate down
+# and read as a regression.
+#
+# It is a stage rather than a documented command because hand-rolling the fpc
+# line is exactly how you get `PPU Invalid Version 207 expecting 208` — an
+# incomplete -Fu list falls back to the distro 3.2.2 RTL, and the error names
+# the wrong cause. See the header note above; this is the second time that trap
+# has been paid for.
+#
+# ExitCode: 0 with deviations (they are findings), 1 only if a probe BREAKS.
+echo
+echo "── proto3 conformance probe (report only, not a gate) ────────────────"
+CONF="$HERE/Nghttp2ProtobufConformance.dpr"
+if [[ -f "$CONF" ]]; then
+  CFOUT="$OUT/conformance"
+  mkdir -p "$CFOUT"
+  rm -f "$CFOUT"/*.ppu "$CFOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$CFOUT" -FE"$CFOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$CONF" > "$CFOUT/build.log" 2>&1 \
+     && [[ -x "$CFOUT/Nghttp2ProtobufConformance" ]]; then
+    "$CFOUT/Nghttp2ProtobufConformance" < /dev/null | sed 's/^/  /'
+    CONF_RC=${PIPESTATUS[0]}
+    if [[ "$CONF_RC" -eq 1 ]]; then
+      # BROKEN is not a known gap — it means something that should hold does
+      # not, and the plan says investigate before writing generator code.
+      echo "  FAIL  a conformance probe BROKE (not a known gap) — see above"
+      RC=2
+    fi
+  else
+    echo "  FAIL  Nghttp2ProtobufConformance.dpr did not compile"
+    grep -E "Error|Fatal" "$CFOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $CFOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2ProtobufConformance.dpr not present"
 fi
 
 # ── samples/grpc-server — compile only ───────────────────────────────────────

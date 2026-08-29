@@ -8,6 +8,20 @@ REM
 REM    1  Nghttp2ProtobufTests            build + run   (gates)
 REM    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
 REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
+REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
+REM
+REM  Stage 4 is gated even though it is a "report", and that is not an
+REM  inconsistency: the program itself decides. It exits 0 when it finds
+REM  DEVIATES rows — those are findings about proto3 conformance, not test
+REM  failures — and non-zero ONLY when a probe BROKEN s, meaning something that
+REM  should have held did not. So GATES=1 here catches exactly the case worth
+REM  stopping for. See plans/horse-grpc-codegen.md C0a.
+REM
+REM  Stage 4 also carries the one path FPC cannot reach. FIX-PROTO-UINT32-1
+REM  guards UInt64 differently per compiler — FPC types it tkQWord, Delphi has
+REM  no unsigned-64 kind and types it tkInt64, handled by a TypeInfo(UInt64)
+REM  comparison inside {$ELSE}. FPC never compiles that arm. THIS is where it
+REM  gets exercised.
 REM
 REM  Exists because until 2026-08-24 these were compiled by hand, every time,
 REM  from a command line nobody had written down. A regression suite that only
@@ -64,6 +78,10 @@ call :build_run
 
 set "STAGE=Nghttp2AllocBench"
 set "GATES=0"
+call :build_run
+
+set "STAGE=Nghttp2ProtobufConformance"
+set "GATES=1"
 call :build_run
 
 echo.

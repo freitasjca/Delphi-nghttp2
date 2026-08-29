@@ -212,6 +212,19 @@ type
     property ids: TArray<Integer> read Fids write Fids;
   end;
 
+  { FIX-PROTO-UINT32-1. One unsigned field each, isolated for the same reason
+    TPackedOnlyMessage is: the byte assertions below must be about the value
+    under test and nothing else. }
+  [TGrpcMessage]
+  TUnsignedMessage = class
+  private
+    Fu32: Cardinal;
+    Fu64: UInt64;
+  published
+    [TProtoMember(1)] property u32: Cardinal read Fu32 write Fu32;
+    [TProtoMember(2)] property u64: UInt64   read Fu64 write Fu64;
+  end;
+
 // ── Destructor for TAdvancedMessage — implementation outside type block ─────
 
 destructor TAdvancedMessage.Destroy;
@@ -762,6 +775,66 @@ begin
   end;
 end;
 
+{ FIX-PROTO-UINT32-1 — proto3 uint32 / uint64.
+
+  These assert BYTES, not just a round-trip, and that is the whole point. On
+  the unfixed code a Cardinal above MaxInt round-tripped PERFECTLY: the
+  encoder overflowed it to negative and the decoder reversed the same
+  overflow, so the pair agreed with itself while putting a completely
+  different number on the wire. Every test that checked only round-trip passed.
+  Any future test added here must compare bytes for the same reason.
+
+  Expected encodings, from the proto3 spec rather than from our own writer:
+    uint32 3000000000 -> 80 BC C1 96 0B          (5-byte varint)
+    uint64 2^63       -> 80 80 80 80 80 80 80 80 80 01
+  The unfixed encoder produced 80 BC C1 96 FB FF FF FF FF 01 for the first —
+  note the shared 4-byte prefix, which is what made it look plausible. }
+procedure TestUnsignedWireForm;
+var
+  LSrc, LDst: TUnsignedMessage;
+  LBytes: TBytes;
+  LW: TProtoWriter;
+  LWant: TBytes;
+begin
+  Section('12  uint32 / uint64 wire form (FIX-PROTO-UINT32-1)');
+
+  LSrc := TUnsignedMessage.Create;
+  LDst := TUnsignedMessage.Create;
+  LW   := TProtoWriter.Create;
+  try
+    LSrc.u32 := Cardinal(3000000000);
+    LSrc.u64 := UInt64(1) shl 63;
+
+    LBytes := TProtoSerializer.Serialize(LSrc);
+
+    { Reference bytes built with the wire-level API, which has always had
+      WriteUInt32Field/WriteUInt64Field — the defect was that the RTTI layer
+      never called them. Comparing the two layers is exactly the assertion. }
+    LW.WriteUInt32Field(1, Cardinal(3000000000));
+    LW.WriteUInt64Field(2, UInt64(1) shl 63);
+    LWant := LW.ToBytes;
+
+    Check('uint32/uint64 bytes match the wire-level encoders',
+      BytesEqual(LBytes, LWant),
+      'got ' + BytesToHex(LBytes) + '  want ' + BytesToHex(LWant));
+
+    Check('uint32 = 3000000000 did not sign-extend',
+      Length(LBytes) = Length(LWant),
+      'got ' + IntToStr(Length(LBytes)) + ' bytes, want ' +
+      IntToStr(Length(LWant)) + ' — a longer result means sign extension');
+
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('uint32 round-trips above MaxInt',
+      LDst.u32 = Cardinal(3000000000), IntToStr(Int64(LDst.u32)));
+    Check('uint64 round-trips above High(Int64)',
+      LDst.u64 = (UInt64(1) shl 63), 'high bit set');
+  finally
+    LW.Free;
+    LSrc.Free;
+    LDst.Free;
+  end;
+end;
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 begin
@@ -780,6 +853,7 @@ begin
     TestRepeatedRoundTrip;
     TestRepeatedEmptyAndWire;
     TestRepeatedAcceptsUnpackedNumeric;
+    TestUnsignedWireForm;
 
     WriteLn;
     WriteLn(Format('[Nghttp2Protobuf] %d passed, %d failed', [GPassCount, GFailCount]));

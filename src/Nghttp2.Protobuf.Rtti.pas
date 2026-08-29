@@ -13,12 +13,20 @@ unit Nghttp2.Protobuf.Rtti;
 //  Nghttp2.Protobuf.
 //
 //  Types supported:
-//    Int32 / Integer  — pkInt32        Single      — pkFloat
-//    Int64            — pkInt64        Double      — pkDouble
-//    string           — pkString       enum        — pkEnum (int32 varint)
-//    Boolean          — pkBool         TBytes      — pkBytes
-//    nested class     — pkSubmessage
-//    TArray<T>        — repeated, for any T above  (M1c.2)
+//    Int32 / Integer     — pkInt32     Single      — pkFloat
+//    Int64               — pkInt64     Double      — pkDouble
+//    Cardinal / UInt32   — pkUInt32    enum        — pkEnum (int32 varint)
+//    UInt64              — pkUInt64    TBytes      — pkBytes
+//    string              — pkString    Boolean     — pkBool
+//    nested class        — pkSubmessage
+//    TArray<T>           — repeated, for any T above  (M1c.2)
+//
+//  NOT supported, and the reason is structural rather than an omission:
+//    sint32/sint64 (zigzag) and the fixed32/64/sfixed32/64 family. The wire
+//    layer implements all of them — TProtoWriter.WriteSInt32Field and friends
+//    exist — but TProtoMemberAttribute carries only a TAG, so a property has
+//    no way to ask for a wire form. Selecting them needs an attribute
+//    overload; see plans/horse-grpc-codegen.md section 6.1.
 //
 //  TBytes is proto3 `bytes` (a scalar), NOT `repeated uint8` — so TArray<Byte>
 //  is deliberately excluded from repeated handling. Changing that would
@@ -71,11 +79,26 @@ type
   //   the kinds below — packed on the wire for numerics, LEN-per-element for
   //   string/bytes/submessage. Repeated is a framing property, recorded on
   //   TProtoFieldInfo.IsRepeated, not a kind of its own.
-  // Still deferred: unsigned variants (UInt32/UInt64), ZigZag variants
-  //   (SInt32/SInt64), fixed variants (Fixed32/64/SFixed32/64), and maps.
+  // FIX-PROTO-UINT32-1 (2026-08-29) added UNSIGNED: proto3 uint32/uint64.
+  //   Before it, tkInteger mapped unconditionally to pkInt32 and marshalled
+  //   through TValue.AsInteger, so a Cardinal above MaxInt overflowed to
+  //   negative and sign-extended into a 10-byte varint — a DIFFERENT value on
+  //   the wire, with no error anywhere. It round-tripped cleanly against our
+  //   own decoder, which is why no test caught it; see
+  //   tests/Nghttp2ProtobufConformance.dpr, which compares against an
+  //   independent reference encoder rather than against ourselves.
+  //   Nothing in the wire layer was missing: WriteUInt32Field /
+  //   ReadVarintAsUInt32 and their 64-bit twins already existed in
+  //   Nghttp2.Protobuf. Only this layer never selected them.
+  // Still deferred: ZigZag variants (SInt32/SInt64), fixed variants
+  //   (Fixed32/64/SFixed32/64), and maps. Those genuinely cannot be expressed —
+  //   TProtoMemberAttribute carries only a tag, so no wire form can be
+  //   requested. Adding them means an attribute overload.
   TProtoFieldKind = (
     pkInt32,
     pkInt64,
+    pkUInt32,     // proto3 uint32 — plain varint of the UNSIGNED value
+    pkUInt64,     // proto3 uint64
     pkString,
     pkBool,
     pkFloat,
@@ -272,10 +295,43 @@ begin
   ASubmessageClass := nil;
 
   case ARttiType.TypeKind of
+    { FIX-PROTO-UINT32-1. Signedness is NOT in the type kind — Cardinal and
+      Integer are both tkInteger — so it must come from OrdType. Without this
+      test a Cardinal took pkInt32, marshalled via AsInteger, and any value
+      above MaxInt went onto the wire sign-extended and wrong.
+
+      otUByte / otUWord are folded in with otULong deliberately: proto3 has no
+      8- or 16-bit scalar, so a Byte or Word property is someone spelling a
+      uint32 narrowly. Their values cannot exceed MaxInt, so this changes not a
+      single emitted byte for them — it only makes the mapping honest. }
     tkInteger:
-      AKind := pkInt32;
+      if (ARttiType is TRttiOrdinalType)
+         and (TRttiOrdinalType(ARttiType).OrdType in [otUByte, otUWord, otULong]) then
+        AKind := pkUInt32
+      else
+        AKind := pkInt32;
+
+    { The two compilers disagree about UInt64, and the disagreement is why the
+      conformance probe reported REFUSES on FPC and would report DEVIATES on
+      Delphi. FPC gives UInt64 its own kind (tkQWord), so it never reached here
+      and fell through to the raise below — loud, survivable. Delphi has NO
+      unsigned-64 kind: UInt64 is tkInt64, so it took pkInt64 and was silently
+      wrong exactly like Cardinal. Compare by type handle to separate them. }
     tkInt64:
+    {$IF DEFINED(FPC)}
       AKind := pkInt64;
+    {$ELSE}
+      if ARttiType.Handle = TypeInfo(UInt64) then
+        AKind := pkUInt64
+      else
+        AKind := pkInt64;
+    {$IFEND}
+
+    {$IF DEFINED(FPC)}
+    // FPC only: UInt64/QWord carry their own type kind.
+    tkQWord:
+      AKind := pkUInt64;
+    {$IFEND}
     tkChar, tkWChar, tkString, tkLString, tkWString, tkUString
     {$IF DEFINED(FPC)}
       // FPC: with {$MODE DELPHI}{$H+}, `string` = AnsiString = tkAString (9).
@@ -345,9 +401,10 @@ begin
   else
     raise EProtoRttiError.CreateFmt(
       'ProtoMember %s has type kind %d — not supported. ' +
-      'Covered: Int32/Int64/string/Boolean/Float/Double/Enum/TBytes/submessage, ' +
-      'and TArray<> of any of those. ' +
-      'UInt/SInt/Fixed variants remain deferred.',
+      'Covered: Int32/Int64/UInt32/UInt64/string/Boolean/Float/Double/Enum/' +
+      'TBytes/submessage, and TArray<> of any of those. ' +
+      'SInt (zigzag) and Fixed variants remain deferred — they need a wire-form ' +
+      'parameter on TProtoMember, which carries only a tag today.',
       [ADesc, Ord(ARttiType.TypeKind)]);
   end;
 end;
@@ -484,7 +541,8 @@ end;
   does. This function only decides what we EMIT. }
 function IsPackableKind(AKind: TProtoFieldKind): Boolean;
 begin
-  Result := AKind in [pkInt32, pkInt64, pkBool, pkEnum, pkFloat, pkDouble];
+  Result := AKind in [pkInt32, pkInt64, pkUInt32, pkUInt64,
+                      pkBool, pkEnum, pkFloat, pkDouble];
 end;
 
 { One packed element, tagless, into AWriter. Mirrors the body of the matching
@@ -501,6 +559,11 @@ begin
   case AKind of
     pkInt32: AWriter.WriteVarint(UInt64(Int64(AValue.AsInteger)));
     pkInt64: AWriter.WriteVarint(UInt64(AValue.AsInt64));
+    { AsOrdinal returns Int64, which holds every uint32 value exactly, so the
+      cast is lossless — unlike AsInteger, which is what broke this. uint64
+      cannot go through AsOrdinal: values above High(Int64) do not fit. }
+    pkUInt32: AWriter.WriteVarint(UInt64(AValue.AsOrdinal));
+    pkUInt64: AWriter.WriteVarint(AValue.AsType<UInt64>);
     pkBool:  if AValue.AsBoolean then AWriter.WriteVarint(1) else AWriter.WriteVarint(0);
     pkEnum:  AWriter.WriteVarint(UInt64(Int64(AValue.AsOrdinal)));
     pkFloat:
@@ -604,6 +667,8 @@ begin
       case LField.Kind of
         pkInt32:   LWriter.WriteInt32Field(LField.Tag, LValue.AsInteger);
         pkInt64:   LWriter.WriteInt64Field(LField.Tag, LValue.AsInt64);
+        pkUInt32:  LWriter.WriteUInt32Field(LField.Tag, UInt32(LValue.AsOrdinal));
+        pkUInt64:  LWriter.WriteUInt64Field(LField.Tag, LValue.AsType<UInt64>);
         pkString:  LWriter.WriteStringField(LField.Tag, LValue.AsString);
         pkBool:    LWriter.WriteBoolField(LField.Tag, LValue.AsBoolean);
         pkFloat:   LWriter.WriteFloatField(LField.Tag, LValue.AsExtended);
@@ -643,6 +708,8 @@ begin
   case AKind of
     pkInt32:  Result := TValue.From<Integer>(AReader.ReadVarintAsInt32);
     pkInt64:  Result := TValue.From<Int64>(AReader.ReadVarintAsInt64);
+    pkUInt32: Result := TValue.From<UInt32>(AReader.ReadVarintAsUInt32);
+    pkUInt64: Result := TValue.From<UInt64>(AReader.ReadVarintAsUInt64);
     pkBool:   Result := TValue.From<Boolean>(AReader.ReadBool);
     pkFloat:  Result := TValue.From<Single>(AReader.ReadFloat);
     pkDouble: Result := TValue.From<Double>(AReader.ReadDouble);
@@ -773,6 +840,16 @@ begin
             pkInt64:
               begin
                 LValue := TValue.From<Int64>(LReader.ReadVarintAsInt64);
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkUInt32:
+              begin
+                LValue := TValue.From<UInt32>(LReader.ReadVarintAsUInt32);
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkUInt64:
+              begin
+                LValue := TValue.From<UInt64>(LReader.ReadVarintAsUInt64);
                 LField.Prop.SetValue(AObj, LValue);
               end;
             pkString:
