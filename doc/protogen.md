@@ -93,6 +93,31 @@ than no test.
 | message | a class reference | |
 | `repeated T` | `TArray<T>` | Packed for numerics, LEN-per-element otherwise. |
 | `service` / `rpc` | interface + methods | All four shapes: unary, server-, client-streaming and bidi. |
+| nested `message` / `enum` | hoisted to file scope | See below. |
+
+### Nested declarations are flattened
+
+Pascal has no nested class scope, so a declaration inside a message is hoisted
+to file scope and keeps the proto path that located it as its identity:
+
+```proto
+message Outer {
+  enum Status { STATUS_NONE = 0; }
+  message Inner { int32 a = 1; }
+}
+```
+
+gives three types — `Outer`, `Outer.Status`, `Outer.Inner` — all at file level,
+each carrying both its simple name and its qualified one. Hierarchy survives as
+a **name** rather than as structure, which is the only option available.
+
+The qualifier accumulates, so `Outer.Inner.Deep` works to any depth. Two types
+may share a simple name across different parents; the qualified name is what
+disambiguates them.
+
+*Why this matters:* nesting was **52% of a 7300-file googleapis corpus** — the
+single largest thing this tooling could not read — and it needed no change to
+the wire format at all.
 
 ### Refused, and why
 
@@ -120,13 +145,6 @@ optimisation, not correctness.
 | `map<K,V>` | Encoded as a repeated entry submessage, so it needs a synthesised message type per map. Model it as a `repeated` message with explicit key and value fields. |
 | `oneof` | A tagged union with presence semantics; nothing here can express which member is set. |
 | `optional` | proto3 explicit presence needs a has-bit. Worse, the serializer currently emits **even default-valued scalars**, so "set to zero" and "not set" are indistinguishable on the wire. Drop the keyword — implicit presence is the proto3 default. |
-
-**Deferred — a naming problem, not a wire problem**
-
-Nested `message` / `enum` declarations. The codec handles submessages perfectly
-well; Pascal simply has no nested class scope to mirror `Outer.Inner`, so the
-generator would have to invent a flattening rule. Declare it at file scope and
-reference it by name.
 
 **Out of scope**
 
