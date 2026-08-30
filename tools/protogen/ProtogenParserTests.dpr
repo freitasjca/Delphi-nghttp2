@@ -415,13 +415,76 @@ begin
   end;
 end;
 
-// ── 05 · the refusal corpus ─────────────────────────────────────────────────
+// ── 05 · bundled well-known types ───────────────────────────────────────────
+// 1395 of 7300 googleapis files wanted one of these. They were never a codec
+// limitation — Timestamp is int64+int32, FieldMask is a repeated string — and
+// now Nghttp2.Protobuf.WellKnown supplies the Pascal.
+
+procedure TestWellKnown;
+var
+  F: TProtoFileNode;
+  M: TProtoMessageNode;
+begin
+  Section('05  bundled well-known types are accepted');
+
+  F := Parse(
+    'syntax = "proto3";'#10 +
+    'package t;'#10 +
+    'import "google/protobuf/timestamp.proto";'#10 +
+    'message M {'#10 +
+    '  google.protobuf.Timestamp   created = 1;'#10 +
+    '  google.protobuf.Duration    ttl     = 2;'#10 +
+    '  google.protobuf.FieldMask   mask    = 3;'#10 +
+    '  google.protobuf.StringValue note    = 4;'#10 +
+    '  google.protobuf.Int32Value  count   = 5;'#10 +
+    '  google.protobuf.BoolValue   flag    = 6;'#10 +
+    '  .google.protobuf.Timestamp  updated = 7;'#10 +
+    '}'#10 +
+    'service S {'#10 +
+    '  rpc Wipe (M) returns (google.protobuf.Empty);'#10 +
+    '}'#10);
+  try
+    M := F.FindMessage('M');
+    Check('message with 7 well-known fields parsed', M <> nil);
+    if M <> nil then
+    begin
+      Check('7 fields', M.Fields.Count = 7, IntToStr(M.Fields.Count));
+      Check('Timestamp kept as a type reference, not a scalar',
+        (M.Fields[0].Scalar = psNone)
+        and (M.Fields[0].TypeName = 'google.protobuf.Timestamp'));
+      { The leading-dot spelling is the same type — a schema uses it to escape
+        package-relative lookup, and the lookup must not care. }
+      Check('leading-dot spelling accepted too',
+        M.Fields[6].TypeName = '.google.protobuf.Timestamp',
+        M.Fields[6].TypeName);
+    end;
+
+    Check('Empty accepted as an rpc response',
+      (F.Services.Count = 1) and (F.Services[0].Rpcs.Count = 1)
+      and (F.Services[0].Rpcs[0].ResponseType = 'google.protobuf.Empty'));
+  finally
+    F.Free;
+  end;
+
+  { The mapping is the contract shared with the emitter, so assert it directly
+    rather than only through the parser's accept/refuse behaviour. }
+  Check('Timestamp maps to TProtobufTimestamp',
+    WellKnownPascalClass('google.protobuf.Timestamp') = 'TProtobufTimestamp');
+  Check('leading dot maps identically',
+    WellKnownPascalClass('.google.protobuf.FieldMask') = 'TProtobufFieldMask');
+  Check('Struct is NOT bundled',
+    WellKnownPascalClass('google.protobuf.Struct') = '');
+  Check('a user type is not mistaken for well-known',
+    WellKnownPascalClass('myapp.Timestamp') = '');
+end;
+
+// ── 06 · the refusal corpus ─────────────────────────────────────────────────
 
 procedure TestRefusals;
 const
   HDR = 'syntax = "proto3";'#10'package t;'#10;
 begin
-  Section('05  unsupported features must be refused, WITH a reason');
+  Section('06  unsupported features must be refused, WITH a reason');
 
   ExpectRefusal('sint32',
     HDR + 'message M { sint32 v = 1; }', 'sint32');
@@ -451,9 +514,23 @@ begin
   ExpectRefusal('proto2 syntax',
     'syntax = "proto2";'#10'package t;'#10, 'proto2');
 
-  ExpectRefusal('well-known type',
-    HDR + 'message M { google.protobuf.Timestamp t = 1; }',
-    'google.protobuf.Timestamp');
+  { Only the UNBUNDLED well-known types are refused now. Struct is the cheapest
+    to state: it is built on oneof. The bundled ones are asserted accepted in
+    TestWellKnown below — both halves matter, because a list like this fails
+    silently in either direction. }
+  ExpectRefusal('well-known type (not bundled)',
+    HDR + 'message M { google.protobuf.Struct s = 1; }',
+    'google.protobuf.Struct');
+
+  ExpectRefusal('well-known Any (dynamic typing)',
+    HDR + 'message M { google.protobuf.Any a = 1; }',
+    'google.protobuf.Any');
+
+  { The rpc-type check, which did not exist before the well-known split. }
+  ExpectRefusal('unbundled well-known type as an rpc response',
+    HDR + 'message Q { int32 a = 1; }'#10 +
+    'service S { rpc Go (Q) returns (google.protobuf.Any); }',
+    'google.protobuf.Any');
 
   { Nested declarations are no longer refused — see TestNesting. Left as a
     comment rather than deleted so the change is visible to anyone diffing
@@ -485,6 +562,7 @@ begin
     TestEcho;
     TestSupportedExtras;
     TestNesting;
+    TestWellKnown;
     TestRefusals;
 
     WriteLn;

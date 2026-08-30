@@ -230,10 +230,20 @@ message Outer {
 }
 EOF
 
-add_case wellknown refuse "well-known types are not bundled" <<EOF
+add_case wellknown accept "Timestamp/Duration/FieldMask/Empty/wrappers bundled" <<EOF
 $HDR
 import "google/protobuf/timestamp.proto";
-message M { google.protobuf.Timestamp t = 1; }
+import "google/protobuf/field_mask.proto";
+message M {
+  google.protobuf.Timestamp t = 1;
+  google.protobuf.FieldMask m = 2;
+}
+EOF
+
+add_case wellknown_blocked refuse "Struct needs oneof - still refused" <<EOF
+$HDR
+import "google/protobuf/struct.proto";
+message M { google.protobuf.Struct s = 1; }
 EOF
 
 add_case proto2_syntax refuse "proto2 - valid to protoc, out of scope for us" <<EOF

@@ -462,6 +462,7 @@ var
   LField: TProtoFieldInfo;
   I, J:   Integer;
   LTmp:   TProtoFieldInfo;
+  LIsDeclaredMessage: Boolean;
 begin
   Result.TypeClass := AClass;
 
@@ -501,11 +502,36 @@ begin
       LList.Add(LField);
     end;
 
+    // A zero-field result is ambiguous: it means EITHER the author forgot
+    // {$M+} / `published` / the attribute import, OR the message genuinely has
+    // no fields. `message Empty {}` is the canonical proto3 example and gRPC
+    // returns it constantly, so refusing it outright was wrong.
+    //
+    // [TGrpcMessage] resolves the ambiguity. It is the author stating "this
+    // class IS a protobuf message", so zero fields is a deliberate shape. The
+    // attribute was decorative until now — every sample carried it and nothing
+    // read it — and this gives it a job.
+    //
+    // Without the attribute the original diagnostic stands, because that is
+    // exactly the case it was written for.
     if LList.Count = 0 then
-      raise EProtoRttiError.CreateFmt(
-        'Class %s has no [ProtoMember]-annotated published properties. '
-        + 'Check {$M+}, `published` section, and TProtoMemberAttribute imports.',
-        [AClass.ClassName]);
+    begin
+      LIsDeclaredMessage := False;
+      for LAttr in LType.GetAttributes do
+        if LAttr is TGrpcMessageAttribute then
+        begin
+          LIsDeclaredMessage := True;
+          Break;
+        end;
+
+      if not LIsDeclaredMessage then
+        raise EProtoRttiError.CreateFmt(
+          'Class %s has no [ProtoMember]-annotated published properties. '
+          + 'Check {$M+}, `published` section, and TProtoMemberAttribute '
+          + 'imports. If the message is genuinely empty, mark the class '
+          + '[TGrpcMessage] to say so.',
+          [AClass.ClassName]);
+    end;
 
     // Sort by tag for deterministic wire output. Small N (typically < 20)
     // so a simple insertion sort in-place is fine — no need for TArray.Sort.

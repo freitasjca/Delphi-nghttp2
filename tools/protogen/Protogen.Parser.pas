@@ -278,17 +278,29 @@ procedure TProtoParser.CheckTypeNameSupported(const ATypeName: string;
   const AFieldName: string; ALine, ACol: Integer);
 begin
   { Well-known types arrive as qualified names because the lexer keeps dots in
-    an identifier. They need google/protobuf/*.proto imported and a matching
-    Pascal class; neither exists here. Named explicitly so the message does not
-    read as "unknown message type", which would send the user hunting for a
-    typo in their own schema. }
+    an identifier. The plain ones are now bundled in
+    Nghttp2.Protobuf.WellKnown — Timestamp, Duration, FieldMask, Empty and the
+    wrappers — because they were never a codec limitation, only missing Pascal.
+    WellKnownPascalClass is the single list both this check and the emitter
+    read. The rest are refused BY NAME, with the actual obstacle stated, so the
+    message never reads as "unknown message type" and sends someone hunting for
+    a typo in their own schema. }
   if (Pos('google.protobuf.', ATypeName) = 1)
      or (Pos('.google.protobuf.', ATypeName) = 1) then
+  begin
+    if WellKnownPascalClass(ATypeName) <> '' then
+      Exit;   // bundled — nothing to refuse
+
     RefuseAt(ALine, ACol, ATypeName,
-      Format('Field %s refers to a protobuf well-known type. Those are not ' +
-             'bundled: they need google/protobuf/*.proto and hand-written ' +
-             'Pascal equivalents. Declare your own message instead.',
+      Format('Field %s refers to a well-known type that is not bundled. ' +
+             'Struct, Value and ListValue are built on oneof; Any needs ' +
+             'dynamic type resolution from a type URL; Api, Type and ' +
+             'DescriptorProto are protobuf''s own reflection machinery. All ' +
+             'need a presence model the serializer does not have. Timestamp, ' +
+             'Duration, FieldMask, Empty and the scalar wrappers ARE ' +
+             'supported.',
              [QuotedStr(AFieldName)]));
+  end;
 end;
 
 // ── Statements ──────────────────────────────────────────────────────────────
@@ -687,6 +699,14 @@ begin
     LRpc.RequestType := ExpectQualifiedIdent;
     ExpectSymbol(')');
 
+    { RPC types were previously unchecked, which mattered little while every
+      well-known type was refused at field level anyway. Now that some are
+      bundled and some are not, an rpc returning google.protobuf.Any would sail
+      through here and produce an interface the emitter cannot honour. Checked
+      at the same position the type was read. }
+    CheckTypeNameSupported(LRpc.RequestType,
+      Format('rpc %s request', [LRpc.Name]), LRpc.Line, 1);
+
     ExpectIdentValue('returns');
 
     ExpectSymbol('(');
@@ -696,6 +716,8 @@ begin
       NextTok;
     end;
     LRpc.ResponseType := ExpectQualifiedIdent;
+    CheckTypeNameSupported(LRpc.ResponseType,
+      Format('rpc %s response', [LRpc.Name]), LRpc.Line, 1);
     ExpectSymbol(')');
 
     // Either a bare `;` or an options block, which must be skipped by BRACE

@@ -157,6 +157,20 @@ function ScalarFromKeyword(const AWord: string): TProtoScalar;
   user's own spelling back at them. }
 function ScalarName(AScalar: TProtoScalar): string;
 
+{ Maps a protobuf well-known type to the Pascal class that implements it in
+  Nghttp2.Protobuf.WellKnown, or '' when the type is not bundled.
+
+  One list, two consumers, and that is the point: the PARSER asks "may I accept
+  a field of this type" and the EMITTER will ask "what do I call it". Splitting
+  them would let the two drift, and the failure mode is a generator that
+  accepts a schema it cannot emit.
+
+  Not bundled, and each for a reason rather than an oversight: Struct, Value
+  and ListValue are built on `oneof`; Any needs dynamic type resolution from a
+  type URL; Api, Type and DescriptorProto are protobuf's own reflection
+  machinery. All stay refused until presence exists. }
+function WellKnownPascalClass(const AProtoName: string): string;
+
 implementation
 
 // ── TProtoFieldNode ─────────────────────────────────────────────────────────
@@ -291,6 +305,32 @@ begin
   else if AWord = 'string'   then Result := psString
   else if AWord = 'bytes'    then Result := psBytes
   else Result := psNone;
+end;
+
+function WellKnownPascalClass(const AProtoName: string): string;
+var
+  LName: string;
+begin
+  // Accept both the plain and leading-dot spellings — '.google.protobuf.X' is
+  // how a schema escapes package-relative lookup, and it means the same type.
+  LName := AProtoName;
+  if (Length(LName) > 0) and (LName[1] = '.') then
+    Delete(LName, 1, 1);
+
+  if      LName = 'google.protobuf.Timestamp'   then Result := 'TProtobufTimestamp'
+  else if LName = 'google.protobuf.Duration'    then Result := 'TProtobufDuration'
+  else if LName = 'google.protobuf.FieldMask'   then Result := 'TProtobufFieldMask'
+  else if LName = 'google.protobuf.Empty'       then Result := 'TProtobufEmpty'
+  else if LName = 'google.protobuf.DoubleValue' then Result := 'TProtobufDoubleValue'
+  else if LName = 'google.protobuf.FloatValue'  then Result := 'TProtobufFloatValue'
+  else if LName = 'google.protobuf.Int64Value'  then Result := 'TProtobufInt64Value'
+  else if LName = 'google.protobuf.UInt64Value' then Result := 'TProtobufUInt64Value'
+  else if LName = 'google.protobuf.Int32Value'  then Result := 'TProtobufInt32Value'
+  else if LName = 'google.protobuf.UInt32Value' then Result := 'TProtobufUInt32Value'
+  else if LName = 'google.protobuf.BoolValue'   then Result := 'TProtobufBoolValue'
+  else if LName = 'google.protobuf.StringValue' then Result := 'TProtobufStringValue'
+  else if LName = 'google.protobuf.BytesValue'  then Result := 'TProtobufBytesValue'
+  else Result := '';
 end;
 
 function ScalarName(AScalar: TProtoScalar): string;

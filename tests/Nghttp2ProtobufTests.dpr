@@ -225,6 +225,19 @@ type
     [TProtoMember(2)] property u64: UInt64   read Fu64 write Fu64;
   end;
 
+  { A genuinely fieldless message — the shape of google.protobuf.Empty, which
+    gRPC returns constantly. The scanner used to refuse ANY zero-field class,
+    because it could not tell a deliberate empty message from someone who
+    forgot the M+ directive. [TGrpcMessage] is now that discriminator. }
+  [TGrpcMessage]
+  TEmptyMessage = class
+  end;
+
+  { The control: same zero fields, NO attribute. Must still be refused, or the
+    fix has thrown away the diagnostic it was protecting. }
+  TUnmarkedEmptyMessage = class
+  end;
+
 // ── Destructor for TAdvancedMessage — implementation outside type block ─────
 
 destructor TAdvancedMessage.Destroy;
@@ -789,6 +802,56 @@ end;
     uint64 2^63       -> 80 80 80 80 80 80 80 80 80 01
   The unfixed encoder produced 80 BC C1 96 FB FF FF FF FF 01 for the first —
   note the shared 4-byte prefix, which is what made it look plausible. }
+{ An empty message must serialise to zero bytes and survive a round trip.
+
+  Both halves are asserted, and the second is the one that keeps the change
+  honest: an UNMARKED zero-field class must still be refused, because that is
+  the M+ / published / missing-import mistake the original guard exists to
+  catch. Relaxing the guard without keeping that control would trade a loud,
+  accurate diagnostic for messages that silently serialise as nothing.
+
+  This also exercises TRttiType.GetAttributes on a CLASS, which is the part
+  most at risk of behaving differently on FPC — hence a gate rather than a
+  report. }
+procedure TestEmptyMessage;
+var
+  LSrc, LDst: TEmptyMessage;
+  LBad: TUnmarkedEmptyMessage;
+  LBytes: TBytes;
+  LRefused: Boolean;
+begin
+  Section('13  empty message ([TGrpcMessage], zero fields)');
+
+  LSrc := TEmptyMessage.Create;
+  LDst := TEmptyMessage.Create;
+  try
+    LBytes := TProtoSerializer.Serialize(LSrc);
+    Check('empty message serialises to 0 bytes', Length(LBytes) = 0,
+      IntToStr(Length(LBytes)) + ' bytes: ' + BytesToHex(LBytes));
+
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('empty message round-trips without raising', True);
+  finally
+    LSrc.Free;
+    LDst.Free;
+  end;
+
+  LRefused := False;
+  LBad := TUnmarkedEmptyMessage.Create;
+  try
+    try
+      TProtoSerializer.Serialize(LBad);
+    except
+      on E: EProtoRttiError do
+        LRefused := True;
+    end;
+  finally
+    LBad.Free;
+  end;
+  Check('zero fields WITHOUT [TGrpcMessage] is still refused', LRefused,
+    'the {$M+} diagnostic must survive');
+end;
+
 procedure TestUnsignedWireForm;
 var
   LSrc, LDst: TUnsignedMessage;
@@ -854,6 +917,7 @@ begin
     TestRepeatedEmptyAndWire;
     TestRepeatedAcceptsUnpackedNumeric;
     TestUnsignedWireForm;
+    TestEmptyMessage;
 
     WriteLn;
     WriteLn(Format('[Nghttp2Protobuf] %d passed, %d failed', [GPassCount, GFailCount]));
