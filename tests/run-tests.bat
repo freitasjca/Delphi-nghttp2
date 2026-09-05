@@ -11,6 +11,10 @@ REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
 REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
+REM    6  ProtogenEmitTests               build + run   (gates) - same dir
+REM    7  ProtogenInterfaceTests          build + run   (gates) - same dir
+REM    8  ProtogenRunnerTests             build + run   (gates) - same dir
+REM    9  Protogen.dpr                    compile only  (gates) - same dir
 REM
 REM  The protoc oracle (C1b) is NOT run here. It is a bash script, and the
 REM  Windows story for it is `wsl bash protoc-oracle.sh` or running it from the
@@ -114,6 +118,79 @@ echo    SKIP  ..\tools\protogen not present
 
 :after_protogen
 
+REM -- protogen emitter (C2). Same directory as the parser tests.
+REM    Its units are pure RTL — no Nghttp2 on the path — same rule as stage 5.
+if not exist "..\tools\protogen\ProtogenEmitTests.dpr" goto :no_emit
+pushd "..\tools\protogen"
+set "STAGE=ProtogenEmitTests"
+set "GATES=1"
+set "STAGEUNITS=."
+call :build_run
+popd
+set "STAGEUNITS=..\src"
+goto :after_emit
+
+:no_emit
+echo -- ProtogenEmitTests ---------------------------------------------------------------
+echo    SKIP  ..\tools\protogen\ProtogenEmitTests.dpr not present
+
+:after_emit
+
+REM -- protogen interface emitter (C3). Same directory as the emitter tests.
+REM    Its units are pure RTL + protogen — no Nghttp2 on the path — same rule.
+if not exist "..\tools\protogen\ProtogenInterfaceTests.dpr" goto :no_iface
+pushd "..\tools\protogen"
+set "STAGE=ProtogenInterfaceTests"
+set "GATES=1"
+set "STAGEUNITS=."
+call :build_run
+popd
+set "STAGEUNITS=..\src"
+goto :after_iface
+
+:no_iface
+echo -- ProtogenInterfaceTests ---------------------------------------------------------------
+echo    SKIP  ..\tools\protogen\ProtogenInterfaceTests.dpr not present
+
+:after_iface
+
+REM -- protogen runner (C4). Same directory as the interface emitter tests.
+REM    Exercises WriteUnits + Run against a real temp directory (file I/O,
+REM    no-overwrite, dry-run, error paths). Uses System.IOUtils for TPath.GetTempPath.
+if not exist "..\tools\protogen\ProtogenRunnerTests.dpr" goto :no_runner
+pushd "..\tools\protogen"
+set "STAGE=ProtogenRunnerTests"
+set "GATES=1"
+set "STAGEUNITS=."
+call :build_run
+popd
+set "STAGEUNITS=..\src"
+goto :after_runner
+
+:no_runner
+echo -- ProtogenRunnerTests ---------------------------------------------------------------
+echo    SKIP  ..\tools\protogen\ProtogenRunnerTests.dpr not present
+
+:after_runner
+
+REM -- protogen binary (compile only). Protogen.dpr is the CLI; running it
+REM    without args exits 1, so we only compile. A build failure means the
+REM    runner's public API changed without updating the binary.
+if not exist "..\tools\protogen\Protogen.dpr" goto :no_protogen_bin
+pushd "..\tools\protogen"
+set "STAGE=Protogen"
+set "STAGEUNITS=."
+call :build_only
+popd
+set "STAGEUNITS=..\src"
+goto :after_protogen_bin
+
+:no_protogen_bin
+echo -- Protogen (compile only) ---------------------------------------------------------------
+echo    SKIP  ..\tools\protogen\Protogen.dpr not present
+
+:after_protogen_bin
+
 echo.
 echo ===========================================================================
 if "!FAILED!"=="0" goto :all_ok
@@ -168,6 +245,29 @@ set /a FAILED+=1
 goto :eof
 
 :br_missing
+echo    SKIP  !STAGE!.dpr not present
+goto :eof
+
+REM ===========================================================================
+:build_only
+REM Compile only — do not run.  Gates on compile failure; run result is ignored.
+echo -- !STAGE! (compile only) ---------------------------------------------------------------
+if not exist "!STAGE!.dpr" goto :bo_missing
+"!DCC!" -CC -B -U"!STAGEUNITS!" "!STAGE!.dpr" > "!STAGE!.buildlog" 2>&1
+if errorlevel 1 goto :bo_buildfail
+if not exist "!STAGE!.exe" goto :bo_buildfail
+echo    PASS  !STAGE! ^(compile only^)
+goto :eof
+
+:bo_buildfail
+echo    FAIL  !STAGE! did not compile
+findstr /C:"Error" /C:"Fatal" "!STAGE!.buildlog"
+echo.
+echo    Full log: !STAGE!.buildlog
+set /a FAILED+=1
+goto :eof
+
+:bo_missing
 echo    SKIP  !STAGE!.dpr not present
 goto :eof
 

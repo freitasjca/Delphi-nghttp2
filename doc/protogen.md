@@ -10,6 +10,12 @@ against `protoc`.
 > schema before you hand-write the message classes, and it will tell you
 > whether that work is going to pay off.
 
+> **Looking for `horse-pb-compiler`?** That is a different tool for a different
+> runtime — it emits against Horse's own gRPC stack (`Horse.Grpc.Attributes`,
+> `Horse.Core.Protobuf.Serializer`), not this library's. Which one you want
+> depends on which server you are running:
+> [`doc/protogen-vs-horse-pb-compiler.md`](protogen-vs-horse-pb-compiler.md).
+
 Everything here builds on both compilers and needs nothing beyond the RTL.
 
 ---

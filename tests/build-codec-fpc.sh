@@ -16,6 +16,10 @@
 #    6  protogen parser tests (C1)      build + run   (gates)
 #    7  protoc oracle (C1b)             run           (gates if protoc is
 #                                                      present; skips if not)
+#    8  protogen emitter tests (C2)     build + run   (gates)
+#    9  protogen interface emitter (C3) build + run   (gates)
+#   10  protogen runner tests (C4)      build + run   (gates)
+#   11  protogen binary (Protogen.dpr)  compile only  (gates)
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -435,6 +439,140 @@ if [[ -x "$PROTOGEN/protoc-oracle.sh" ]] || [[ -f "$PROTOGEN/protoc-oracle.sh" ]
   fi
 else
   echo "  SKIP  protoc-oracle.sh not present"
+fi
+
+# ── 8 · protogen emitter (C2) ───────────────────────────────────────────────
+# TMessagesEmitter: generates .Messages.pas from a parsed TProtoFileNode.
+# Same unit-path rules as stage 6 (pure RTL, no Nghttp2 unit on the path),
+# and same gating: a mismatch here means generated code diverges from the
+# hand-verified .Messages.pas originals.
+echo
+echo "── protogen emitter tests (C2) ───────────────────────────────────────"
+if [[ -f "$PROTOGEN/ProtogenEmitTests.dpr" ]]; then
+  PEOUT="$OUT/protogen-emit"
+  mkdir -p "$PEOUT"
+  rm -f "$PEOUT"/*.ppu "$PEOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PEOUT" -FE"$PEOUT" \
+       -Fu"$PROTOGEN" \
+       $TRUNK_UNIT_PATHS \
+       "$PROTOGEN/ProtogenEmitTests.dpr" > "$PEOUT/build.log" 2>&1 \
+     && [[ -x "$PEOUT/ProtogenEmitTests" ]]; then
+    "$PEOUT/ProtogenEmitTests" < /dev/null | sed 's/^/  /'
+    PE_RC=${PIPESTATUS[0]}
+    if [[ "$PE_RC" -eq 0 ]]; then
+      echo "  emitter tests: PASSED"
+    else
+      echo "  FAIL  protogen emitter tests"
+      [[ $RC -eq 0 ]] && RC=1
+    fi
+  else
+    echo "  FAIL  ProtogenEmitTests.dpr did not compile"
+    grep -E "Error|Fatal" "$PEOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PEOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  ProtogenEmitTests.dpr not present"
+fi
+
+# ── 9 · protogen service+interfaces emitter (C3) ────────────────────────────
+# TInterfacesEmitter + TServiceSkeletonEmitter. Same unit-path rules as stage 8
+# (pure RTL + protogen dir, no Nghttp2 units) — keeping them separate means a
+# dependency on Nghttp2 code would surface as a compile failure here.
+echo
+echo "── protogen interface emitter tests (C3) ────────────────────────────────"
+if [[ -f "$PROTOGEN/ProtogenInterfaceTests.dpr" ]]; then
+  PIOUT="$OUT/protogen-iface"
+  mkdir -p "$PIOUT"
+  rm -f "$PIOUT"/*.ppu "$PIOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PIOUT" -FE"$PIOUT" \
+       -Fu"$PROTOGEN" \
+       $TRUNK_UNIT_PATHS \
+       "$PROTOGEN/ProtogenInterfaceTests.dpr" > "$PIOUT/build.log" 2>&1 \
+     && [[ -x "$PIOUT/ProtogenInterfaceTests" ]]; then
+    "$PIOUT/ProtogenInterfaceTests" < /dev/null | sed 's/^/  /'
+    PI_RC=${PIPESTATUS[0]}
+    if [[ "$PI_RC" -eq 0 ]]; then
+      echo "  interface emitter tests: PASSED"
+    else
+      echo "  FAIL  protogen interface emitter tests"
+      [[ $RC -eq 0 ]] && RC=1
+    fi
+  else
+    echo "  FAIL  ProtogenInterfaceTests.dpr did not compile"
+    grep -E "Error|Fatal" "$PIOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PIOUT/build.log"
+    [[ $RC -eq 0 ]] && RC=2
+  fi
+else
+  echo "  SKIP  ProtogenInterfaceTests.dpr not present"
+fi
+
+# ── 10 · protogen runner (C4) ───────────────────────────────────────────────
+# TProtogenRunner: reads a proto file, orchestrates the three emitters, writes
+# output units into a directory.  This is the layer the CLI binary wraps.
+#
+# Uses a real temp directory (GetTempDir + 'pgtc4') so it exercises actual file
+# I/O — existence checks, ForceDirectories, the no-overwrite contract.  Content
+# correctness is covered by stages 8 and 9; this gate focuses on file creation,
+# no-overwrite, dry-run, and the high-level Run() error paths.
+echo
+echo "── protogen runner tests (C4) ────────────────────────────────────────"
+if [[ -f "$PROTOGEN/ProtogenRunnerTests.dpr" ]]; then
+  PROUT="$OUT/protogen-runner"
+  mkdir -p "$PROUT"
+  rm -f "$PROUT"/*.ppu "$PROUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PROUT" -FE"$PROUT" \
+       -Fu"$PROTOGEN" \
+       $TRUNK_UNIT_PATHS \
+       "$PROTOGEN/ProtogenRunnerTests.dpr" > "$PROUT/build.log" 2>&1 \
+     && [[ -x "$PROUT/ProtogenRunnerTests" ]]; then
+    "$PROUT/ProtogenRunnerTests" < /dev/null | sed 's/^/  /'
+    PR_RC=${PIPESTATUS[0]}
+    if [[ "$PR_RC" -eq 0 ]]; then
+      echo "  runner tests: PASSED"
+    else
+      echo "  FAIL  protogen runner tests"
+      [[ $RC -eq 0 ]] && RC=1
+    fi
+  else
+    echo "  FAIL  ProtogenRunnerTests.dpr did not compile"
+    grep -E "Error|Fatal" "$PROUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PROUT/build.log"
+    [[ $RC -eq 0 ]] && RC=2
+  fi
+else
+  echo "  SKIP  ProtogenRunnerTests.dpr not present"
+fi
+
+# ── 11 · protogen binary (compile only) ─────────────────────────────────────
+# Protogen.dpr is the CLI binary — compile it, do not run it (it exits 1 when
+# called with no arguments, which would set RC here incorrectly).  A compile
+# failure means the runner unit broke its public API, or a dep was removed.
+echo
+echo "── protogen binary — compile only ────────────────────────────────────"
+if [[ -f "$PROTOGEN/Protogen.dpr" ]]; then
+  PBOUT="$OUT/protogen-bin"
+  mkdir -p "$PBOUT"
+  rm -f "$PBOUT"/*.ppu "$PBOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PBOUT" -FE"$PBOUT" \
+       -Fu"$PROTOGEN" \
+       $TRUNK_UNIT_PATHS \
+       "$PROTOGEN/Protogen.dpr" > "$PBOUT/build.log" 2>&1 \
+     && [[ -x "$PBOUT/Protogen" ]]; then
+    echo "  PASS  Protogen.dpr"
+  else
+    echo "  FAIL  Protogen.dpr did not compile"
+    grep -E "Error|Fatal" "$PBOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PBOUT/build.log"
+    [[ $RC -eq 0 ]] && RC=2
+  fi
+else
+  echo "  SKIP  Protogen.dpr not present"
 fi
 
 exit $RC
