@@ -58,7 +58,7 @@ var
 procedure Section(const S: string);
 begin
   WriteLn;
-  WriteLn('── ', S);
+  WriteLn('-- ', S);
 end;
 
 procedure Check(const AName: string; APassed: Boolean; const ADetail: string = '');

@@ -42,7 +42,7 @@ var
 procedure Section(const S: string);
 begin
   WriteLn;
-  WriteLn('── ', S);
+  WriteLn('-- ', S);
 end;
 
 procedure Check(const AName: string; APassed: Boolean; const ADetail: string = '');
@@ -107,7 +107,7 @@ begin
       begin
         // Explicitly NOT counted as a refusal: an AV or a range error means
         // the parser fell over, which is a defect wearing a refusal's clothes.
-        Check(ACaseName + ' — refused with EProtoParseError', False,
+        Check(ACaseName + ' - refused with EProtoParseError', False,
           'got ' + E.ClassName + ': ' + E.Message);
         Exit;
       end;
@@ -116,13 +116,13 @@ begin
     LFile.Free;
   end;
 
-  Check(ACaseName + ' — refused', LRaised);
+  Check(ACaseName + ' - refused', LRaised);
   if not LRaised then Exit;
 
-  Check(ACaseName + ' — names ' + QuotedStr(AMustMention),
+  Check(ACaseName + ' - names ' + QuotedStr(AMustMention),
     Pos(LowerCase(AMustMention), LowerCase(LMsg)) > 0, LMsg);
 
-  Check(ACaseName + ' — explains, not just restates',
+  Check(ACaseName + ' - explains, not just restates',
     Length(LMsg) > Length(AMustMention) + 40, LMsg);
 end;
 
@@ -140,7 +140,7 @@ const
     'service Greeter {'#10 +
     '  rpc Greet (GreetRequest) returns (GreetResponse);'#10 +
     '  rpc Echo  (EchoRequest)  returns (EchoResponse);'#10 +
-    '  // M6a — server-streaming.'#10 +
+    '  // M6a - server-streaming.'#10 +
     '  rpc ListGreetings (GreetRequest) returns (stream GreetResponse);'#10 +
     '  rpc JoinNames     (stream GreetRequest) returns (GreetResponse);'#10 +
     '  rpc ChatGreetings (stream GreetRequest) returns (stream GreetResponse);'#10 +
@@ -196,7 +196,7 @@ var
   M: TProtoMessageNode;
   S: TProtoServiceNode;
 begin
-  Section('01  greeter.proto — the four RPC shapes');
+  Section('01  greeter.proto - the four RPC shapes');
   F := Parse(GREETER_PROTO);
   try
     Check('syntax = proto3',  F.Syntax = 'proto3', F.Syntax);
@@ -269,7 +269,7 @@ var
   F: TProtoFileNode;
   M: TProtoMessageNode;
 begin
-  Section('02  echo.proto — comments, two services shapes');
+  Section('02  echo.proto - comments, two services shapes');
   F := Parse(ECHO_PROTO);
   try
     Check('package = echo', F.PackageName = 'echo', F.PackageName);
@@ -352,7 +352,7 @@ end;
 // ── 04 · nested declarations are hoisted, not refused ───────────────────────
 // The 52% gap from the C1c googleapis run. Pascal has no nested class scope,
 // so hierarchy is preserved as a NAME and the types are flattened to file
-// scope. What they are finally CALLED in Pascal is the emitter's decision —
+// scope. What they are finally CALLED in Pascal is the emitter's decision -
 // this only fixes the identity.
 
 procedure TestNesting;
@@ -399,7 +399,7 @@ begin
     { Two levels deep — the qualifier has to accumulate, not just record the
       immediate parent. }
     M := F.FindMessage('Outer.Inner.Deep');
-    Check('Outer.Inner.Deep found — qualifier accumulates', M <> nil);
+    Check('Outer.Inner.Deep found - qualifier accumulates', M <> nil);
     Check('  its field survived the hoist',
       (M <> nil) and (M.Fields.Count = 1) and (M.Fields[0].Name = 'd'));
 
@@ -556,7 +556,7 @@ end;
 
 begin
   try
-    WriteLn('ProtogenParserTests — C1 gate (plans/horse-grpc-codegen.md)');
+    WriteLn('ProtogenParserTests - C1 gate (plans/horse-grpc-codegen.md)');
 
     TestGreeter;
     TestEcho;

@@ -43,7 +43,7 @@ var
 procedure Section(const S: string);
 begin
   WriteLn;
-  WriteLn('── ', S);
+  WriteLn('-- ', S);
 end;
 
 procedure Check(const AName: string; APassed: Boolean;
@@ -272,18 +272,18 @@ begin
 
     // Validation errors — no ALog, testing just the exit code
     LCode := TProtogenRunner.Run('', LDir, 'T.Greet', False, LResult);
-    Check('missing input → 1',    LCode = 1);
+    Check('missing input -> 1',    LCode = 1);
     LCode := TProtogenRunner.Run(LProtoFile, '', 'T.Greet', False, LResult);
-    Check('missing output → 1',   LCode = 1);
+    Check('missing output -> 1',   LCode = 1);
     LCode := TProtogenRunner.Run(LProtoFile, LDir, '', False, LResult);
-    Check('missing prefix → 1',   LCode = 1);
+    Check('missing prefix -> 1',   LCode = 1);
     LCode := TProtogenRunner.Run('nonexistent.proto', LDir, 'T.Greet', False, LResult);
-    Check('not found → 1',        LCode = 1);
+    Check('not found -> 1',        LCode = 1);
 
     // Bad proto
     WriteFile(LProtoFile, BAD_PROTO);
     LCode := TProtogenRunner.Run(LProtoFile, LDir, 'T.Greet', False, LResult);
-    Check('bad proto → 1',        LCode = 1);
+    Check('bad proto -> 1',        LCode = 1);
   finally
     LLog.Free;
   end;
