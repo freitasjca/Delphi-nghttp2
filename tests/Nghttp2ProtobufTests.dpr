@@ -52,7 +52,7 @@ var
 procedure Section(const S: string);
 begin
   WriteLn;
-  WriteLn('── ', S);
+  WriteLn('-- ', S);
 end;
 
 procedure Check(const AName: string; APassed: Boolean; const ADetail: string = '');
@@ -343,7 +343,7 @@ var
   LSrc, LDst: TUserMessage;
   LBytes: TBytes;
 begin
-  Section('04  RTTI serializer — populated message round-trip');
+  Section('04  RTTI serializer - populated message round-trip');
   LSrc := TUserMessage.Create;
   LDst := TUserMessage.Create;
   try
@@ -374,14 +374,14 @@ var
   LSrc, LDst: TUserMessage;
   LBytes: TBytes;
 begin
-  Section('05  RTTI serializer — all-default (proto3 zero-value) round-trip');
+  Section('05  RTTI serializer - all-default (proto3 zero-value) round-trip');
   LSrc := TUserMessage.Create;
   LDst := TUserMessage.Create;
   try
     // Leave all fields at Pascal default (0 / '' / False).
     LBytes := TProtoSerializer.Serialize(LSrc);
     // Proto3 default values MAY be omitted; we currently emit them, so the
-    // buffer isn't empty — but the sizes are small and it round-trips fine.
+    // buffer isn't empty - but the sizes are small and it round-trips fine.
     Check('serialize succeeds on default-valued instance', True,
       IntToStr(Length(LBytes)) + ' bytes: ' + BytesToHex(LBytes));
 
@@ -410,7 +410,7 @@ var
   LDst: TUserMessage;
   LBytes: TBytes;
 begin
-  Section('06  RTTI serializer — unknown-field skip (proto3 forward-compat)');
+  Section('06  RTTI serializer - unknown-field skip (proto3 forward-compat)');
   // Hand-build a message containing:
   //   tag 1 (id, varint):      99
   //   tag 99 (unknown, varint): 42  ← must be silently skipped
@@ -444,7 +444,7 @@ var
   LBytes:     TBytes;
   I:          Integer;
 begin
-  Section('08  M1c — Float/Double/Enum/TBytes/Submessage round-trip');
+  Section('08  M1c - Float/Double/Enum/TBytes/Submessage round-trip');
   LSrc := TAdvancedMessage.Create;
   LDst := TAdvancedMessage.Create;
   try
@@ -510,7 +510,7 @@ var
   LSrc: TUserMessage;
   LBytes, LExpected: TBytes;
 begin
-  Section('07  RTTI serializer — known bytes for known input');
+  Section('07  RTTI serializer - known bytes for known input');
   LSrc := TUserMessage.Create;
   try
     LSrc.id := 1;
@@ -600,7 +600,7 @@ var
   I:          Integer;
   LOk:        Boolean;
 begin
-  Section('09  Repeated fields — round-trip (packed + unpacked)');
+  Section('09  Repeated fields - round-trip (packed + unpacked)');
 
   LSrc := TRepeatedMessage.Create;
   LDst := TRepeatedMessage.Create;
@@ -684,7 +684,7 @@ var
   LW:         TProtoWriter;
   LPacked:    TBytes;
 begin
-  Section('10  Repeated fields — empty arrays + wire shape');
+  Section('10  Repeated fields - empty arrays + wire shape');
 
   { An empty repeated field emits NOTHING — proto3 cannot distinguish "empty"
     from "absent", so any byte here is waste. Measured on TPackedOnlyMessage
@@ -884,7 +884,7 @@ begin
     Check('uint32 = 3000000000 did not sign-extend',
       Length(LBytes) = Length(LWant),
       'got ' + IntToStr(Length(LBytes)) + ' bytes, want ' +
-      IntToStr(Length(LWant)) + ' — a longer result means sign extension');
+      IntToStr(Length(LWant)) + ' - a longer result means sign extension');
 
     TProtoSerializer.Deserialize(LBytes, LDst);
     Check('uint32 round-trips above MaxInt',
@@ -902,7 +902,7 @@ end;
 
 begin
   try
-    WriteLn('Nghttp2ProtobufTests — M1 wire codec + M1b RTTI serializer');
+    WriteLn('Nghttp2ProtobufTests - M1 wire codec + M1b RTTI serializer');
     WriteLn;
 
     TestZigZag;

@@ -66,7 +66,7 @@ var
 procedure Section(const S: string);
 begin
   WriteLn;
-  WriteLn('── ', S);
+  WriteLn('-- ', S);
 end;
 
 procedure Conforms(const AName, ADetail: string);
@@ -274,7 +274,7 @@ begin
       TProtoSerializer.Deserialize(LBytes, LRt);
       if LRt.v = Cardinal(3000000000) then
         Conforms('uint32 = 3000000000 survives our own round-trip',
-          'symmetric — but see the byte check above for interop')
+          'symmetric - but see the byte check above for interop')
       else
         Deviates('uint32 = 3000000000 survives our own round-trip',
           '3000000000', IntToStr(Int64(LRt.v)));
@@ -375,7 +375,7 @@ var
   LMsg: TI32Msg;
   LPayload, LZigZag: TBytes;
 begin
-  Section('04  sint32 / sint64 — zigzag not selectable through RTTI');
+  Section('04  sint32 / sint64 - zigzag not selectable through RTTI');
 
   LMsg := TI32Msg.Create;
   try
@@ -387,7 +387,7 @@ begin
 
       if BytesEqual(LPayload, LZigZag) then
         Conforms('sint32 = -1 encodes as zigzag',
-          'unexpected — the RTTI layer gained a zigzag path')
+          'unexpected - the RTTI layer gained a zigzag path')
       else
         Deviates('sint32 = -1 encodes as zigzag',
           'zigzag, ' + IntToStr(Length(LZigZag)) + ' byte(s): ' + BytesToHex(LZigZag),
@@ -409,7 +409,7 @@ var
   LMsg: TI32Msg;
   LBytes: TBytes;
 begin
-  Section('05  fixed32 / fixed64 — fixed-width not selectable through RTTI');
+  Section('05  fixed32 / fixed64 - fixed-width not selectable through RTTI');
 
   LMsg := TI32Msg.Create;
   try
@@ -420,9 +420,9 @@ begin
       // pwVarint = 0 gives $08; a fixed32 field would be $0D.
       if Length(LBytes) = 0 then
         Broken('fixed32 selectable',
-          'non-default int32 = 1 serialised to zero bytes — probe cannot read a tag')
+          'non-default int32 = 1 serialised to zero bytes - probe cannot read a tag')
       else if (LBytes[0] and $07) = 5 then
-        Conforms('fixed32 selectable', 'unexpected — RTTI layer gained a fixed path')
+        Conforms('fixed32 selectable', 'unexpected - RTTI layer gained a fixed path')
       else
         Deviates('fixed32 selectable',
           'wire type 5, tag byte $0D, 4 payload bytes',
@@ -503,7 +503,7 @@ var
   LMsg, LRt: TI64Msg;
   LBytes, LPayload, LWant: TBytes;
 begin
-  Section('07  int64 = High(Int64)  [control — expected to conform]');
+  Section('07  int64 = High(Int64)  [control - expected to conform]');
 
   LMsg := TI64Msg.Create;
   LRt  := TI64Msg.Create;
@@ -538,15 +538,15 @@ end;
 procedure PrintVerdict;
 begin
   WriteLn;
-  WriteLn('════════════════════════════════════════════════════════════════');
+  WriteLn('================================================================');
   WriteLn(Format('  CONFORMS %d   DEVIATES %d   REFUSES %d   BROKEN %d',
     [GConforms, GDeviates, GRefuses, GBroken]));
-  WriteLn('════════════════════════════════════════════════════════════════');
+  WriteLn('================================================================');
   WriteLn;
   WriteLn('  Reading this, for plans/horse-grpc-codegen.md decision 6.1:');
   WriteLn;
   WriteLn('    DEVIATES is the dangerous column. Those types encode, and the');
-  WriteLn('    bytes are wrong — a peer decodes a different value with no');
+  WriteLn('    bytes are wrong - a peer decodes a different value with no');
   WriteLn('    error anywhere. The generator MUST refuse every proto3 type');
   WriteLn('    listed there until the serializer grows a path for it.');
   WriteLn;
@@ -555,7 +555,7 @@ begin
   WriteLn('    still refuse at build time, which is earlier and cheaper.');
   WriteLn;
   WriteLn('    BROKEN means a probe that should have held did not. Unlike the');
-  WriteLn('    other two this is not a known gap — investigate before writing');
+  WriteLn('    other two this is not a known gap - investigate before writing');
   WriteLn('    any generator code.');
   WriteLn;
 
@@ -567,7 +567,7 @@ end;
 
 begin
   try
-    WriteLn('Nghttp2ProtobufConformance — proto3 scalar conformance probe');
+    WriteLn('Nghttp2ProtobufConformance - proto3 scalar conformance probe');
     WriteLn('C0a of plans/horse-grpc-codegen.md. Report only; deviations are');
     WriteLn('findings, not failures, so ExitCode stays 0 unless a probe BREAKS.');
 
