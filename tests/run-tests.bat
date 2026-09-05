@@ -191,6 +191,58 @@ echo    SKIP  ..\tools\protogen\Protogen.dpr not present
 
 :after_protogen_bin
 
+REM -- C6a: compile protogen's OUTPUT.
+REM    Every other protogen stage compares generated text against expected
+REM    text. None of them puts generated Pascal in front of a compiler, so a
+REM    language-level defect — a type that does not exist, a method pointer
+REM    that is not assignment-compatible, a missing unit in a uses clause — is
+REM    invisible to all of them. This stage generates into a scratch directory
+REM    and builds the result against the real Nghttp2 units.
+REM
+REM    The scratch directory is DELETED first: the no-overwrite contract
+REM    preserves an existing .Service.pas and writes .Service.new.pas instead,
+REM    so a dirty directory would compile the previous run's skeleton and
+REM    report a pass that says nothing about this build.
+if not exist "..\tools\protogen\ProtogenGeneratedCompileCheck.dpr" goto :no_gencheck
+if not exist "..\tools\protogen\Protogen.exe" goto :no_gencheck_bin
+if not exist "..\..\horse-provider-nghttp2\samples\grpc\greeter.proto" goto :no_gencheck_proto
+
+echo.
+set "GENOUT=%TEMP%\protogen-gencheck"
+if exist "%GENOUT%" rmdir /s /q "%GENOUT%"
+pushd "..\tools\protogen"
+Protogen.exe -i "..\..\..\horse-provider-nghttp2\samples\grpc\greeter.proto" -o "%GENOUT%" --unit-prefix Sample.Greeter > nul
+if errorlevel 1 (
+  echo -- ProtogenGeneratedCompileCheck ^(C6a^) ------------------------------------------------
+  echo    FAIL  Protogen.exe could not generate into %GENOUT%
+  set /a FAILED+=1
+  popd
+  goto :after_gencheck
+)
+set "STAGE=ProtogenGeneratedCompileCheck"
+set "GATES=1"
+set "STAGEUNITS=%GENOUT%;..\..\src"
+call :build_run
+popd
+set "STAGEUNITS=..\src"
+goto :after_gencheck
+
+:no_gencheck
+echo -- ProtogenGeneratedCompileCheck (C6a) ------------------------------------------------
+echo    SKIP  ..\tools\protogen\ProtogenGeneratedCompileCheck.dpr not present
+goto :after_gencheck
+
+:no_gencheck_bin
+echo -- ProtogenGeneratedCompileCheck (C6a) ------------------------------------------------
+echo    SKIP  Protogen.exe not built - run the Protogen compile-only stage first
+goto :after_gencheck
+
+:no_gencheck_proto
+echo -- ProtogenGeneratedCompileCheck (C6a) ------------------------------------------------
+echo    SKIP  greeter.proto not found - needs the horse-provider-nghttp2 sibling checkout
+
+:after_gencheck
+
 echo.
 echo ===========================================================================
 if "!FAILED!"=="0" goto :all_ok
