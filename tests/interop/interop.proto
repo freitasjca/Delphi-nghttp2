@@ -1,0 +1,34 @@
+// interop.proto — §7.5 cross-language interop schema.
+//
+// Deliberately restricted to the Group A scalars the codec supports, because
+// the point of this test is to check that the bytes we produce for values we
+// CLAIM to support are the bytes a reference implementation expects. Group B
+// (sint*/fixed*) and Group C (map/oneof/optional) are refused by the generator
+// and by the parser, so there is nothing to interoperate about.
+//
+// Enum values are 0,1,2 — contiguous from zero. The parser requires the first
+// value to be 0, and a Pascal enum's ordinals are sequential, so a sparse proto
+// enum has no representation.
+
+syntax = "proto3";
+
+package interop;
+
+enum Colour {
+  COLOUR_UNSET = 0;
+  COLOUR_RED   = 1;
+  COLOUR_BLUE  = 2;
+}
+
+message Scalars {
+  int32  i32    = 1;
+  int64  i64    = 2;
+  uint32 u32    = 3;
+  uint64 u64    = 4;
+  bool   b      = 5;
+  string s      = 6;
+  float  f32    = 7;
+  double f64    = 8;
+  bytes  blob   = 9;
+  Colour colour = 10;
+}

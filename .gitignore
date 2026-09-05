@@ -69,3 +69,10 @@ tools/protogen/.venv/
 tools/protogen/.oracle-out/
 tools/protogen/ProtogenParserTests
 tools/protogen/ProtogenCheck
+
+# interop test scratch (tests/interop): the generated Python module, the case
+# and round-trip .bin files, and the compiled codec binary. All reproducible by
+# interop_check.py. The binary has no extension, so *.exe does not cover it.
+.interop-out/
+__pycache__/
+tests/interop/Nghttp2InteropCodec

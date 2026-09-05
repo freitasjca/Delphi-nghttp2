@@ -23,6 +23,10 @@
 #   12  protogen GENERATED output (C6a) build + run   (gates; skips without
 #                                                      the horse-provider-nghttp2
 #                                                      sibling checkout)
+#   13  cross-language interop (§7.5)   build + run   (gates; skips without
+#                                                      grpc_tools. The only
+#                                                      stage whose verdict comes
+#                                                      from outside this repo)
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -658,5 +662,62 @@ else
     [[ $RC -eq 0 ]] && RC=2
   fi
 fi
+
+# ── 13 · §7.5 cross-language interop (boundary values) ──────────────────────
+# The only check in this file whose verdict does not come from us.
+#
+# FIX-PROTO-UINT32-1 was real data corruption that survived for years because
+# it was SYMMETRIC: our client and our server share a codec, so every
+# round-trip agreed with itself. No internal test could have found it. This
+# stage hands the judgement to google.protobuf instead.
+#
+# It must use BOUNDARY values — a naive interop test with small integers passes
+# against the broken code too, because 42 encodes identically whether or not
+# the encoder sign-extends.
+echo
+echo "── cross-language interop, boundary values (§7.5) ───────────────────"
+INTEROP="$HERE/interop"
+if [[ ! -f "$INTEROP/interop_check.py" ]]; then
+  echo "  SKIP  tests/interop/interop_check.py not present"
+else
+  # Same detection the oracle stage uses: prefer the venv, else a system
+  # python that already has grpc_tools.
+  IPY=""
+  if [[ -x "$PROTOGEN/.venv/bin/python" ]] \
+     && "$PROTOGEN/.venv/bin/python" -c 'import grpc_tools.protoc' > /dev/null 2>&1; then
+    IPY="$PROTOGEN/.venv/bin/python"
+  elif python3 -c 'import grpc_tools.protoc' > /dev/null 2>&1; then
+    IPY="python3"
+  fi
+
+  if [[ -z "$IPY" ]]; then
+    echo "  SKIP  grpc_tools not available — install with:"
+    echo "          python3 -m venv $PROTOGEN/.venv"
+    echo "          $PROTOGEN/.venv/bin/python -m pip install grpcio-tools"
+  else
+    IOUT="$OUT/interop"
+    rm -rf "$IOUT"
+    mkdir -p "$IOUT"
+    if ! "$TRUNK" -MDelphi -O1 \
+           -FU"$IOUT" -FE"$IOUT" \
+           -Fu"$SRC" \
+           $TRUNK_UNIT_PATHS \
+           "$INTEROP/Nghttp2InteropCodec.dpr" > "$IOUT/build.log" 2>&1 \
+       || [[ ! -x "$IOUT/Nghttp2InteropCodec" ]]; then
+      echo "  FAIL  Nghttp2InteropCodec.dpr did not compile"
+      grep -E "Error|Fatal" "$IOUT/build.log" | head -12 | sed 's/^/    /'
+      echo "    full log: $IOUT/build.log"
+      [[ $RC -eq 0 ]] && RC=2
+    elif "$IPY" "$INTEROP/interop_check.py" \
+           --pascal "$IOUT/Nghttp2InteropCodec" \
+           --work "$IOUT/run" 2>&1 | sed 's/^/  /'; then
+      echo "  PASS  every boundary value round-tripped through google.protobuf"
+    else
+      echo "  FAIL  an independent implementation disagrees about our bytes"
+      [[ $RC -eq 0 ]] && RC=2
+    fi
+  fi
+fi
+
 
 exit $RC
