@@ -4,11 +4,15 @@
 generator: a proto3 parser, a single-file verdict CLI, and a differential test
 against `protoc`.
 
-> **It does not generate code yet.** Today it parses a `.proto`, validates it,
-> and tells you — precisely — whether this library can express it. The emitter
-> is the next milestone. What ships now is useful on its own: run it against a
-> schema before you hand-write the message classes, and it will tell you
-> whether that work is going to pay off.
+> **It generates code.** `Protogen -i x.proto -o src/ --unit-prefix My.Svc`
+> writes four units: messages, service interfaces, an implementation skeleton
+> and a registration unit. **How to use it is
+> [`codegen-guide.md`](codegen-guide.md)** — start there.
+>
+> This file is the *contract*: which proto3 constructs are supported, which are
+> refused and why, and the rules generated code obeys. Both audiences need it —
+> run `ProtogenCheck` against a schema before adopting it and you will know in
+> one line whether this library can express it.
 
 > **Looking for `horse-pb-compiler`?** That is a different tool for a different
 > runtime — it emits against Horse's own gRPC stack (`Horse.Grpc.Attributes`,
@@ -165,9 +169,12 @@ first enum value that is not 0.
 
 ## Writing message and service units by hand
 
-Until the emitter lands this is the manual path — and it is worth reading even
-afterwards, because these are the rules the generator will enforce. Five of the
-six fail **only on FPC**, and they fail in ways that name the wrong cause.
+You no longer have to — `Protogen` emits all of this, see
+[`codegen-guide.md`](codegen-guide.md). This section is still worth reading,
+for two reasons: these are the rules the generator enforces, so it explains
+*why* generated code looks the way it does; and if you are adapting an existing
+hand-written unit, these are the traps. Five of the six fail **only on FPC**,
+and they fail in ways that name the wrong cause.
 
 ```pascal
 unit MyApp.Messages;
