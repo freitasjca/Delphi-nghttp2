@@ -9,18 +9,25 @@ program ProtogenEmitTests;
 //  PascalFieldType in isolation. These are the decision functions; getting
 //  them wrong silently poisons every generated file.
 //
-//  EMIT GATE: parse echo.proto and greeter.proto inline, emit with
-//  TMessagesEmitter, normalize (strip comments + collapse whitespace), and
-//  compare against the expected normalized form derived from the hand-written
-//  .Messages.pas samples. A mismatch here means generated code would differ
-//  from what has been hand-verified against the live gRPC suite.
+//  EMIT GATE: parse the REAL echo.proto and greeter.proto, emit with
+//  TMessagesEmitter, and compare against the REAL hand-written
+//  Sample.Echo.Messages.pas and Sample.Greeter.Messages.pas, all read from
+//  disk. A mismatch means generated code would differ from what has been
+//  hand-verified against the live gRPC suite.
 //
-//  Normalization rules:
+//  Normalization rules — kept IDENTICAL to ProtogenInterfaceTests (C3). If you
+//  change one, change both; two gates comparing generated Pascal against
+//  hand-written Pascal by different rules is how they start disagreeing about
+//  what a difference even is:
 //    - Strip '//' line comments (everything to end of line)
 //    - Strip '{ }' block comments where the char after '{' is NOT '$'
 //      (compiler directives like {$M+} are KEPT)
 //    - Strip '(* *)' star comments
+//    - Track string literals, so braces inside 'quoted text' are not mistaken
+//      for a block comment and silently swallowed
 //    - Collapse all whitespace runs to a single space
+//    - Remove whitespace adjacent to Pascal punctuation, so a hand-written
+//      file's column alignment does not read as a structural difference
 //    - Trim leading/trailing whitespace
 //
 //  Build (FPC trunk):
@@ -114,17 +121,46 @@ end;
 function StripComments(const S: string): string;
 var
   I: Integer;
-  InLC, InBlock, InStar: Boolean;  // LC = line comment; Delphi rejects 'InLine' (reserved)
+  InLC, InBlock, InStar, InStr: Boolean;
+  // LC = line comment; 'InLine' is a Delphi reserved word so we use InLC.
+  // InStr tracks Pascal string literals so { } inside 'strings' are not
+  // treated as block comments — without this, a GUID literal like
+  // '{B8E23A31-...}' would be stripped entirely.
   Ch, Next: Char;
 begin
   Result := '';
   I := 1;
-  InLC := False; InBlock := False; InStar := False;
+  InLC := False; InBlock := False; InStar := False; InStr := False;
   while I <= Length(S) do
   begin
     Ch := S[I];
     if I < Length(S) then Next := S[I + 1] else Next := #0;
-    if InLC then
+
+    if InStr then
+    begin
+      // Inside a string literal: pass everything through, but handle
+      // '' (escaped quote) and the closing quote.
+      if Ch = '''' then
+      begin
+        if Next = '''' then
+        begin
+          Result := Result + Ch + Next; // emit both chars of ''
+          Inc(I, 2);
+        end
+        else
+        begin
+          Result := Result + Ch; // closing quote
+          InStr := False;
+          Inc(I);
+        end;
+      end
+      else
+      begin
+        Result := Result + Ch;
+        Inc(I);
+      end;
+    end
+    else if InLC then
     begin
       if Ch = #10 then InLC := False;
       Inc(I);
@@ -144,6 +180,13 @@ begin
       else
         Inc(I);
     end
+    else if Ch = '''' then
+    begin
+      // Start of a string literal
+      InStr := True;
+      Result := Result + Ch;
+      Inc(I);
+    end
     else if (Ch = '/') and (Next = '/') then
     begin
       InLC := True;
@@ -158,13 +201,13 @@ begin
     begin
       if Next = '$' then
       begin
-        // Compiler directive — keep it; emit '{' and continue scanning
+        // Compiler directive — keep verbatim
         Result := Result + Ch;
         Inc(I);
       end
       else
       begin
-        // Block comment — skip to closing '}'
+        // Block comment — consume to matching '}'
         InBlock := True;
         Inc(I);
       end;
@@ -184,7 +227,7 @@ var
   Ch: Char;
 begin
   Result := '';
-  WS := True; // True at start trims leading whitespace
+  WS := True; // leading whitespace trimmed
   for I := 1 to Length(S) do
   begin
     Ch := S[I];
@@ -206,9 +249,56 @@ begin
     SetLength(Result, Length(Result) - 1);
 end;
 
+function IsPascalPunct(C: Char): Boolean;
+begin
+  case C of
+    '(', ')', '[', ']', ':', ';', ',', '.': Result := True;
+  else
+    Result := False;
+  end;
+end;
+
+// Removes whitespace immediately adjacent to Pascal punctuation.
+//
+// CollapseWS reduces whitespace RUNS to a single space but never removes a
+// lone one, so a hand-written file's column alignment survives it. The real
+// Sample.Greeter.Interfaces.pas aligns its method names:
+//
+//     function Greet(const ARequest: TGreetRequest): TGreetResponse;
+//     function Echo (const ARequest: TEchoRequest):  TEchoResponse;
+//
+// That single space before '(' is formatting, not structure, and a generator
+// should not reproduce hand alignment. The gate's contract is "identical
+// modulo comments and whitespace" — this step is what makes the whitespace
+// half of that actually true.
+//
+// It is deliberately blind to string literals, matching CollapseWS's existing
+// behaviour. Nothing in a generated unit has a literal whose meaning depends
+// on a space beside punctuation, and keeping the two steps consistent is
+// worth more here than a precision neither of them currently has.
+function TightenPunctuation(const S: string): string;
+var
+  I: Integer;
+  Ch: Char;
+begin
+  Result := '';
+  for I := 1 to Length(S) do
+  begin
+    Ch := S[I];
+    if Ch = ' ' then
+    begin
+      if (Length(Result) > 0) and IsPascalPunct(Result[Length(Result)]) then
+        Continue;
+      if (I < Length(S)) and IsPascalPunct(S[I + 1]) then
+        Continue;
+    end;
+    Result := Result + Ch;
+  end;
+end;
+
 function Normalize(const S: string): string;
 begin
-  Result := CollapseWS(StripComments(S));
+  Result := TightenPunctuation(CollapseWS(StripComments(S)));
 end;
 
 // ── Sample locations ─────────────────────────────────────────────────────────

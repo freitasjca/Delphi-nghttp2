@@ -120,6 +120,7 @@ begin
   DeleteFile(D + APrefix + '.Interfaces.pas');
   DeleteFile(D + APrefix + '.Service.pas');
   DeleteFile(D + APrefix + '.Service.new.pas');
+  DeleteFile(D + APrefix + '.Registration.pas');   // C5
 end;
 
 // ── Proto source constants ───────────────────────────────────────────────────
@@ -163,12 +164,17 @@ begin
     Check('messages file exists',   FileExists(LResult.MessagesPath));
     Check('interfaces file exists', FileExists(LResult.InterfacesPath));
     Check('service file exists',    FileExists(LResult.ServicePath));
+    // C5 — the fourth generated unit, always regenerated.
+    Check('registration path set',   LResult.RegistrationPath <> '');
+    Check('registration file exists', FileExists(LResult.RegistrationPath));
     Check('messages has unit header',
       Pos('unit T.Greet.Messages', ReadFile(LResult.MessagesPath)) > 0);
     Check('interfaces has IGreeter',
       Pos('IGreeter', ReadFile(LResult.InterfacesPath)) > 0);
     Check('service has TGreeterServiceImpl',
       Pos('TGreeterServiceImpl', ReadFile(LResult.ServicePath)) > 0);
+    Check('registration has RegisterGreeter',
+      Pos('RegisterGreeter', ReadFile(LResult.RegistrationPath)) > 0);
   finally
     LFile.Free;
   end;
@@ -236,6 +242,7 @@ begin
     Check('dry-run: no messages',   not FileExists(LResult.MessagesPath));
     Check('dry-run: no interfaces', not FileExists(LResult.InterfacesPath));
     Check('dry-run: no service',    not FileExists(LResult.ServicePath));
+    Check('dry-run: no registration', not FileExists(LResult.RegistrationPath));
   finally
     LFile.Free;
   end;

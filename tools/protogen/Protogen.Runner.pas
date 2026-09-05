@@ -3,7 +3,7 @@ unit Protogen.Runner;
 // =============================================================================
 //  Protogen.Runner — C4 of plans/horse-grpc-codegen.md.
 //
-//  TProtogenRunner orchestrates the three emitters into a directory.
+//  TProtogenRunner orchestrates the four emitters into a directory.
 //
 //  WriteUnits(AFile, AOutputDir, AUnitPrefix, ADryRun, out AResult,
 //             ALog = nil, AProtoFileName = '')
@@ -17,9 +17,15 @@ unit Protogen.Runner;
 //    Returns 0 on success, 1 on validation or parse error, 2 on I/O error.
 //
 //  No-overwrite contract (§6.4):
-//    .Messages.pas and .Interfaces.pas are always regenerated.
+//    .Messages.pas, .Interfaces.pas and .Registration.pas are always
+//    regenerated — none of them contains user code.
 //    .Service.pas is written ONLY when absent — it holds user code.
 //    If .Service.pas already exists, the new skeleton goes to .Service.new.pas.
+//
+//  .Registration.pas (C5) is deliberately on the always-regenerated side. It is
+//  the file that must track the .proto: preserving it would leave a newly added
+//  rpc unregistered, which surfaces at runtime as an unimplemented path with
+//  nothing in the build to explain it.
 //
 //  Dual-compilation: dcc64 (Delphi 10.4+) and fpc trunk 3.3.1 {$MODE DELPHI}.
 // =============================================================================
@@ -40,10 +46,11 @@ uses
 
 type
   TProtogenResult = record
-    MessagesPath:   string;  // path written (or would be in dry-run)
-    InterfacesPath: string;
-    ServicePath:    string;  // .Service.pas or .Service.new.pas
-    ServiceIsNew:   Boolean; // True → .new.pas, existing .Service.pas preserved
+    MessagesPath:     string;  // path written (or would be in dry-run)
+    InterfacesPath:   string;
+    ServicePath:      string;  // .Service.pas or .Service.new.pas
+    ServiceIsNew:     Boolean; // True → .new.pas, existing .Service.pas preserved
+    RegistrationPath: string;  // .Registration.pas — always regenerated (C5)
   end;
 
   TProtogenRunner = class
@@ -109,6 +116,7 @@ var
   LEmitMsg:    TMessagesEmitter;
   LEmitIface:  TInterfacesEmitter;
   LEmitSkel:   TServiceSkeletonEmitter;
+  LEmitReg:    TRegistrationEmitter;
   LServicePas: string;
   LServiceNew: string;
 begin
@@ -116,6 +124,7 @@ begin
   AResult := Default(TProtogenResult);
   AResult.MessagesPath   := MakePath(AOutputDir, AUnitPrefix, 'Messages');
   AResult.InterfacesPath := MakePath(AOutputDir, AUnitPrefix, 'Interfaces');
+  AResult.RegistrationPath := MakePath(AOutputDir, AUnitPrefix, 'Registration');
   LServicePas := MakePath(AOutputDir, AUnitPrefix, 'Service');
   LServiceNew := IncludeTrailingPathDelimiter(AOutputDir)
     + AUnitPrefix + '.Service.new.pas';
@@ -170,6 +179,21 @@ begin
       end;
     finally
       LEmitSkel.Free;
+    end;
+
+    // Registration — ALWAYS regenerated (C5).
+    //
+    // Deliberately not subject to the no-overwrite contract above: it contains
+    // no user code, and it is exactly the file that must track the .proto. If
+    // it were preserved like Service.pas, adding an rpc would leave it silently
+    // unregistered — a 404 at runtime with nothing in the build to explain it.
+    LLines.Clear;
+    LEmitReg := TRegistrationEmitter.Create;
+    try
+      LEmitReg.Emit(AFile, AUnitPrefix, LLines);
+      Flush(LLines, AResult.RegistrationPath, ADryRun, ALog);
+    finally
+      LEmitReg.Free;
     end;
   finally
     LLines.Free;
