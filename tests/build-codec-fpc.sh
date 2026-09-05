@@ -20,6 +20,9 @@
 #    9  protogen interface emitter (C3) build + run   (gates)
 #   10  protogen runner tests (C4)      build + run   (gates)
 #   11  protogen binary (Protogen.dpr)  compile only  (gates)
+#   12  protogen GENERATED output (C6a) build + run   (gates; skips without
+#                                                      the horse-provider-nghttp2
+#                                                      sibling checkout)
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -377,6 +380,20 @@ fi
 echo
 echo "── protogen parser tests (C1) ────────────────────────────────────────"
 PROTOGEN="$HERE/../tools/protogen"
+
+# The C2 and C3 emit gates compare generated output against the REAL
+# hand-written samples on disk. They locate those relative to the running
+# executable, which is correct on Windows where the tests are built in place —
+# but here every binary is built into $OUT, so ExeDir points at a scratch
+# directory and the lookup fails: echo FAILs (it is in-repo, so absence is a
+# defect) and greeter SKIPs, taking the suite to "GATE INCOMPLETE".
+#
+# Echo lives in this repo; greeter lives in the sibling horse-provider-nghttp2
+# checkout. If that sibling is absent the greeter comparisons skip loudly and
+# the stage reports incomplete, which is the intended behaviour rather than a
+# silent pass.
+export PROTOGEN_ECHO_DIR="$HERE/../samples/grpc-server"
+export PROTOGEN_GREETER_DIR="$HERE/../../horse-provider-nghttp2/samples/grpc"
 if [[ -f "$PROTOGEN/ProtogenParserTests.dpr" ]]; then
   PGOUT="$OUT/protogen"
   mkdir -p "$PGOUT"
@@ -573,6 +590,73 @@ if [[ -f "$PROTOGEN/Protogen.dpr" ]]; then
   fi
 else
   echo "  SKIP  Protogen.dpr not present"
+fi
+
+# ── 12 · C6a — compile protogen's OUTPUT with FPC ───────────────────────────
+# Every other protogen stage compares generated text against expected text.
+# This one generates into a scratch directory and puts the result in front of
+# the compiler, so a language-level defect in an emitter — a type that does not
+# exist, a method pointer that is not assignment-compatible, a missing unit in
+# a uses clause — actually fails something.
+#
+# The Windows suite has the equivalent stage. Running it on FPC too is the
+# point: protogen is dual-compilation and its gates run on both compilers, but
+# until this stage existed its OUTPUT had only ever been compiled by dcc64.
+#
+# Reuses the binary built by stage 11 rather than rebuilding it.
+echo
+echo "── protogen generated output — compile (C6a) ─────────────────────────"
+GENPROTO="$HERE/../../horse-provider-nghttp2/samples/grpc/greeter.proto"
+if [[ ! -f "$PROTOGEN/ProtogenGeneratedCompileCheck.dpr" ]]; then
+  echo "  SKIP  ProtogenGeneratedCompileCheck.dpr not present"
+elif [[ ! -x "$PBOUT/Protogen" ]]; then
+  echo "  SKIP  Protogen binary not built by the previous stage"
+elif [[ ! -f "$GENPROTO" ]]; then
+  echo "  SKIP  greeter.proto not found — needs the horse-provider-nghttp2 sibling"
+  echo "        looked in: $GENPROTO"
+else
+  GENOUT="$OUT/protogen-gencheck"
+  GCOUT="$OUT/protogen-gencheck-bin"
+  # Deleted, not just cleaned: the no-overwrite contract preserves an existing
+  # .Service.pas and writes .Service.new.pas instead, so a leftover directory
+  # would compile the PREVIOUS run's skeleton and pass while proving nothing.
+  rm -rf "$GENOUT" "$GCOUT"
+  mkdir -p "$GENOUT" "$GCOUT"
+
+  if ! "$PBOUT/Protogen" -i "$GENPROTO" -o "$GENOUT" \
+         --unit-prefix Sample.Greeter > "$GCOUT/generate.log" 2>&1; then
+    echo "  FAIL  Protogen could not generate into $GENOUT"
+    sed 's/^/    /' "$GCOUT/generate.log" | head -12
+    [[ $RC -eq 0 ]] && RC=2
+  # NOTE the deliberate difference from the samples/grpc-server stage above:
+  # that one sets -dNGHTTP2_GRPC_NO_FFI because it registers only through the
+  # PROCEDURAL RegisterMethod, which never reaches TRttiMethod.Invoke. Generated
+  # code does the opposite — the registration unit calls RegisterService<T>,
+  # the IInvokable/RTTI path — so it genuinely needs ffi.manager, and the define
+  # would be a lie here. That is why libffi goes on the search path instead.
+  #
+  # This is a real property of protogen's output on FPC, not a build detail:
+  # anything consuming a generated .Registration.pas needs libffi available.
+  elif "$TRUNK" -MDelphi -O1 \
+         -FU"$GCOUT" -FE"$GCOUT" \
+         -Fu"$GENOUT" -Fu"$SRC" -Fu"$TU/libffi" \
+         $TRUNK_UNIT_PATHS \
+         "$PROTOGEN/ProtogenGeneratedCompileCheck.dpr" > "$GCOUT/build.log" 2>&1 \
+       && [[ -x "$GCOUT/ProtogenGeneratedCompileCheck" ]]; then
+    "$GCOUT/ProtogenGeneratedCompileCheck" < /dev/null | sed 's/^/  /'
+    if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+      echo "  PASS  generated units compile and register under FPC"
+    else
+      echo "  FAIL  generated units compiled but registration was wrong"
+      [[ $RC -eq 0 ]] && RC=2
+    fi
+  else
+    echo "  FAIL  protogen's generated units did not compile under FPC"
+    grep -E "Error|Fatal" "$GCOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $GCOUT/build.log"
+    echo "    generated units kept for inspection: $GENOUT"
+    [[ $RC -eq 0 ]] && RC=2
+  fi
 fi
 
 exit $RC
