@@ -501,8 +501,17 @@ begin
 
   ExpectRefusal('map',
     HDR + 'message M { map<string, int32> m = 1; }', 'map');
-  ExpectRefusal('oneof',
-    HDR + 'message M { oneof pick { int32 a = 1; } }', 'oneof');
+  { `oneof` itself is now ACCEPTED (ONEOF-1, section 08). What stays refused
+    are the shapes proto3 does not allow inside one, plus the message-member
+    case the generator cannot represent. }
+  ExpectRefusal('repeated inside oneof',
+    HDR + 'message M { oneof pick { repeated int32 a = 1; } }', 'repeated');
+  ExpectRefusal('optional inside oneof',
+    HDR + 'message M { oneof pick { optional int32 a = 1; } }', 'optional');
+  ExpectRefusal('nested oneof',
+    HDR + 'message M { oneof p { oneof q { int32 a = 1; } } }', 'oneof');
+  ExpectRefusal('empty oneof',
+    HDR + 'message M { oneof pick { } }', 'empty');
   { `optional` USED to be refused here. PRESENCE-1 gave the serializer a
     has-bit, so it is now accepted — see section 07. What remains refused is
     `optional repeated`, which is not legal proto3 in the first place. }
@@ -623,6 +632,74 @@ begin
   end;
 end;
 
+// ── 08  proto3 `oneof` is ACCEPTED and members are grouped (ONEOF-1) ────────
+
+procedure TestOneofAccepted;
+const
+  HDR = 'syntax = "proto3";'#10'package t;'#10;
+var
+  LFile: TProtoFileNode;
+  LMsg: TProtoMessageNode;
+begin
+  Section('08  `oneof` accepted, members hoisted and grouped (ONEOF-1)');
+
+  LFile := Parse(HDR +
+    'message M {'#10 +
+    '  int32 plain = 1;'#10 +
+    '  oneof pick {'#10 +
+    '    int32  a = 2;'#10 +
+    '    string b = 3;'#10 +
+    '  }'#10 +
+    '  int32 after = 4;'#10 +
+    '}');
+  try
+    LMsg := LFile.FindMessage('M');
+    Check('message M parsed', LMsg <> nil);
+    if LMsg = nil then Exit;
+
+    { Members are HOISTED into the ordinary field list, because that is what
+      they are on the wire - a oneof has no framing of its own. }
+    Check('4 fields, members hoisted alongside ordinary ones',
+      LMsg.Fields.Count = 4, IntToStr(LMsg.Fields.Count));
+
+    Check('plain is not in a oneof',  not LMsg.Fields[0].InOneof);
+    Check('a is in oneof "pick"',     LMsg.Fields[1].OneofName = 'pick');
+    Check('b is in oneof "pick"',     LMsg.Fields[2].OneofName = 'pick');
+    Check('after is not in a oneof',  not LMsg.Fields[3].InOneof);
+
+    { Field numbers and types must survive the grouping untouched - a member
+      is an ordinary field that happens to carry a group name. }
+    Check('member keeps its field number', LMsg.Fields[1].Number = 2);
+    Check('member keeps its type',         LMsg.Fields[1].Scalar = psInt32);
+    Check('field after the oneof keeps its number',
+      LMsg.Fields[3].Number = 4);
+
+    { A oneof member carries no label: plNone, not plOptional. The presence
+      comes from being in a oneof, not from a keyword. }
+    Check('member label is plNone', LMsg.Fields[1].FieldLabel = plNone);
+  finally
+    LFile.Free;
+  end;
+
+  // two independent groups in one message
+  LFile := Parse(HDR +
+    'message M {'#10 +
+    '  oneof first  { int32 a = 1; }'#10 +
+    '  oneof second { int32 b = 2; }'#10 +
+    '}');
+  try
+    LMsg := LFile.FindMessage('M');
+    Check('two oneof groups parse', LMsg <> nil);
+    if LMsg <> nil then
+    begin
+      Check('first group name',  LMsg.Fields[0].OneofName = 'first');
+      Check('second group name', LMsg.Fields[1].OneofName = 'second');
+    end;
+  finally
+    LFile.Free;
+  end;
+end;
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 begin
@@ -636,6 +713,7 @@ begin
     TestWellKnown;
     TestRefusals;
     TestOptionalAccepted;
+    TestOneofAccepted;
 
     WriteLn;
     WriteLn(Format('[Protogen] %d passed, %d failed', [GPass, GFail]));

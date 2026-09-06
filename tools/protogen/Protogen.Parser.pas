@@ -93,8 +93,13 @@ type
       into, so hierarchy is preserved as a NAME rather than as structure. }
     procedure ParseMessage(const AParentQualified: string = '');
     procedure ParseMessageBody(AMsg: TProtoMessageNode);
+    { AOneofName is TRAILING and OPTIONAL on purpose: the three existing call
+      sites are positional and compile untouched. That is the shape the C4
+      arity defect taught — a parameter inserted mid-list silently shifts
+      every argument after it. }
     procedure ParseField(AMsg: TProtoMessageNode; AFieldLabel: TProtoLabel;
-      ALabelLine, ALabelCol: Integer);
+      ALabelLine, ALabelCol: Integer; const AOneofName: string = '');
+    procedure ParseOneof(AMsg: TProtoMessageNode);
     procedure ParseEnum(const AParentQualified: string = '');
     procedure ParseService;
     procedure ParseRpc(AService: TProtoServiceNode);
@@ -443,12 +448,11 @@ begin
     if IsIdent('option')   then begin SkipOptionStatement; Continue; end;
     if IsIdent('reserved') then begin SkipReserved;        Continue; end;
 
-    // ── Group C refusals ────────────────────────────────────────────────
-    if IsIdent('oneof') then
-      Refuse('oneof',
-        'A oneof is a tagged union with presence semantics; the RTTI ' +
-        'serializer has no way to express which member is set. Model it as ' +
-        'separate optional-by-convention fields instead.');
+    { ONEOF-1. Was refused until PRESENCE-1 supplied a has-bit. A oneof needs
+      no wire support — each member is an ordinary tagged field — so what was
+      actually missing was a way to say "this one is set and the others are
+      not", which is exactly what a has-bit says. }
+    if IsIdent('oneof') then begin ParseOneof(AMsg); Continue; end;
 
     if IsIdent('map') then
       Refuse('map',
@@ -517,8 +521,84 @@ begin
   end;
 end;
 
+// ONEOF-1. Parses a `oneof` block, hoisting each member into the message's
+// ordinary field list tagged with the group name.
+//
+// Hoisting rather than nesting is not a shortcut: on the wire a oneof HAS no
+// framing, and each member is an ordinary tagged field. Keeping them in the
+// normal list is therefore the accurate model, and it is what lets the emitter
+// reuse the has-bit machinery unchanged.
+//
+// LINE comments deliberately: this text wants to show a oneof's braces, and a
+// closing brace inside a { } comment ENDS it early - Pascal brace comments do
+// not nest. That is exactly how this function failed to compile the first
+// time, with the error landing far below on an unrelated line.
+procedure TProtoParser.ParseOneof(AMsg: TProtoMessageNode);
+var
+  LName: string;
+  LLine, LCol: Integer;
+  LCount: Integer;
+begin
+  LLine := Tok.Line;
+  LCol  := Tok.Column;
+  NextTok;                       // consume 'oneof'
+  LName  := ExpectIdent;
+  LCount := 0;
+  ExpectSymbol('{');
+
+  while not (IsSymbol('}') or (Tok.Kind = ptEof)) do
+  begin
+    if IsSymbol(';') then begin NextTok; Continue; end;
+    if IsIdent('option') then begin SkipOptionStatement; Continue; end;
+
+    { A oneof member carries no label. protoc rejects all of these, so
+      refusing keeps us aligned with it rather than accepting a schema it
+      would not compile - the one oracle cell that counts as a defect. }
+    if IsIdent('repeated') then
+      Refuse('repeated inside oneof',
+        Format('Field in oneof %s is `repeated`. A oneof member cannot be ' +
+               'repeated: a repeated field has no presence, and "which one ' +
+               'is set" is the entire content of a oneof. Move it out of ' +
+               'the oneof.', [QuotedStr(LName)]));
+
+    if IsIdent('optional') then
+      Refuse('optional inside oneof',
+        Format('Field in oneof %s is `optional`. A oneof member already has ' +
+               'explicit presence - that is what a oneof IS - so the label ' +
+               'is not permitted. Drop it.', [QuotedStr(LName)]));
+
+    if IsIdent('map') then
+      Refuse('map inside oneof',
+        Format('Field in oneof %s is a map. proto3 does not allow map fields '
+               + 'inside a oneof. Wrap it in a message and use that instead.',
+          [QuotedStr(LName)]));
+
+    if IsIdent('oneof') then
+      Refuse('nested oneof',
+        Format('oneof %s contains another oneof. proto3 does not allow that.',
+          [QuotedStr(LName)]));
+
+    ParseField(AMsg, plNone, Tok.Line, Tok.Column, LName);
+    Inc(LCount);
+  end;
+
+  ExpectSymbol('}');
+
+  { protoc rejects an empty oneof, so we do too. Refusing is also the safe
+    direction when unsure: accepting something protoc rejects is the ONLY
+    oracle cell that counts as a defect, since it means emitting Pascal from
+    a schema that will not compile anywhere else. }
+  if LCount = 0 then
+    RefuseAt(LLine, LCol, 'oneof ' + LName,
+      Format('oneof %s is empty. A oneof must declare at least one member.',
+        [QuotedStr(LName)]));
+end;
+
+{ No `= ''` here: for a method, a default parameter value belongs to the
+  DECLARATION only, and repeating it in the implementation is a syntax error. }
 procedure TProtoParser.ParseField(AMsg: TProtoMessageNode;
-  AFieldLabel: TProtoLabel; ALabelLine, ALabelCol: Integer);
+  AFieldLabel: TProtoLabel; ALabelLine, ALabelCol: Integer;
+  const AOneofName: string);
 var
   LField: TProtoFieldNode;
   LTypeName: string;
@@ -551,6 +631,7 @@ begin
     LField.FieldLabel := AFieldLabel;
     LField.Line       := ALabelLine;
     LField.Column     := ALabelCol;
+    LField.OneofName  := AOneofName;      // ONEOF-1; '' for ordinary fields
     LField.Name       := ExpectIdent;
 
     { Now that the name is known the refusal can quote it, and the position

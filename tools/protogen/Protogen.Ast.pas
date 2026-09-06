@@ -50,7 +50,20 @@ type
     FieldLabel: TProtoLabel;
     Line:       Integer;
     Column:     Integer;
+
+    { ONEOF-1. The name of the oneof group this field belongs to, or '' when
+      it is an ordinary field.
+
+      Members are hoisted to the message's normal field list rather than kept
+      in a nested structure, because that is exactly what they are on the
+      WIRE: a oneof has no framing of its own, and each member is an ordinary
+      tagged field. The "at most one is set" rule is a language-binding
+      constraint, not a wire one — which is why supporting oneof needs no
+      codec change at all, only generated setters that clear their siblings. }
+    OneofName:  string;
+
     function IsRepeated: Boolean;
+    function InOneof: Boolean;
   end;
 
   TProtoEnumValueNode = class
@@ -178,6 +191,11 @@ implementation
 function TProtoFieldNode.IsRepeated: Boolean;
 begin
   Result := FieldLabel = plRepeated;
+end;
+
+function TProtoFieldNode.InOneof: Boolean;
+begin
+  Result := OneofName <> '';
 end;
 
 // ── TProtoEnumNode ──────────────────────────────────────────────────────────

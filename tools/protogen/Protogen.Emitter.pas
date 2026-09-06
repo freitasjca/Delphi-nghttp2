@@ -56,11 +56,22 @@ type
     // PRESENCE-1 — proto3 `optional`
     function  NeedsHasBit(AField: TProtoFieldNode): Boolean;
     procedure EmitOptionalBodies;
+    // ONEOF-1 — proto3 `oneof`
+    function  OneofGroups(AMsg: TProtoMessageNode): TArray<string>;
+    procedure EmitOneofCaseEnums(AMsg: TProtoMessageNode);
+    procedure EmitOneofBodies(AMsg: TProtoMessageNode);
   public
     // The generated has-bit property name for a field's Pascal property name.
     // Public so the C2 gate can assert against it rather than re-deriving the
     // rule and agreeing with itself.
     class function HasBitName(const APropName: string): string;
+
+    // ONEOF-1 naming, public for the same reason.
+    //   CaseEnumName  'TM', 'pick'      -> 'TMPickCase'
+    //   CaseValueName 'TM', 'pick', 'a' -> 'MPickCaseA'   ('' member -> None)
+    class function CaseEnumName(const AClassName, AOneof: string): string;
+    class function CaseValueName(const AClassName, AOneof,
+      AMemberProp: string): string;
 
     // Emit a complete .Messages.pas into ALines. ALines is cleared first.
     // AUnitPrefix: dotted name prefix, e.g. 'Sample.Greeter' -- the unit
@@ -233,12 +244,29 @@ end;
 function TMessagesEmitter.NeedsHasBit(AField: TProtoFieldNode): Boolean;
 begin
   Result := False;
-  if AField.FieldLabel <> plOptional then Exit;
+
+  { ONEOF-1 rides on exactly the same machinery. A oneof member IS a field
+    with explicit presence; the only thing a oneof adds is that setting one
+    clears its siblings, which lives in the generated setter. That is why
+    supporting oneof needed no codec change. }
+  if (AField.FieldLabel <> plOptional) and (not AField.InOneof) then Exit;
 
   if AField.Scalar <> psNone then Exit(True);      // a built-in scalar
 
   if FFile.FindEnum(AField.TypeName) <> nil then
     Exit(True);                                    // enum: varint, needs a bit
+
+  { A MESSAGE, which the two cases must refuse for different reasons. }
+
+  if AField.InOneof then
+    raise EEmitError.CreateFmt(
+      'Field %s is a message inside oneof %s. Clearing a oneof member means ' +
+      'FREEING the one previously set, and protogen emits no destructor for ' +
+      'generated message classes - a submessage field has no ownership story ' +
+      'here yet, so clearing one would either leak it or silently not clear ' +
+      'it. Move the field out of the oneof, or give the oneof a wrapper ' +
+      'message of its own.',
+      [QuotedStr(AField.Name), QuotedStr(AField.OneofName)]);
 
   raise EEmitError.CreateFmt(
     'Field %s is `optional %s`, and %s is a message. A message field already ' +
@@ -246,6 +274,62 @@ begin
     'has-bit would be a second, contradictory source of truth and the ' +
     'serializer refuses that pairing. Drop `optional`.',
     [QuotedStr(AField.Name), AField.TypeName, AField.TypeName]);
+end;
+
+{ Upper-cases the first character only. proto names are conventionally
+  lower_snake, and the generated identifiers built from them read as Pascal. }
+function CapFirst(const S: string): string;
+begin
+  Result := S;
+  if Result <> '' then
+    Result[1] := UpCase(Result[1]);
+end;
+
+{ Distinct oneof group names, in first-appearance order. Field order rather
+  than sorted, so generated output is stable against the .proto's own layout. }
+function TMessagesEmitter.OneofGroups(AMsg: TProtoMessageNode): TArray<string>;
+var
+  I, J: Integer;
+  LSeen: Boolean;
+begin
+  SetLength(Result, 0);
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    if not AMsg.Fields[I].InOneof then Continue;
+    LSeen := False;
+    for J := 0 to High(Result) do
+      if SameText(Result[J], AMsg.Fields[I].OneofName) then
+      begin
+        LSeen := True;
+        Break;
+      end;
+    if not LSeen then
+    begin
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := AMsg.Fields[I].OneofName;
+    end;
+  end;
+end;
+
+class function TMessagesEmitter.CaseEnumName(const AClassName,
+  AOneof: string): string;
+begin
+  { AClassName already carries the leading T. }
+  Result := AClassName + CapFirst(AOneof) + 'Case';
+end;
+
+class function TMessagesEmitter.CaseValueName(const AClassName, AOneof,
+  AMemberProp: string): string;
+begin
+  { Pascal enum values are NOT scoped, so every value must be unique across
+    the whole unit. Deriving from the enum type name (minus its leading T)
+    makes collisions impossible between two oneofs, or two messages that
+    happen to use the same member names. }
+  Result := Copy(CaseEnumName(AClassName, AOneof), 2, MaxInt);
+  if AMemberProp = '' then
+    Result := Result + 'None'
+  else
+    Result := Result + CapFirst(AMemberProp);
 end;
 
 { The generated has-bit / setter / clear names for one optional field.
@@ -260,6 +344,46 @@ begin
   Result := 'Has' + APropName;
 end;
 
+{ ONEOF-1. One discriminator enum per oneof group, emitted immediately before
+  the class that uses it. `None` is first so it is the zero value, which makes
+  a freshly-constructed message report "nothing set" without any constructor. }
+procedure TMessagesEmitter.EmitOneofCaseEnums(AMsg: TProtoMessageNode);
+var
+  LGroups: TArray<string>;
+  G, I: Integer;
+  LClass, LRenamed: string;
+  LNames: TArray<string>;
+begin
+  LGroups := OneofGroups(AMsg);
+  if Length(LGroups) = 0 then Exit;
+  LClass := PascalTypeName(AMsg.QualifiedName);
+
+  for G := 0 to High(LGroups) do
+  begin
+    { Names collected first so the comma placement is decided once, against a
+      known count, rather than guessed inside the emit loop. }
+    SetLength(LNames, 1);
+    LNames[0] := CaseValueName(LClass, LGroups[G], '');
+    for I := 0 to AMsg.Fields.Count - 1 do
+      if SameText(AMsg.Fields[I].OneofName, LGroups[G]) then
+      begin
+        SetLength(LNames, Length(LNames) + 1);
+        LNames[High(LNames)] := CaseValueName(LClass, LGroups[G],
+          PascalFieldName(AMsg.Fields[I].Name, LRenamed));
+      end;
+
+    W('  { which member of oneof ' + LGroups[G] + ' is set, if any }');
+    W('  ' + CaseEnumName(LClass, LGroups[G]) + ' = (');
+    for I := 0 to High(LNames) do
+      if I < High(LNames) then
+        W('    ' + LNames[I] + ',')
+      else
+        W('    ' + LNames[I]);
+    W('  );');
+    W;
+  end;
+end;
+
 procedure TMessagesEmitter.EmitMessage(AMsg: TProtoMessageNode);
 var
   I, J: Integer;
@@ -267,6 +391,7 @@ var
   LPropName, LRenamedFrom, LBackField, LFieldType: string;
   LOtherName, LOtherRenamed: string;
   LAnyOptional: Boolean;
+  LGroups: TArray<string>;
 begin
   { Collision check first, so the diagnostic names the two proto fields rather
     than surfacing as a duplicate identifier in generated Pascal. }
@@ -291,6 +416,9 @@ begin
   end;
 
   LAnyOptional := False;
+
+  { The case enums must precede the class that uses them. }
+  EmitOneofCaseEnums(AMsg);
 
   W('  [TGrpcMessage]');
   W('  ' + PascalTypeName(AMsg.QualifiedName) + ' = class');
@@ -327,7 +455,12 @@ begin
   { The setter is the mechanism, not a convenience: deserialisation writes
     through TRttiProperty.SetValue, which calls it, which raises the bit. That
     is why the has-bit property is read-only, and why nothing on the decode
-    side has to know about presence at all. }
+    side has to know about presence at all.
+
+    For a oneof member the same setter also clears its siblings, which is the
+    entire behavioural difference between `oneof` and a set of `optional`
+    fields - and it lands on the decode path for free, giving proto3's
+    "last member on the wire wins" without the decoder knowing about oneofs. }
   for I := 0 to AMsg.Fields.Count - 1 do
   begin
     LField := AMsg.Fields[I];
@@ -336,6 +469,12 @@ begin
     LFieldType := PascalFieldType(LField, FFile);
     W('    procedure Set' + LPropName + '(const AValue: ' + LFieldType + ');');
   end;
+
+  // Pass 3 - one case-getter per oneof group.
+  LGroups := OneofGroups(AMsg);
+  for I := 0 to High(LGroups) do
+    W('    function Get' + CapFirst(LGroups[I]) + 'Case: ' +
+      CaseEnumName(PascalTypeName(AMsg.QualifiedName), LGroups[I]) + ';');
 
   if LAnyOptional then
   begin
@@ -349,6 +488,19 @@ begin
         the setter SETS the field to zero, which on the wire is the opposite
         of absent. }
       W('    procedure Clear' + LPropName + ';');
+    end;
+
+    { One Clear + one Case property per oneof group. The Case property is
+      READ-ONLY and COMPUTED from the has-bits rather than stored, for the
+      same reason the has-bit itself is read-only: a derived value cannot
+      desync from the thing it describes. It carries no [TProtoMember], so
+      TProtobufRtti skips it - discovery ignores unannotated properties. }
+    for I := 0 to High(LGroups) do
+    begin
+      W('    procedure Clear' + CapFirst(LGroups[I]) + ';');
+      W('    property ' + CapFirst(LGroups[I]) + 'Case: ' +
+        CaseEnumName(PascalTypeName(AMsg.QualifiedName), LGroups[I]) +
+        ' read Get' + CapFirst(LGroups[I]) + 'Case;');
     end;
   end;
 
@@ -406,6 +558,14 @@ begin
       W('procedure ' + LClass + '.Set' + LPropName +
         '(const AValue: ' + LFieldType + ');');
       W('begin');
+      { ONEOF-1. Clearing the whole group FIRST is what makes "at most one is
+        set" true, and it is the only behavioural difference between a oneof
+        member and an `optional` field. It also lands on the decode path for
+        free: deserialisation reaches this setter, so two members arriving on
+        the wire leave only the last one set - proto3's rule, without the
+        decoder knowing oneofs exist. }
+      if LField.InOneof then
+        W('  Clear' + CapFirst(LField.OneofName) + ';');
       W('  F' + LPropName + ' := AValue;');
       W('  F' + HasBitName(LPropName) + ' := True;');
       W('end;');
@@ -417,6 +577,69 @@ begin
       W('end;');
       W;
     end;
+    EmitOneofBodies(LMsg);
+  end;
+end;
+
+{ ONEOF-1 bodies: one Clear and one case-getter per group.
+
+  Clear touches the fields DIRECTLY rather than calling the per-field Clear
+  methods. Going through those would work today, but it makes the group's
+  invariant depend on each member's Clear staying trivial - and the setters
+  call this, so any future per-field Clear that itself touched the group would
+  recurse. Writing the fields here keeps the group's rule in exactly one
+  place.
+
+  The case-getter is COMPUTED from the has-bits, never stored. A stored
+  discriminator is a second copy of the truth, and the whole design of
+  PRESENCE-1 is that presence has exactly one representation. }
+procedure TMessagesEmitter.EmitOneofBodies(AMsg: TProtoMessageNode);
+var
+  LGroups: TArray<string>;
+  G, I: Integer;
+  LClass, LProp, LRenamed, LType, LEnum: string;
+  LFirst: Boolean;
+begin
+  LGroups := OneofGroups(AMsg);
+  if Length(LGroups) = 0 then Exit;
+  LClass := PascalTypeName(AMsg.QualifiedName);
+
+  for G := 0 to High(LGroups) do
+  begin
+    LEnum := CaseEnumName(LClass, LGroups[G]);
+
+    W('procedure ' + LClass + '.Clear' + CapFirst(LGroups[G]) + ';');
+    W('begin');
+    for I := 0 to AMsg.Fields.Count - 1 do
+    begin
+      if not SameText(AMsg.Fields[I].OneofName, LGroups[G]) then Continue;
+      LProp := PascalFieldName(AMsg.Fields[I].Name, LRenamed);
+      LType := PascalFieldType(AMsg.Fields[I], FFile);
+      W('  F' + LProp + ' := Default(' + LType + ');');
+      W('  F' + HasBitName(LProp) + ' := False;');
+    end;
+    W('end;');
+    W;
+
+    W('function ' + LClass + '.Get' + CapFirst(LGroups[G]) + 'Case: ' +
+      LEnum + ';');
+    W('begin');
+    LFirst := True;
+    for I := 0 to AMsg.Fields.Count - 1 do
+    begin
+      if not SameText(AMsg.Fields[I].OneofName, LGroups[G]) then Continue;
+      LProp := PascalFieldName(AMsg.Fields[I].Name, LRenamed);
+      if LFirst then
+        W('  if F' + HasBitName(LProp) + ' then')
+      else
+        W('  else if F' + HasBitName(LProp) + ' then');
+      W('    Result := ' + CaseValueName(LClass, LGroups[G], LProp));
+      LFirst := False;
+    end;
+    W('  else');
+    W('    Result := ' + CaseValueName(LClass, LGroups[G], '') + ';');
+    W('end;');
+    W;
   end;
 end;
 

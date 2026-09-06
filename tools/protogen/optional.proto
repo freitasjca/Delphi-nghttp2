@@ -46,3 +46,42 @@ message OptMsg {
   optional OptColour col = 5;
   repeated int32  ids   = 6;
 }
+
+// ONEOF-1. A oneof is PRESENCE-1 plus one rule: setting a member clears its
+// siblings. There is no wire framing for it — each member is an ordinary
+// tagged field — so the generated setters carry the whole difference.
+//
+// Present here rather than in a fixture of its own so the same check exercises
+// both features on ONE class, which is where they could interfere: an ordinary
+// `optional` field must NOT be cleared when a oneof member is set, and the
+// members must not disturb the plain fields around them.
+//
+//   pick_i / pick_s   two members of one group, different wire families
+//                     (varint and length-delimited) so a clear that only
+//                     handled one kind would show up.
+//   pick_c            an enum member, exercising Default(TEnum) in the
+//                     generated group Clear.
+//   other_a           a SECOND, independent group. Setting a member of `pick`
+//                     must not touch it - the commonest way to get group
+//                     clearing wrong is to clear every has-bit in the class.
+//
+// A message member is deliberately absent: clearing one means FREEING it, and
+// protogen emits no destructor, so the generator refuses that case outright.
+
+message OneofMsg {
+  int32 before = 1;
+
+  oneof pick {
+    int32     pick_i = 2;
+    string    pick_s = 3;
+    OptColour pick_c = 4;
+  }
+
+  optional int32 lone = 5;      // an `optional` field OUTSIDE the group
+
+  oneof other {
+    int32 other_a = 6;
+  }
+
+  int32 after = 7;
+}

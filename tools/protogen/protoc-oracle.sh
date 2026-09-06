@@ -206,9 +206,24 @@ $HDR
 message M { map<string, int32> m = 1; }
 EOF
 
-add_case oneof    refuse "Group C - no presence model" <<EOF
+# Was `refuse` until ONEOF-1. A oneof has no wire framing of its own - each
+# member is an ordinary tagged field - so what was missing was presence, which
+# PRESENCE-1 supplied. Now an `ok` row.
+add_case oneof    accept "ONEOF-1 - members are has-bit fields" <<EOF
 $HDR
 message M { oneof pick { int32 a = 1; string b = 2; } }
+EOF
+
+# Still refused, and protoc refuses them too: proto3 forbids labels and maps
+# inside a oneof, and forbids nesting one.
+add_case oneof_repeated refuse "no labels inside a oneof" <<EOF
+$HDR
+message M { oneof pick { repeated int32 a = 1; } }
+EOF
+
+add_case oneof_empty refuse "a oneof needs at least one member" <<EOF
+$HDR
+message M { oneof pick { } }
 EOF
 
 # Was `refuse` until PRESENCE-1 gave the serializer a has-bit ([TProtoHas] on a

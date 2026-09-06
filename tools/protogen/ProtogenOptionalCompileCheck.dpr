@@ -91,6 +91,7 @@ end;
 
 var
   GMsg, GDst: TOptMsg;
+  GOne, GOneDst: TOneofMsg;      // ONEOF-1
   GBytes: TBytes;
   GOk: Boolean;
   GErr: string;
@@ -200,6 +201,127 @@ begin
   finally
     GMsg.Free;
     GDst.Free;
+  end;
+
+  // ── ONEOF-1 · generated oneof code ───────────────────────────────────────
+  //  Same two questions as above, one layer along: does it compile, and does
+  //  the RTTI layer accept it? A oneof member is an ordinary has-bit field, so
+  //  AttachHasBits must take it exactly as it takes an `optional` one.
+  WriteLn;
+  WriteLn('-- ONEOF-1: generated oneof code');
+
+  GOk  := False;
+  GErr := '';
+  GOne := TOneofMsg.Create;
+  try
+    try
+      TProtoSerializer.Serialize(GOne);
+      GOk := True;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+  finally
+    GOne.Free;
+  end;
+  Check('generated oneof class is ACCEPTED by AttachHasBits', GOk, GErr);
+
+  if GOk then
+  begin
+    GOne := TOneofMsg.Create;
+    try
+      Check('fresh message reports no member set',
+        GOne.PickCase = OneofMsgPickCaseNone);
+      Check('unset members emit nothing',
+        (not EmitsTag(GOne, 2)) and (not EmitsTag(GOne, 3))
+        and (not EmitsTag(GOne, 4)));
+      Check('a plain field beside the group still emits', EmitsTag(GOne, 1));
+    finally
+      GOne.Free;
+    end;
+
+    // setting one member
+    GOne := TOneofMsg.Create;
+    try
+      GOne.pick_i := 7;
+      Check('setting a member raises its bit',      GOne.HasPick_i);
+      Check('case reports THAT member',
+        GOne.PickCase = OneofMsgPickCasePick_i);
+      Check('only that member is emitted',
+        EmitsTag(GOne, 2) and (not EmitsTag(GOne, 3))
+        and (not EmitsTag(GOne, 4)));
+    finally
+      GOne.Free;
+    end;
+
+    { The rule that makes a oneof a oneof, and across two wire families:
+      pick_i is a varint, pick_s is length-delimited. A clear that handled
+      only one kind would pass a single-member test. }
+    GOne := TOneofMsg.Create;
+    try
+      GOne.pick_i := 7;
+      GOne.pick_s := 'now this one';
+      Check('setting a second member CLEARED the first', not GOne.HasPick_i);
+      Check('the second member is set',                  GOne.HasPick_s);
+      Check('case follows the last one set',
+        GOne.PickCase = OneofMsgPickCasePick_s);
+      Check('only the last member goes on the wire',
+        EmitsTag(GOne, 3) and (not EmitsTag(GOne, 2)));
+    finally
+      GOne.Free;
+    end;
+
+    { Group isolation. The easiest way to get clearing wrong is to clear every
+      has-bit in the class rather than only the group's - which would silently
+      wipe an unrelated `optional` field and the other group. }
+    GOne := TOneofMsg.Create;
+    try
+      GOne.lone    := 99;
+      GOne.other_a := 5;
+      GOne.pick_i  := 1;
+      Check('setting a member left the OTHER group alone', GOne.HasOther_a);
+      Check('setting a member left a plain optional alone', GOne.HasLone);
+      Check('the two groups report independently',
+        (GOne.PickCase = OneofMsgPickCasePick_i)
+        and (GOne.OtherCase = OneofMsgOtherCaseOther_a));
+    finally
+      GOne.Free;
+    end;
+
+    // the generated group Clear, including the enum member's Default(TEnum)
+    GOne := TOneofMsg.Create;
+    try
+      GOne.pick_c := OPT_COLOUR_BLUE;
+      Check('enum member sets its case',
+        GOne.PickCase = OneofMsgPickCasePick_c);
+      GOne.ClearPick;
+      Check('ClearPick returns the group to None',
+        GOne.PickCase = OneofMsgPickCaseNone);
+      Check('ClearPick lowered the member bit', not GOne.HasPick_c);
+      Check('cleared group emits nothing', not EmitsTag(GOne, 4));
+    finally
+      GOne.Free;
+    end;
+
+    { Round trip. Two members on the wire must leave only the last one set -
+      proto3's rule - and it falls out of deserialisation reaching the setter,
+      with no decoder-side knowledge of oneofs. }
+    GOne := TOneofMsg.Create;
+    GOneDst := TOneofMsg.Create;
+    try
+      GOne.pick_s := 'over the wire';
+      GBytes := TProtoSerializer.Serialize(GOne);
+      TProtoSerializer.Deserialize(GBytes, GOneDst);
+      Check('round-trip: member value survives',
+        GOneDst.pick_s = 'over the wire');
+      Check('round-trip: member arrives PRESENT', GOneDst.HasPick_s);
+      Check('round-trip: case survives the wire',
+        GOneDst.PickCase = OneofMsgPickCasePick_s);
+      Check('round-trip: the other members stay unset',
+        (not GOneDst.HasPick_i) and (not GOneDst.HasPick_c));
+    finally
+      GOne.Free;
+      GOneDst.Free;
+    end;
   end;
 
   WriteLn;
