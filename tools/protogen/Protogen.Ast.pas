@@ -196,6 +196,7 @@ function ScalarName(AScalar: TProtoScalar): string;
   type URL; Api, Type and DescriptorProto are protobuf's own reflection
   machinery. All stay refused until presence exists. }
 function WellKnownPascalClass(const AProtoName: string): string;
+function WellKnownIsEnum(const AProtoName: string): Boolean;
 
 implementation
 
@@ -361,7 +362,29 @@ begin
   else if LName = 'google.protobuf.BoolValue'   then Result := 'TProtobufBoolValue'
   else if LName = 'google.protobuf.StringValue' then Result := 'TProtobufStringValue'
   else if LName = 'google.protobuf.BytesValue'  then Result := 'TProtobufBytesValue'
+  // STRUCT-1. Bundled once PRESENCE-1, ONEOF-1 and MAP-1 supplied what they
+  // needed. NullValue is an ENUM, not a class - see WellKnownIsEnum, which
+  // callers must consult before treating one of these as an owned instance.
+  else if LName = 'google.protobuf.Struct'      then Result := 'TProtobufStruct'
+  else if LName = 'google.protobuf.Value'       then Result := 'TProtobufValue'
+  else if LName = 'google.protobuf.ListValue'   then Result := 'TProtobufListValue'
+  else if LName = 'google.protobuf.NullValue'   then Result := 'TProtobufNullValue'
   else Result := '';
+end;
+
+{ Is this bundled well-known type an ENUM rather than a message class?
+
+  Only google.protobuf.NullValue is, and the distinction is load-bearing: an
+  emitter that treats it as a message puts it in a generated destructor and
+  emits `.Free` on an enum. Every other entry in the table above is a class. }
+function WellKnownIsEnum(const AProtoName: string): Boolean;
+var
+  LName: string;
+begin
+  LName := AProtoName;
+  if (Length(LName) > 0) and (LName[1] = '.') then
+    Delete(LName, 1, 1);
+  Result := LName = 'google.protobuf.NullValue';
 end;
 
 function ScalarName(AScalar: TProtoScalar): string;

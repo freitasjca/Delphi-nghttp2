@@ -32,6 +32,9 @@ syntax = "proto3";
 
 package opt;
 
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
 enum OptColour {
   OPT_COLOUR_UNSET = 0;
   OPT_COLOUR_RED   = 1;
@@ -133,4 +136,27 @@ message OneofMsg {
   }
 
   int32 after = 7;
+}
+
+// STRUCT-1. The end-to-end path: a .proto that USES the bundled Struct family,
+// generated and then compiled and run. Everything else about STRUCT-1 is
+// asserted one layer down - the WellKnownPascalClass table in the parser
+// tests, the classes themselves in Nghttp2ProtobufTests section 15 - and none
+// of that proves the GENERATOR turns `google.protobuf.Struct s = 2;` into
+// Pascal that compiles.
+//
+//   s   a bundled message WKT. Must reach the generated destructor, because
+//       the class owns the instance.
+//   n   a bundled ENUM WKT, and the one that can go wrong quietly: it is not
+//       declared in this .proto, so it is absent from the file's enum list.
+//       An emitter that decides "message field" by asking only that list puts
+//       it in the destructor and emits `.Free` on an enum value. WellKnownIsEnum
+//       is what prevents it, and this field is what would catch its absence.
+//   t   a WKT that was ALREADY bundled - the control. If this one broke too,
+//       the cause is the WKT path generally rather than anything STRUCT-1 did.
+message WktMsg {
+  int32                     tag = 1;
+  google.protobuf.Struct    s   = 2;
+  google.protobuf.NullValue n   = 3;
+  google.protobuf.Timestamp t   = 4;
 }

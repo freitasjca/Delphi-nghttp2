@@ -44,6 +44,7 @@ uses
 {$IFEND}
   Nghttp2.Protobuf,
   Nghttp2.Protobuf.Rtti,
+  Nghttp2.Protobuf.WellKnown,   // STRUCT-1 - the bundled Struct family
   Sample.Opt.Messages;      // <- generated. The point of the exercise.
 
 var
@@ -94,6 +95,7 @@ var
   GOne, GOneDst: TOneofMsg;      // ONEOF-1
   GOwn, GOwnDst: TOwnerMsg;      // PROTOGEN-DTOR
   GMap, GMapDst: TMapMsg;        // MAP-1
+  GWkt, GWktDst: TWktMsg;        // STRUCT-1
   GPay: TPayload;
   GPayloads: TArray<TPayload>;
   GBytes: TBytes;
@@ -597,6 +599,80 @@ begin
     end;
     Check('message-valued map round-trips and frees without double-free',
           GOk, GErr);
+  end;
+
+  // ── STRUCT-1 · a GENERATED field whose type is a bundled well-known ──────
+  //  The table says google.protobuf.Struct maps to TProtobufStruct, and
+  //  section 15 of the codec suite says TProtobufStruct works. Neither shows
+  //  that the EMITTER turns a Struct-typed field into Pascal that compiles,
+  //  puts the right unit in `uses`, and - the part that can go quietly wrong -
+  //  keeps the bundled ENUM out of the generated destructor.
+  WriteLn;
+  WriteLn('-- STRUCT-1: generated fields of bundled well-known types');
+
+  GOk  := False;
+  GErr := '';
+  GWkt := TWktMsg.Create;
+  try
+    try
+      TProtoSerializer.Serialize(GWkt);
+      GOk := True;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+  finally
+    GWkt.Free;
+  end;
+  Check('a class with WKT fields registers and serialises', GOk, GErr);
+
+  if GOk then
+  begin
+    { The enum field. That this COMPILED at all is most of the result: had the
+      emitter classified NullValue as a message it would have emitted
+      `Fn.Free` in the destructor, and `.Free` on an enum does not compile.
+      So reaching this line proves WellKnownIsEnum did its job. }
+    GWkt := TWktMsg.Create;
+    try
+      GWkt.n := NULL_VALUE;
+      Check('bundled ENUM field is a value, not an owned instance',
+        GWkt.n = NULL_VALUE);
+      Check('  and an enum at its default is omitted, like any other',
+        not EmitsTag(GWkt, 3));
+    finally
+      GWkt.Free;      { must NOT try to free the enum }
+    end;
+
+    { The message WKTs. Both are OWNED - assigned here, freed by the generated
+      destructor - so a missing destructor leaks and a wrong one crashes. }
+    GWkt    := TWktMsg.Create;
+    GWktDst := TWktMsg.Create;
+    try
+      GWkt.tag := 9;
+      GWkt.s := TProtobufStruct.Create;
+      GWkt.s.SetFields('inner', TProtobufValue.Create);
+      GWkt.s.GetFields('inner').string_value := 'from a generated field';
+      GWkt.t := TProtobufTimestamp.Create;     // the already-bundled control
+      GWkt.t.seconds := 1700000000;
+
+      Check('a Struct-typed generated field goes on the wire', EmitsTag(GWkt, 2));
+      Check('the control Timestamp field does too',            EmitsTag(GWkt, 4));
+
+      GBytes := TProtoSerializer.Serialize(GWkt);
+      TProtoSerializer.Deserialize(GBytes, GWktDst);
+
+      Check('round-trip: the plain field beside them is untouched',
+        GWktDst.tag = 9);
+      Check('round-trip: Struct arrives with its entry',
+        (GWktDst.s <> nil) and (GWktDst.s.FieldsCount = 1));
+      if (GWktDst.s <> nil) and (GWktDst.s.FieldsCount = 1) then
+        Check('round-trip: and the value inside it survives',
+          GWktDst.s.GetFields('inner').string_value = 'from a generated field');
+      Check('round-trip: the control Timestamp survives',
+        (GWktDst.t <> nil) and (GWktDst.t.seconds = 1700000000));
+    finally
+      GWkt.Free;        { the generated destructor frees s and t }
+      GWktDst.Free;     { and the codec-allocated ones }
+    end;
   end;
 
   WriteLn;

@@ -278,22 +278,25 @@ message M {
 }
 EOF
 
-# The stated reason has changed twice, so it is spelled out rather than left as
-# a shorthand that goes stale again. Struct is
-#
-#   Struct    { map<string, Value> fields = 1; }
-#   Value     { oneof kind { ... Struct struct_value = 5; ListValue ... } }
-#   ListValue { repeated Value values = 1; }
-#
-# oneof stopped being the blocker at ONEOF-1 and map stopped being one at
-# MAP-1. What still blocks it is (a) MESSAGE members inside a oneof - clearing
-# one means freeing it, which the generated group Clear does not do - and
-# (b) Struct and Value refer to each other, and the emitter writes classes in
-# declaration order with no forward declarations. Neither is about Struct.
-add_case wellknown_blocked refuse "needs oneof MESSAGE members + mutual recursion" <<EOF
+# STRUCT-1 closed this. The reason had already gone stale twice before that
+# - "needs oneof" survived ONEOF-1, "needs map" survived MAP-1 - so what
+# actually unblocked it is worth stating: Struct/Value/ListValue/NullValue are
+# now BUNDLED as hand-written classes in Nghttp2.Protobuf.WellKnown, which
+# routes around the two things the generator still cannot emit (a oneof with
+# message members, and mutual recursion) rather than closing them.
+add_case wellknown_struct accept "STRUCT-1 - Struct family bundled" <<EOF
 $HDR
 import "google/protobuf/struct.proto";
 message M { google.protobuf.Struct s = 1; }
+EOF
+
+# The control for the row above. Without a still-refused well-known type,
+# "the table is right" is indistinguishable from "the table accepts anything
+# under google.protobuf.".
+add_case wellknown_blocked refuse "Any needs run-time type-URL resolution" <<EOF
+$HDR
+import "google/protobuf/any.proto";
+message M { google.protobuf.Any a = 1; }
 EOF
 
 add_case proto2_syntax refuse "proto2 - valid to protoc, out of scope for us" <<EOF

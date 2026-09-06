@@ -41,7 +41,8 @@ uses
   System.SysUtils, System.Classes,
 {$IFEND}
   Nghttp2.Protobuf,
-  Nghttp2.Protobuf.Rtti;
+  Nghttp2.Protobuf.Rtti,
+  Nghttp2.Protobuf.WellKnown;
 
 var
   GPassCount: Integer = 0;
@@ -1193,6 +1194,175 @@ begin
   end;
 end;
 
+// ── 15 · the Struct family (STRUCT-1) ───────────────────────────────────────
+//  Nghttp2.Protobuf.WellKnown had NO runtime test at all before this: the
+//  classes were asserted only by compiling. That was survivable while every
+//  one of them was a bag of scalars with no behaviour. Struct/Value/ListValue
+//  have behaviour - ownership, sibling-clearing, two presence mechanisms in
+//  one class - so "it compiles" stops being evidence.
+//
+//  ProtoStructProbe already showed the RUNTIME carries this shape. What it
+//  could not show is that the SHIPPED classes are the ones it validated: the
+//  probe used its own private copies. This is the same questions asked of the
+//  real types.
+procedure TestStructFamily;
+var
+  LS, LS2:  TProtobufStruct;
+  LV, LV2:  TProtobufValue;
+  LL:       TProtobufListValue;
+  LInner:   TProtobufValue;
+  LBytes:   TBytes;
+begin
+  Section('15  the Struct family (STRUCT-1)');
+
+  { A fresh Value has nothing set, and says so through the discriminator
+    rather than through six separate reads. }
+  LV := TProtobufValue.Create;
+  try
+    Check('fresh Value reports no member set',
+      LV.KindCase = ProtobufValueKindCaseNone);
+    Check('fresh Value serialises to zero bytes',
+      Length(TProtoSerializer.Serialize(LV)) = 0);
+  finally
+    LV.Free;
+  end;
+
+  { The scalar half: a has-bit, because 0 / "" / False are otherwise
+    indistinguishable from absent. Each set to its DEFAULT on purpose - that
+    is the case the mechanism exists for. }
+  LV := TProtobufValue.Create;
+  try
+    LV.number_value := 0;
+    Check('number_value := 0 raises its has-bit', LV.has_number_value);
+    Check('  and reports the case', LV.KindCase = ProtobufValueKindCaseNumber_value);
+    Check('  and goes on the wire despite being 0',
+      Length(TProtoSerializer.Serialize(LV)) > 0);
+
+    LV.string_value := '';
+    Check('setting a sibling CLEARED number_value', not LV.has_number_value);
+    Check('  and the case follows the last one set',
+      LV.KindCase = ProtobufValueKindCaseString_value);
+  finally
+    LV.Free;
+  end;
+
+  { The message half: nil is the presence signal, and clearing means FREEING.
+    A leak here is invisible; a double-free is not, so the check is that this
+    survives at all. }
+  LV := TProtobufValue.Create;
+  try
+    LV.struct_value := TProtobufStruct.Create;
+    Check('struct_value reports its case',
+      LV.KindCase = ProtobufValueKindCaseStruct_value);
+    LV.list_value := TProtobufListValue.Create;
+    Check('setting list_value freed and cleared struct_value',
+      LV.struct_value = nil);
+    Check('  and the case moved', LV.KindCase = ProtobufValueKindCaseList_value);
+    LV.ClearKind;
+    Check('ClearKind returns to None', LV.KindCase = ProtobufValueKindCaseNone);
+    Check('  and freed the message member', LV.list_value = nil);
+  finally
+    LV.Free;
+  end;
+
+  { Self-assignment. Without the guard this frees the instance and stores the
+    pointer it just freed - the next read touches freed memory. }
+  LV := TProtobufValue.Create;
+  try
+    LV.struct_value := TProtobufStruct.Create;
+    LV.struct_value := LV.struct_value;
+    Check('re-setting struct_value to ITSELF does not free it',
+      LV.struct_value <> nil);
+  finally
+    LV.Free;
+  end;
+
+  { Struct's map accessors - the hand-written twin of what MAP-1 generates. }
+  LS := TProtobufStruct.Create;
+  try
+    Check('fresh Struct is empty', LS.FieldsCount = 0);
+    Check('absent key reads as nil', LS.GetFields('nope') = nil);
+    Check('absent key reports absent', not LS.HasFields('nope'));
+
+    LInner := TProtobufValue.Create;
+    LInner.string_value := 'one';
+    LS.SetFields('a', LInner);
+    Check('SetFields stores by key', LS.GetFields('a').string_value = 'one');
+    Check('  and reports present', LS.HasFields('a'));
+
+    { Replace. The displaced Value is freed by SetFields; an append-only
+      implementation passes every check above and still puts a duplicate key
+      on the wire. }
+    LInner := TProtobufValue.Create;
+    LInner.string_value := 'two';
+    LS.SetFields('a', LInner);
+    Check('re-setting a key REPLACES rather than appends', LS.FieldsCount = 1);
+    Check('  and yields the new value', LS.GetFields('a').string_value = 'two');
+
+    LS.ClearFields;
+    Check('ClearFields empties the map', LS.FieldsCount = 0);
+  finally
+    LS.Free;
+  end;
+
+  // The whole point: a nested, mutually recursive value round-trips. In JSON
+  // terms the value is  { "k": [ 1 ] }  - which as classes is
+  // Struct -> entry -> Value -> ListValue -> Value, the cycle that could not
+  // be generated and is the reason these four are hand-written.
+  LS  := TProtobufStruct.Create;
+  LS2 := TProtobufStruct.Create;
+  try
+    LL := TProtobufListValue.Create;
+    LInner := TProtobufValue.Create;
+    LInner.number_value := 1;
+    LL.Add(LInner);
+
+    LV := TProtobufValue.Create;
+    LV.list_value := LL;
+    LS.SetFields('k', LV);
+
+    LBytes := TProtoSerializer.Serialize(LS);
+    Check('a recursive value encodes to something', Length(LBytes) > 0);
+
+    TProtoSerializer.Deserialize(LBytes, LS2);
+    Check('round-trip: one entry survives', LS2.FieldsCount = 1);
+    LV2 := LS2.GetFields('k');
+    Check('round-trip: the key resolves', LV2 <> nil);
+    if LV2 <> nil then
+    begin
+      Check('round-trip: the case survives the wire',
+        LV2.KindCase = ProtobufValueKindCaseList_value);
+      Check('round-trip: the list has one element',
+        (LV2.list_value <> nil) and (Length(LV2.list_value.values) = 1));
+      if (LV2.list_value <> nil) and (Length(LV2.list_value.values) = 1) then
+      begin
+        Check('round-trip: the innermost number arrives',
+          LV2.list_value.values[0].number_value = 1);
+        { PRESENCE, not just equality: without the has-bit a decoded 1 and a
+          never-set 0 would both compare "fine" for the wrong reason. }
+        Check('round-trip: and arrives PRESENT',
+          LV2.list_value.values[0].has_number_value);
+      end;
+    end;
+  finally
+    LS.Free;    { frees entry -> Value -> ListValue -> Value }
+    LS2.Free;   { frees the codec-allocated tree }
+  end;
+
+  { NullValue is an ENUM. Asserted here because the emitter has to know that
+    too - treated as a message it lands in a destructor and gets Freed. }
+  LV := TProtobufValue.Create;
+  try
+    LV.null_value := NULL_VALUE;
+    Check('null_value is settable and raises its bit', LV.has_null_value);
+    Check('  and reports its case',
+      LV.KindCase = ProtobufValueKindCaseNull_value);
+  finally
+    LV.Free;
+  end;
+end;
+
+
 procedure TestUnsignedWireForm;
 var
   LSrc, LDst: TUnsignedMessage;
@@ -1260,6 +1430,7 @@ begin
     TestUnsignedWireForm;
     TestEmptyMessage;
     TestExplicitPresence;
+    TestStructFamily;
 
     WriteLn;
     WriteLn(Format('[Nghttp2Protobuf] %d passed, %d failed', [GPassCount, GFailCount]));

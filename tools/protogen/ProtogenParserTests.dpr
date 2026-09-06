@@ -472,10 +472,55 @@ begin
     WellKnownPascalClass('google.protobuf.Timestamp') = 'TProtobufTimestamp');
   Check('leading dot maps identically',
     WellKnownPascalClass('.google.protobuf.FieldMask') = 'TProtobufFieldMask');
-  Check('Struct is NOT bundled',
-    WellKnownPascalClass('google.protobuf.Struct') = '');
+  { STRUCT-1 flipped these four. The assertion is kept rather than deleted,
+    inverted, because "Struct is NOT bundled" was true for a reason and a
+    future reader should see that it CHANGED rather than that it vanished. }
+  Check('Struct now maps to TProtobufStruct',
+    WellKnownPascalClass('google.protobuf.Struct') = 'TProtobufStruct');
+  Check('Value maps to TProtobufValue',
+    WellKnownPascalClass('google.protobuf.Value') = 'TProtobufValue');
+  Check('ListValue maps to TProtobufListValue',
+    WellKnownPascalClass('google.protobuf.ListValue') = 'TProtobufListValue');
+  Check('NullValue maps to TProtobufNullValue',
+    WellKnownPascalClass('google.protobuf.NullValue') = 'TProtobufNullValue');
+
+  { The distinction the emitter's destructor depends on. Treated as a message,
+    NullValue would be emitted into a destructor and freed - and it is an enum
+    value, not an instance. }
+  Check('NullValue is flagged as an ENUM', WellKnownIsEnum('google.protobuf.NullValue'));
+  Check('  and the leading-dot spelling too', WellKnownIsEnum('.google.protobuf.NullValue'));
+  Check('Struct is NOT flagged as an enum', not WellKnownIsEnum('google.protobuf.Struct'));
+  Check('Timestamp is NOT flagged as an enum', not WellKnownIsEnum('google.protobuf.Timestamp'));
+  Check('a user type is not flagged as an enum', not WellKnownIsEnum('myapp.NullValue'));
+
+  { Any stays refused, and it is the control for the whole table: without a
+    still-unbundled entry, "the table is right" would be indistinguishable
+    from "the table accepts everything". }
+  Check('Any is STILL not bundled',
+    WellKnownPascalClass('google.protobuf.Any') = '');
   Check('a user type is not mistaken for well-known',
     WellKnownPascalClass('myapp.Timestamp') = '');
+
+  { And through the parser, not only the table. }
+  F := Parse(
+    'syntax = "proto3";'#10 +
+    'package t;'#10 +
+    'import "google/protobuf/struct.proto";'#10 +
+    'message M {'#10 +
+    '  google.protobuf.Struct    s = 1;'#10 +
+    '  google.protobuf.Value     v = 2;'#10 +
+    '  google.protobuf.ListValue l = 3;'#10 +
+    '  google.protobuf.NullValue n = 4;'#10 +
+    '}'#10);
+  try
+    M := F.FindMessage('M');
+    Check('the Struct family parses as fields', (M <> nil) and (M.Fields.Count = 4));
+    if M <> nil then
+      Check('  each kept as a type reference, not a scalar',
+        (M.Fields[0].Scalar = psNone) and (M.Fields[3].Scalar = psNone));
+  finally
+    F.Free;
+  end;
 end;
 
 // ── 06 · the refusal corpus ─────────────────────────────────────────────────
@@ -532,13 +577,14 @@ begin
   ExpectRefusal('proto2 syntax',
     'syntax = "proto2";'#10'package t;'#10, 'proto2');
 
-  { Only the UNBUNDLED well-known types are refused now. Struct is the cheapest
-    to state: it is built on oneof. The bundled ones are asserted accepted in
-    TestWellKnown below — both halves matter, because a list like this fails
-    silently in either direction. }
+  { Only the UNBUNDLED well-known types are refused now. STRUCT-1 moved Struct
+    OUT of this list - it used to be the example here - so Api takes its place
+    as the cheapest one to state. The bundled ones are asserted accepted in
+    TestWellKnown, and both halves matter: a table like this fails silently in
+    either direction. }
   ExpectRefusal('well-known type (not bundled)',
-    HDR + 'message M { google.protobuf.Struct s = 1; }',
-    'google.protobuf.Struct');
+    HDR + 'message M { google.protobuf.Api a = 1; }',
+    'google.protobuf.Api');
 
   ExpectRefusal('well-known Any (dynamic typing)',
     HDR + 'message M { google.protobuf.Any a = 1; }',

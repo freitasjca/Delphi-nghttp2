@@ -297,7 +297,14 @@ end;
   every field of every message rather than only about ones the author marked. }
 function TMessagesEmitter.IsMessageField(AField: TProtoFieldNode): Boolean;
 begin
-  Result := (AField.Scalar = psNone) and (FFile.FindEnum(AField.TypeName) = nil);
+  { STRUCT-1. A bundled well-known ENUM is not in FFile.Enums - it is not
+    declared in the .proto at all - so the FindEnum test alone calls
+    google.protobuf.NullValue a message, puts it in the generated destructor,
+    and emits `.Free` on an enum value. WellKnownIsEnum is the only thing that
+    can tell them apart. }
+  Result := (AField.Scalar = psNone)
+            and (FFile.FindEnum(AField.TypeName) = nil)
+            and not WellKnownIsEnum(AField.TypeName);
 end;
 
 function TMessagesEmitter.OwnsMessages(AMsg: TProtoMessageNode): Boolean;

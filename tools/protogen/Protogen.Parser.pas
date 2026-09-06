@@ -298,13 +298,13 @@ begin
       Exit;   // bundled — nothing to refuse
 
     RefuseAt(ALine, ACol, ATypeName,
-      Format('Field %s refers to a well-known type that is not bundled. ' +
-             'Struct, Value and ListValue are built on oneof; Any needs ' +
-             'dynamic type resolution from a type URL; Api, Type and ' +
-             'DescriptorProto are protobuf''s own reflection machinery. All ' +
-             'need a presence model the serializer does not have. Timestamp, ' +
-             'Duration, FieldMask, Empty and the scalar wrappers ARE ' +
-             'supported.',
+      Format('Field %s refers to a well-known type that is not bundled. Any ' +
+             'needs dynamic type resolution - it carries a type URL and an ' +
+             'opaque payload, so decoding one means a run-time registry ' +
+             'mapping URLs to classes. Api, Type and DescriptorProto are ' +
+             'protobuf''s own reflection machinery. Timestamp, Duration, ' +
+             'FieldMask, Empty, the scalar wrappers, and Struct, Value, ' +
+             'ListValue and NullValue ARE supported.',
              [QuotedStr(AFieldName)]));
   end;
 end;
