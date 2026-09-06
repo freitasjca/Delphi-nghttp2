@@ -265,18 +265,35 @@ for years here.
 
 ## Known limits
 
-`map`, `oneof`, `optional`, `sint*`, `fixed*`, `sfixed*` and proto2 are refused
-at parse time, with a message naming the construct and explaining why —
-[`protogen.md`](protogen.md) has the full list and the reasoning. A refusal is
-the tool working: these would otherwise encode to bytes a peer decodes
-differently, with no error anywhere.
+`sint*`, `fixed*`, `sfixed*` and proto2 are refused at parse time, with a
+message naming the construct and explaining why — [`protogen.md`](protogen.md)
+has the full list and the reasoning. A refusal is the tool working: these would
+otherwise encode to bytes a peer decodes differently, with no error anywhere.
+
+`map`, `oneof` and `optional` **were** on that list and are now supported, as
+are the `Struct` family and `Any`. If you are reading an older copy of this
+guide, that is the paragraph that changed.
 
 Two further points that are easy to miss:
 
-- The codec **emits default-valued scalars** where canonical proto3 omits them.
-  This is interoperable — a peer decodes the same value either way — but it is
-  not canonical, and it is why `optional` cannot be supported yet: with
-  defaults on the wire, "set to zero" and "not set" are indistinguishable.
-- Well-known types are bundled only in part. `Timestamp`, `Duration`,
-  `FieldMask`, `Empty` and the wrappers work; `Struct`, `Value`, `ListValue`
-  and `Any` are refused because they need `oneof` or dynamic typing.
+- The codec omits default-valued scalars, matching canonical proto3 — which is
+  what makes `optional` meaningful, since "set to zero" and "not set" are
+  distinguishable only when defaults are absent from the wire.
+- Well-known types are bundled except two. `Timestamp`, `Duration`,
+  `FieldMask`, `Empty`, the scalar wrappers, `Struct`, `Value`, `ListValue`,
+  `NullValue` and `Any` all work. `Api` and `DescriptorProto` are refused:
+  they describe `.proto` files rather than carrying user data.
+- `Any` needs one extra step, because nothing in a compiled Pascal program
+  records a class's *proto* name. Register it once at startup, the same way
+  gRPC services are registered:
+
+  ```pascal
+  uses Nghttp2.Protobuf.Any;
+
+  TProtoAnyRegistry.RegisterType('greeter.GreetRequest', TGreetRequest);
+  ```
+
+  Then `TProtoAny.Pack(LAny, LMsg)` and `TProtoAny.UnpackNew(LAny)` resolve the
+  type themselves. `UnpackTo` refuses to decode an `Any` whose `type_url` does
+  not name the destination class — without that check the *peer* chooses how
+  your bytes are interpreted.

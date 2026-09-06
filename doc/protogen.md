@@ -52,10 +52,10 @@ ACCEPT  service.proto  (3 message(s), 0 enum(s), 1 service(s))
 or
 
 ```
-REFUSE  service.proto  [map]  (12:3) map is not supported. A map field is
-encoded as a repeated entry submessage with key/value fields, which needs a
-synthesised message type per map. Model it as a repeated message with explicit
-key and value fields.
+REFUSE  service.proto  [sint32]  (12:3) sint32 is not supported. The wire
+layer implements zigzag, but TProtoMemberAttribute carries only a tag, so a
+property has no way to request a wire form. Use int32 - you lose the
+encoding-size optimisation, not correctness.
 ```
 
 Exit codes: **0** accepted · **1** refused · **2** internal error or bad usage.
@@ -148,22 +148,36 @@ but an additive one.
 *Workaround:* use `int32`/`int64`/`uint32`/`uint64`. You lose the encoding-size
 optimisation, not correctness.
 
-**No representation**
-
-| Feature | Why |
-|---|---|
-| `map<K,V>` | Encoded as a repeated entry submessage, so it needs a synthesised message type per map. Model it as a `repeated` message with explicit key and value fields. |
-| `oneof` | A tagged union with presence semantics; nothing here can express which member is set. |
-| `optional` | proto3 explicit presence needs a has-bit. Worse, the serializer currently emits **even default-valued scalars**, so "set to zero" and "not set" are indistinguishable on the wire. Drop the keyword — implicit presence is the proto3 default. |
-
 **Out of scope**
 
-proto2 syntax, `required`, `group`, `extend`/`extensions`, and the protobuf
-well-known types (`google.protobuf.*`), which are not bundled.
+proto2 syntax, `required`, `group`, `extend`/`extensions`.
+
+Two well-known types are still refused: `google.protobuf.Api` and
+`DescriptorProto`. They describe `.proto` files rather than carrying user data,
+so a program that needs them wants a descriptor library rather than two more
+classes. Everything else under `google.protobuf.` is bundled.
 
 **Rejected as invalid**, matching `protoc`: duplicate field numbers, field
-number 0, numbers in the 19000–19999 range protobuf reserves for itself, and a
-first enum value that is not 0.
+number 0, numbers in the 19000–19999 range protobuf reserves for itself, a
+first enum value that is not 0, a `map` that is also `repeated`, and a map key
+that is not integral or string.
+
+### Previously refused, now supported
+
+Four things this section used to refuse are supported. Called out rather than
+silently deleted, so a reader working from an older copy sees that the answer
+**changed** rather than that it was never there:
+
+| Feature | Since | How |
+|---|---|---|
+| `optional` | PRESENCE-1 | A read-only `[TProtoHas]` Boolean paired to the field's tag and raised by the value's setter, so the bit cannot desync from the value. |
+| `oneof` | ONEOF-1 | Needs no wire support at all — each member is an ordinary tagged field. The generated setter clears its siblings, and a `<Group>Case` discriminator reports which is set. |
+| `map<K,V>` | MAP-1 | A proto3 map **is** a repeated synthesised `<Field>Entry` with `key = 1` and `value = 2`. The parser builds exactly that; the emitter adds `<F>Count` / `Has<F>` / `Get<F>` / `Set<F>` / `Clear<F>` over the entry array. |
+| `Struct`, `Value`, `ListValue`, `NullValue`, `Any` | STRUCT-1, ANY-1 | Bundled as hand-written classes in `Nghttp2.Protobuf.WellKnown`. `Any` also needs `Nghttp2.Protobuf.Any` for `TProtoAnyRegistry` and Pack/Unpack. |
+
+One consequence worth knowing: since CANONICAL-1 the serializer **omits
+default-valued scalars**, which is what makes `optional` meaningful — "set to
+zero" and "not set" are now distinguishable on the wire.
 
 ---
 

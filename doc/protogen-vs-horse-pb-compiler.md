@@ -83,15 +83,20 @@ on the wire.
 
 Being explicit, since the table above may read as if it handles everything:
 
-- `oneof`, `optional`, `map` — need a presence model the RTTI serializer does
-  not have
 - `sint*`, `fixed*`, `sfixed*` — the wire layer implements them, but
   `TProtoMemberAttribute` carries only a tag, so no wire form can be requested
-- `Struct`, `Value`, `ListValue`, `Any` — built on `oneof` or dynamic typing
+- `google.protobuf.Api` and `DescriptorProto` — protobuf's own reflection
+  machinery, describing `.proto` files rather than carrying user data
 - proto2 in any form
 
-Against 7300 real googleapis schemas it accepts 59%, refuses the rest by name,
-and has never accepted a schema `protoc` rejects. See `doc/protogen.md`.
+`oneof`, `optional`, `map`, and the `Struct` family and `Any` were on this list
+until PRESENCE-1 / ONEOF-1 / MAP-1 / STRUCT-1 / ANY-1.
+
+Against 7300 real googleapis schemas it accepts **99.5%** (7267 of 7301),
+refuses the remaining 34 by name, and has never accepted a schema `protoc`
+rejects. Those 34 are 21 wanting proto2 `extend`, 6 wanting `sint*`/`fixed*`,
+6 wanting `Api`/`DescriptorProto`, and 1 wanting two of those at once. See
+`doc/protogen.md`.
 
 ---
 
