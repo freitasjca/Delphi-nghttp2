@@ -499,8 +499,14 @@ begin
   ExpectRefusal('sfixed64',
     HDR + 'message M { sfixed64 v = 1; }', 'sfixed64');
 
-  ExpectRefusal('map',
-    HDR + 'message M { map<string, int32> m = 1; }', 'map');
+  { `map` itself is now ACCEPTED (MAP-1, section 09). What stays refused are
+    the shapes proto3 does not allow. }
+  ExpectRefusal('labelled map',
+    HDR + 'message M { repeated map<string, int32> m = 1; }', 'map');
+  ExpectRefusal('map with a float key',
+    HDR + 'message M { map<double, int32> m = 1; }', 'map key');
+  ExpectRefusal('map with a bytes key',
+    HDR + 'message M { map<bytes, int32> m = 1; }', 'map key');
   { `oneof` itself is now ACCEPTED (ONEOF-1, section 08). What stays refused
     are the shapes proto3 does not allow inside one, plus the message-member
     case the generator cannot represent. }
@@ -700,6 +706,80 @@ begin
   end;
 end;
 
+// ── 09  proto3 `map` synthesises an entry message (MAP-1) ───────────────────
+
+procedure TestMapAccepted;
+const
+  HDR = 'syntax = "proto3";'#10'package t;'#10;
+var
+  LFile: TProtoFileNode;
+  LMsg, LEntry: TProtoMessageNode;
+begin
+  Section('09  `map` accepted, entry message synthesised (MAP-1)');
+
+  LFile := Parse(HDR +
+    'message M {'#10 +
+    '  int32 before = 1;'#10 +
+    '  map<string, int32> labels = 2;'#10 +
+    '  int32 after = 3;'#10 +
+    '}');
+  try
+    LMsg := LFile.FindMessage('M');
+    Check('message M parsed', LMsg <> nil);
+    if LMsg = nil then Exit;
+
+    { The map became an ORDINARY repeated message field - which is what a
+      proto3 map is on the wire, so nothing below the parser needs to know. }
+    Check('3 fields', LMsg.Fields.Count = 3, IntToStr(LMsg.Fields.Count));
+    Check('the map field is repeated',   LMsg.Fields[1].IsRepeated);
+    Check('the map field is flagged',    LMsg.Fields[1].IsMap);
+    Check('a plain field is not flagged', not LMsg.Fields[0].IsMap);
+    Check('the map keeps its number',    LMsg.Fields[1].Number = 2);
+    Check('fields after it keep theirs', LMsg.Fields[2].Number = 3);
+
+    { The synthesised entry, hoisted to file scope with a qualified name -
+      the same shape a nested message gets, so no new naming rule is needed
+      and two maps in different messages cannot collide. }
+    LEntry := LFile.FindMessage('M.LabelsEntry');
+    Check('entry message synthesised and hoisted', LEntry <> nil);
+    Check('the field names the entry type',
+      LMsg.Fields[1].TypeName = 'M.LabelsEntry', LMsg.Fields[1].TypeName);
+    if LEntry <> nil then
+    begin
+      Check('entry has exactly key and value', LEntry.Fields.Count = 2);
+      Check('key is field 1',
+        (LEntry.Fields[0].Name = 'key') and (LEntry.Fields[0].Number = 1)
+        and (LEntry.Fields[0].Scalar = psString));
+      Check('value is field 2',
+        (LEntry.Fields[1].Name = 'value') and (LEntry.Fields[1].Number = 2)
+        and (LEntry.Fields[1].Scalar = psInt32));
+    end;
+  finally
+    LFile.Free;
+  end;
+
+  // a message-valued map, and two maps in one message
+  LFile := Parse(HDR +
+    'message Inner { int32 id = 1; }'#10 +
+    'message M {'#10 +
+    '  map<string, Inner> a = 1;'#10 +
+    '  map<int32,  string> b = 2;'#10 +
+    '}');
+  try
+    LMsg := LFile.FindMessage('M');
+    Check('two maps in one message parse', LMsg <> nil);
+    Check('both entries synthesised',
+      (LFile.FindMessage('M.AEntry') <> nil)
+      and (LFile.FindMessage('M.BEntry') <> nil));
+    LEntry := LFile.FindMessage('M.AEntry');
+    if LEntry <> nil then
+      Check('a message-valued map keeps the value type reference',
+        LEntry.Fields[1].TypeName = 'Inner', LEntry.Fields[1].TypeName);
+  finally
+    LFile.Free;
+  end;
+end;
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 begin
@@ -714,6 +794,7 @@ begin
     TestRefusals;
     TestOptionalAccepted;
     TestOneofAccepted;
+    TestMapAccepted;
 
     WriteLn;
     WriteLn(Format('[Protogen] %d passed, %d failed', [GPass, GFail]));

@@ -64,6 +64,11 @@ type
     function  IsMessageField(AField: TProtoFieldNode): Boolean;
     function  OwnsMessages(AMsg: TProtoMessageNode): Boolean;
     procedure EmitDestructorBody(AMsg: TProtoMessageNode);
+    // MAP-1 — dictionary accessors over the entry array
+    function  MapKeyType(AField: TProtoFieldNode): string;
+    function  MapValueType(AField: TProtoFieldNode): string;
+    procedure EmitMapAccessorDecls(AMsg: TProtoMessageNode);
+    procedure EmitMapAccessorBodies(AMsg: TProtoMessageNode);
   public
     // The generated has-bit property name for a field's Pascal property name.
     // Public so the C2 gate can assert against it rather than re-deriving the
@@ -304,6 +309,38 @@ begin
   Result := False;
 end;
 
+{ MAP-1. The Pascal key/value types of a map field, read off the SYNTHESISED
+  entry message rather than stored on the field.
+
+  The entry has exactly two fields, `key` = 1 and `value` = 2, because the
+  parser built it that way from the proto3 definition of a map. Reading them
+  back from there means the accessors and the wire representation cannot
+  disagree - there is only one place the types are written down. }
+function TMessagesEmitter.MapKeyType(AField: TProtoFieldNode): string;
+var
+  LEntry: TProtoMessageNode;
+begin
+  LEntry := FFile.FindMessage(AField.TypeName);
+  if (LEntry = nil) or (LEntry.Fields.Count < 2) then
+    raise EEmitError.CreateFmt(
+      'Map field %s names entry message %s, which is missing or malformed. '
+      + 'The parser synthesises it with key=1 and value=2; this should be '
+      + 'unreachable.', [QuotedStr(AField.Name), QuotedStr(AField.TypeName)]);
+  Result := PascalFieldType(LEntry.Fields[0], FFile);
+end;
+
+function TMessagesEmitter.MapValueType(AField: TProtoFieldNode): string;
+var
+  LEntry: TProtoMessageNode;
+begin
+  LEntry := FFile.FindMessage(AField.TypeName);
+  if (LEntry = nil) or (LEntry.Fields.Count < 2) then
+    raise EEmitError.CreateFmt(
+      'Map field %s names entry message %s, which is missing or malformed.',
+      [QuotedStr(AField.Name), QuotedStr(AField.TypeName)]);
+  Result := PascalFieldType(LEntry.Fields[1], FFile);
+end;
+
 { Upper-cases the first character only. proto names are conventionally
   lower_snake, and the generated identifiers built from them read as Pascal. }
 function CapFirst(const S: string): string;
@@ -419,6 +456,7 @@ var
   LPropName, LRenamedFrom, LBackField, LFieldType: string;
   LOtherName, LOtherRenamed: string;
   LAnyOptional: Boolean;
+  LAnyMap: Boolean;
   LGroups: TArray<string>;
 begin
   { Collision check first, so the diagnostic names the two proto fields rather
@@ -440,6 +478,35 @@ begin
           'case-insensitive, so the two would collide. Rename one of them.',
           [QuotedStr(LField.Name), QuotedStr(HasBitName(LPropName)),
            QuotedStr(LOther.Name)]);
+    end;
+  end;
+
+  { MAP-1. Same problem, five identifiers wide: a map field `m` also claims
+    MCount / HasM / GetM / SetM / ClearM. Checked here for the same reason -
+    the user wrote the .proto, not the Pascal, so the diagnostic has to be in
+    terms of the .proto. }
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    LField := AMsg.Fields[I];
+    if not LField.IsMap then Continue;
+    LPropName := CapFirst(PascalFieldName(LField.Name, LRenamedFrom));
+    for J := 0 to AMsg.Fields.Count - 1 do
+    begin
+      if J = I then Continue;
+      LOther     := AMsg.Fields[J];
+      LOtherName := PascalFieldName(LOther.Name, LOtherRenamed);
+      if SameText(LOtherName, LPropName + 'Count')
+        or SameText(LOtherName, 'Has'   + LPropName)
+        or SameText(LOtherName, 'Get'   + LPropName)
+        or SameText(LOtherName, 'Set'   + LPropName)
+        or SameText(LOtherName, 'Clear' + LPropName) then
+        raise EEmitError.CreateFmt(
+          'Field %s is a map, so the generator emits %sCount, Has%s, Get%s, ' +
+          'Set%s and Clear%s - but field %s already takes one of those names. '
+          + 'Pascal is case-insensitive, so the two would collide. Rename one '
+          + 'of them.',
+          [QuotedStr(LField.Name), LPropName, LPropName, LPropName, LPropName,
+           LPropName, QuotedStr(LOther.Name)]);
     end;
   end;
 
@@ -509,11 +576,20 @@ begin
     message class is responsible for freeing them in its destructor". protogen
     never emitted one, so every generated class with a message-typed field has
     leaked one instance per decode since codegen existed. }
-  if OwnsMessages(AMsg) or LAnyOptional then
+  LAnyMap := False;
+  for I := 0 to AMsg.Fields.Count - 1 do
+    if AMsg.Fields[I].IsMap then LAnyMap := True;
+
+  if OwnsMessages(AMsg) or LAnyOptional or LAnyMap then
     W('  public');
 
   if OwnsMessages(AMsg) then
     W('    destructor Destroy; override;');
+
+  { MAP-1 accessors sit beside the destructor: a map field is a repeated
+    submessage, so a message with one always owns instances too. }
+  if LAnyMap then
+    EmitMapAccessorDecls(AMsg);
 
   if LAnyOptional then
   begin
@@ -624,6 +700,7 @@ begin
       W;
     end;
     EmitOneofBodies(LMsg);
+    EmitMapAccessorBodies(LMsg);
     EmitDestructorBody(LMsg);
   end;
 end;
@@ -637,6 +714,143 @@ end;
 
   Only message-typed fields appear here. Scalars own nothing, enums own
   nothing, and a repeated SCALAR array is managed by the RTL. }
+{ MAP-1 declarations. The entry ARRAY stays the published property - it is
+  what goes on the wire, and anyone wanting ordered access iterates it. These
+  sit on top for the access pattern people actually want from a map.
+
+  Lookup is a LINEAR SCAN, stated plainly rather than hidden: proto maps are
+  typically small, and the alternative was a TDictionary the codec cannot
+  serialise without dragging libffi in. If a large map ever matters, the array
+  is public and a caller can build their own index. }
+procedure TMessagesEmitter.EmitMapAccessorDecls(AMsg: TProtoMessageNode);
+var
+  I: Integer;
+  LField: TProtoFieldNode;
+  LProp, LName, LRenamed, LK, LV: string;
+begin
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    LField := AMsg.Fields[I];
+    if not LField.IsMap then Continue;
+    LProp := PascalFieldName(LField.Name, LRenamed);
+    LName := CapFirst(LProp);       // the METHOD half; the FIELD stays F<prop>
+    LK    := MapKeyType(LField);
+    LV    := MapValueType(LField);
+    W('    function  ' + LName + 'Count: Integer;');
+    W('    function  Has' + LName + '(const AKey: ' + LK + '): Boolean;');
+    W('    function  Get' + LName + '(const AKey: ' + LK + '): ' + LV + ';');
+    W('    procedure Set' + LName + '(const AKey: ' + LK +
+      '; const AValue: ' + LV + ');');
+    W('    procedure Clear' + LName + ';');
+  end;
+end;
+
+procedure TMessagesEmitter.EmitMapAccessorBodies(AMsg: TProtoMessageNode);
+var
+  I: Integer;
+  LField: TProtoFieldNode;
+  LClass, LProp, LName, LRenamed, LK, LV, LEntryCls: string;
+  LOwnsValue: Boolean;
+begin
+  LClass := PascalTypeName(AMsg.QualifiedName);
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    LField := AMsg.Fields[I];
+    if not LField.IsMap then Continue;
+    LProp     := PascalFieldName(LField.Name, LRenamed);
+    LName     := CapFirst(LProp);   // must match EmitMapAccessorDecls exactly
+    LK        := MapKeyType(LField);
+    LV        := MapValueType(LField);
+    LEntryCls := PascalTypeName(LField.TypeName);
+    { A message-VALUED map owns an instance per entry, so Set has to dispose of
+      what it displaces. Read off the entry's own `value` field for the same
+      reason MapValueType is: one place says what the value is. }
+    LOwnsValue := IsMessageField(FFile.FindMessage(LField.TypeName).Fields[1]);
+
+    W('function ' + LClass + '.' + LName + 'Count: Integer;');
+    W('begin');
+    W('  Result := Length(F' + LProp + ');');
+    W('end;');
+    W;
+
+    W('function ' + LClass + '.Has' + LName +
+      '(const AKey: ' + LK + '): Boolean;');
+    W('var');
+    W('  I: Integer;');
+    W('begin');
+    W('  for I := 0 to High(F' + LProp + ') do');
+    W('    if F' + LProp + '[I].key = AKey then Exit(True);');
+    W('  Result := False;');
+    W('end;');
+    W;
+
+    { An absent key yields the VALUE TYPE'S DEFAULT, which is what proto3
+      itself says a missing map entry means - not an exception. Has<Field>
+      exists for callers who need to tell absent from present-and-default. }
+    W('function ' + LClass + '.Get' + LName +
+      '(const AKey: ' + LK + '): ' + LV + ';');
+    W('var');
+    W('  I: Integer;');
+    W('begin');
+    W('  for I := 0 to High(F' + LProp + ') do');
+    W('    if F' + LProp + '[I].key = AKey then Exit(F' + LProp + '[I].value);');
+    W('  Result := Default(' + LV + ');');
+    W('end;');
+    W;
+
+    { Replace-or-append, so a map cannot end up with duplicate keys through
+      this API. The wire CAN carry duplicates - a hostile or buggy peer may
+      send them - and decoding appends them as entries; last-wins lookup falls
+      out of the scan order. }
+    if LOwnsValue then
+    begin
+      W('{ Takes ownership of AValue: the entry frees it, as every other');
+      W('  message-typed field on a generated class is freed. Replacing an');
+      W('  existing key frees what was there - without that, an ordinary');
+      W('  overwrite would leak an instance per call. }');
+    end;
+    W('procedure ' + LClass + '.Set' + LName +
+      '(const AKey: ' + LK + '; const AValue: ' + LV + ');');
+    W('var');
+    W('  I: Integer;');
+    W('  LEntry: ' + LEntryCls + ';');
+    W('begin');
+    W('  for I := 0 to High(F' + LProp + ') do');
+    W('    if F' + LProp + '[I].key = AKey then');
+    W('    begin');
+    if LOwnsValue then
+    begin
+      { Guarded: Set(k, x) where x is ALREADY the stored instance must not free
+        it and then store a dangling pointer. }
+      W('      if F' + LProp + '[I].value <> AValue then');
+      W('        F' + LProp + '[I].value.Free;');
+    end;
+    W('      F' + LProp + '[I].value := AValue;');
+    W('      Exit;');
+    W('    end;');
+    W('  LEntry := ' + LEntryCls + '.Create;');
+    W('  LEntry.key   := AKey;');
+    W('  LEntry.value := AValue;');
+    W('  SetLength(F' + LProp + ', Length(F' + LProp + ') + 1);');
+    W('  F' + LProp + '[High(F' + LProp + ')] := LEntry;');
+    W('end;');
+    W;
+
+    { Frees the entries: they are owned here, same contract the destructor
+      answers. Emptying the array without freeing would leak exactly what
+      PROTOGEN-DTOR was added to stop leaking. }
+    W('procedure ' + LClass + '.Clear' + LName + ';');
+    W('var');
+    W('  I: Integer;');
+    W('begin');
+    W('  for I := 0 to High(F' + LProp + ') do');
+    W('    F' + LProp + '[I].Free;');
+    W('  SetLength(F' + LProp + ', 0);');
+    W('end;');
+    W;
+  end;
+end;
+
 procedure TMessagesEmitter.EmitDestructorBody(AMsg: TProtoMessageNode);
 var
   I: Integer;

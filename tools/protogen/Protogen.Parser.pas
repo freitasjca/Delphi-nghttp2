@@ -100,6 +100,7 @@ type
     procedure ParseField(AMsg: TProtoMessageNode; AFieldLabel: TProtoLabel;
       ALabelLine, ALabelCol: Integer; const AOneofName: string = '');
     procedure ParseOneof(AMsg: TProtoMessageNode);
+    procedure ParseMapField(AMsg: TProtoMessageNode);
     procedure ParseEnum(const AParentQualified: string = '');
     procedure ParseService;
     procedure ParseRpc(AService: TProtoServiceNode);
@@ -454,11 +455,10 @@ begin
       not", which is exactly what a has-bit says. }
     if IsIdent('oneof') then begin ParseOneof(AMsg); Continue; end;
 
-    if IsIdent('map') then
-      Refuse('map',
-        'A map field is encoded as a repeated entry submessage with key/value ' +
-        'fields, which needs a synthesised message type per map. Model it as ' +
-        'a repeated message with explicit key and value fields.');
+    // MAP-1. Was refused until protogen could synthesise the entry message.
+    // A proto3 map IS `repeated <Field>Entry` with key = 1 and value = 2 on
+    // the wire, so nothing below the parser needs a map concept.
+    if IsIdent('map') then begin ParseMapField(AMsg); Continue; end;
 
     { `optional` was refused until PRESENCE-1 gave the serializer a has-bit
       ([TProtoHas] on a read-only Boolean). It is now ACCEPTED and handled in
@@ -519,6 +519,143 @@ begin
     else
       ParseField(AMsg, plNone, LLine, LCol);
   end;
+end;
+
+{ Upper-cases the first character only, for building `<Field>Entry` from a
+  proto field name. Deliberately NOT shared with the emitter's CapFirst: this
+  one shapes a proto-level QUALIFIED NAME, the emitter's shapes Pascal
+  identifiers, and coupling them would mean a change to Pascal naming silently
+  altering the synthesised proto type name. }
+function CapitaliseFirst(const S: string): string;
+begin
+  Result := S;
+  if Result <> '' then
+    Result[1] := UpCase(Result[1]);
+end;
+
+// MAP-1. Parses `map<K, V> name = N;`.
+//
+// A proto3 map is DEFINED as sugar: the spec says it is equivalent to
+//
+//     message <Name>Entry { K key = 1; V value = 2; }
+//     repeated <Name>Entry <name> = N;
+//
+// so that is literally what this builds. The entry message is synthesised and
+// hoisted to file scope with a qualified name, exactly as a nested message
+// already is, and the field is added as an ordinary repeated message field.
+//
+// Everything downstream therefore needs NO map concept: the codec already
+// encodes repeated submessages, the emitter already emits them, and
+// PROTOGEN-DTOR already frees them. Only `IsMap` survives, and only so the
+// emitter can add dictionary accessors on top of the array.
+//
+// LINE comments: this text needs to show the entry message's braces, and a
+// closing brace inside a { } comment ends it early - Pascal brace comments do
+// not nest.
+procedure TProtoParser.ParseMapField(AMsg: TProtoMessageNode);
+var
+  LLine, LCol: Integer;
+  LKeyType, LValType, LName: string;
+  LKeyScalar, LValScalar: TProtoScalar;
+  LEntry: TProtoMessageNode;
+  LKeyField, LValField, LMapField: TProtoFieldNode;
+  LNumber: Integer;
+  LExisting: TProtoFieldNode;
+begin
+  LLine := Tok.Line;
+  LCol  := Tok.Column;
+  NextTok;                            // consume 'map'
+
+  ExpectSymbol('<');
+  LKeyType := ExpectIdent;
+  LKeyScalar := ScalarFromKeyword(LKeyType);
+  ExpectSymbol(',');
+  LValType := ExpectQualifiedIdent;
+  LValScalar := ScalarFromKeyword(LValType);
+  ExpectSymbol('>');
+
+  LName := ExpectIdent;
+  ExpectSymbol('=');
+  LNumber := ExpectNumber;
+
+  { proto3 restricts map KEYS to integral and string types - no float, no
+    bytes, no enum, no message. Enforced rather than assumed, because an
+    unsupported key would otherwise reach the emitter and produce a Pascal
+    comparison that either fails to compile or compares the wrong thing. }
+  if not (LKeyScalar in [psInt32, psInt64, psUInt32, psUInt64, psBool,
+                         psString]) then
+    RefuseAt(LLine, LCol, 'map key ' + LKeyType,
+      Format('Map %s has key type %s. proto3 allows only integral and string '
+             + 'map keys - not floating-point, bytes, enum or message types.',
+        [QuotedStr(LName), LKeyType]));
+
+  { Group B is refused everywhere else; a map key or value must not be a way
+    around that. CheckScalarSupported names the construct and explains. }
+  CheckScalarSupported(LKeyScalar, LName + ' (map key)', LLine, LCol);
+  CheckScalarSupported(LValScalar, LName + ' (map value)', LLine, LCol);
+  if LValScalar = psNone then
+    CheckTypeNameSupported(LValType, LName + ' (map value)', LLine, LCol);
+
+  if LNumber <= 0 then
+    RefuseAt(LLine, LCol, IntToStr(LNumber),
+      Format('Map %s has number %d. Proto field numbers start at 1.',
+        [QuotedStr(LName), LNumber]));
+  if (LNumber >= 19000) and (LNumber <= 19999) then
+    RefuseAt(LLine, LCol, IntToStr(LNumber),
+      Format('Map %s uses number %d, inside the 19000-19999 range reserved '
+             + 'by protobuf itself.', [QuotedStr(LName), LNumber]));
+
+  LExisting := AMsg.FindByNumber(LNumber);
+  if LExisting <> nil then
+    RefuseAt(LLine, LCol, IntToStr(LNumber),
+      Format('Map %s reuses number %d, already taken by %s on line %d.',
+        [QuotedStr(LName), LNumber, QuotedStr(LExisting.Name),
+         LExisting.Line]));
+
+  if IsSymbol('[') then
+    SkipFieldOptions;
+  ExpectSymbol(';');
+
+  { The synthesised entry message. Named <Message>.<Field>Entry and hoisted,
+    which is the same shape a nested message gets - so PascalTypeName turns it
+    into TMessageFieldEntry with no new naming rule, and two maps in different
+    messages cannot collide. }
+  LEntry := TProtoMessageNode.Create;
+  LEntry.Name          := CapitaliseFirst(LName) + 'Entry';
+  LEntry.QualifiedName := AMsg.QualifiedName + '.' + LEntry.Name;
+  LEntry.Line          := LLine;
+
+  LKeyField := TProtoFieldNode.Create;
+  LKeyField.Name     := 'key';
+  LKeyField.TypeName := LKeyType;
+  LKeyField.Scalar   := LKeyScalar;
+  LKeyField.Number   := 1;
+  LKeyField.Line     := LLine;
+  LKeyField.Column   := LCol;
+  LEntry.Fields.Add(LKeyField);
+
+  LValField := TProtoFieldNode.Create;
+  LValField.Name     := 'value';
+  LValField.TypeName := LValType;
+  LValField.Scalar   := LValScalar;
+  LValField.Number   := 2;
+  LValField.Line     := LLine;
+  LValField.Column   := LCol;
+  LEntry.Fields.Add(LValField);
+
+  FFile.Messages.Add(LEntry);
+
+  // The field itself: an ordinary repeated message field, flagged as a map.
+  LMapField := TProtoFieldNode.Create;
+  LMapField.Name       := LName;
+  LMapField.TypeName   := LEntry.QualifiedName;
+  LMapField.Scalar     := psNone;
+  LMapField.FieldLabel := plRepeated;
+  LMapField.Number     := LNumber;
+  LMapField.Line       := LLine;
+  LMapField.Column     := LCol;
+  LMapField.IsMap      := True;
+  AMsg.Fields.Add(LMapField);
 end;
 
 // ONEOF-1. Parses a `oneof` block, hoisting each member into the message's
@@ -609,12 +746,14 @@ begin
   LTypeLine := Tok.Line;
   LTypeCol  := Tok.Column;
 
-  // A map field can also appear as `map<k,v> name = n;` — catch it here too,
-  // since the body loop only sees `map` when it is the first token.
+  { MAP-1. A map reaching ParseField means it followed a LABEL — `repeated
+    map<...>` or `optional map<...>` — since the body loop routes a leading
+    `map` to ParseMapField. Both are illegal proto3: a map is already
+    repeated, and it has no presence to add. }
   if IsIdent('map') then
-    Refuse('map',
-      'A map field needs a synthesised entry message per map. Model it as a ' +
-      'repeated message with explicit key and value fields.');
+    Refuse('labelled map',
+      'A map field cannot carry `repeated` or `optional`. A map is already a '
+      + 'repeated entry list, and has no presence to express. Drop the label.');
 
   LTypeName := ExpectQualifiedIdent;
   LScalar   := ScalarFromKeyword(LTypeName);

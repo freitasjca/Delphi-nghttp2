@@ -172,9 +172,14 @@ if [[ $ERR -gt 0 ]]; then
 fi
 
 echo
-echo "Baseline to compare against: 3782/7300 = 51% accepted"
-echo "(2026-08-30, after nested flattening; BEFORE WKT bundling,"
-echo " PRESENCE-1 optional and ONEOF-1 all landed)."
+echo "Baselines to compare against (googleapis, ~7300 files):"
+echo "  51%  2026-08-30  after nested flattening"
+echo "  85%  2026-09-05  after WKT bundling + PRESENCE-1 + ONEOF-1"
+echo "  94%  2026-09-06  after MAP-1"
+echo
+echo "These are RECORDED RESULTS, not targets - update the list when a"
+echo "stage legitimately moves it, so a regression shows as a drop rather"
+echo "than as agreement with a number nobody has re-earned."
 
 # Exit non-zero only on things that are actually wrong. A gap is a finding, not
 # a failure - same rule the conformance probe uses.

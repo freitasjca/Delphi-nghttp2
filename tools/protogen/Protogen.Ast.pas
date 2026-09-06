@@ -62,6 +62,19 @@ type
       codec change at all, only generated setters that clear their siblings. }
     OneofName:  string;
 
+    { MAP-1. True when this field came from `map<K,V>`.
+
+      By the time it reaches here it IS an ordinary `repeated <Entry>` field —
+      that is precisely what a proto3 map is on the wire, so the parser
+      synthesises the entry message and rewrites the field, and nothing
+      downstream needs a map concept to encode it.
+
+      The flag exists only so the EMITTER knows to add dictionary accessors on
+      top. Key and value types are not stored: the entry message has them, as
+      field 1 and field 2, and reading them from there means the two can never
+      disagree. }
+    IsMap:      Boolean;
+
     function IsRepeated: Boolean;
     function InOneof: Boolean;
   end;

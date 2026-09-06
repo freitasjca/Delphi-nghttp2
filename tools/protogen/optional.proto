@@ -90,6 +90,33 @@ message OwnerMsg {
   repeated Payload many     = 3;   // one owned instance PER ELEMENT
 }
 
+// MAP-1. A proto3 map has NO wire format of its own: it is exactly a repeated
+// message field whose element type is a synthesised `<Field>Entry` with
+// key = 1 and value = 2. The parser builds that entry; the codec was already
+// able to carry repeated submessages; so the only new code is the generated
+// dictionary accessors, and this is what puts them in front of a compiler.
+//
+// Three maps, each for a reason the others cannot cover:
+//
+//   counts  string key, scalar value - the ordinary case, and the one where
+//           replace-or-append is easiest to check.
+//   items   MESSAGE value. The entry OWNS an instance, so this is the only
+//           field here that can leak or double-free: Set must dispose of what
+//           it displaces, Clear must free the entries, and the destructor must
+//           free whatever survives to it.
+//   flags   bool key. Boolean is tkEnumeration on Delphi and tkBool on FPC -
+//           the one key type whose RTTI differs by compiler - and `= AKey` on
+//           a Boolean is where a comparison written for integers would show.
+//
+// `tag` sits alongside as the control: a plain field must be unaffected by
+// any of it.
+message MapMsg {
+  int32               tag    = 1;
+  map<string, int32>  counts = 2;
+  map<int32, Payload> items  = 3;
+  map<bool, string>   flags  = 4;
+}
+
 message OneofMsg {
   int32 before = 1;
 

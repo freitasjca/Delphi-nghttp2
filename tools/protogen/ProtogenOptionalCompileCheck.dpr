@@ -93,6 +93,8 @@ var
   GMsg, GDst: TOptMsg;
   GOne, GOneDst: TOneofMsg;      // ONEOF-1
   GOwn, GOwnDst: TOwnerMsg;      // PROTOGEN-DTOR
+  GMap, GMapDst: TMapMsg;        // MAP-1
+  GPay: TPayload;
   GPayloads: TArray<TPayload>;
   GBytes: TBytes;
   GOk: Boolean;
@@ -424,6 +426,178 @@ begin
   end;
   Check('repeated submessage: every element freed, no double-free',
         GOk, GErr);
+
+  // ── MAP-1 · the generated dictionary accessors ───────────────────────────
+  //  A map is a repeated synthesised-entry message on the wire, so the codec
+  //  needed no change at all. What is new is the five generated methods per
+  //  map field, and they are only ever exercised here - the emitter tests
+  //  compare their TEXT, which cannot tell a linear scan that returns the
+  //  wrong element from one that does not.
+  WriteLn;
+  WriteLn('-- MAP-1: generated map accessors');
+
+  GOk  := False;
+  GErr := '';
+  GMap := TMapMsg.Create;
+  try
+    try
+      TProtoSerializer.Serialize(GMap);
+      GOk := True;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+  finally
+    GMap.Free;
+  end;
+  Check('generated map class + entry classes are ACCEPTED by the RTTI layer',
+        GOk, GErr);
+
+  if GOk then
+  begin
+    GMap := TMapMsg.Create;
+    try
+      Check('fresh map is empty',            GMap.countsCount = 0);
+      Check('empty map emits nothing',       not EmitsTag(GMap, 2));
+      { An absent key is the value type's ZERO, which is what proto3 says a
+        missing entry means. Asserted because raising instead would be a
+        defensible-looking choice that silently diverges from the spec. }
+      Check('absent key reads as the value default',
+        GMap.GetCounts('nothing here') = 0);
+      Check('absent key is reported absent', not GMap.HasCounts('nothing'));
+    finally
+      GMap.Free;
+    end;
+
+    GMap := TMapMsg.Create;
+    try
+      GMap.SetCounts('a', 1);
+      GMap.SetCounts('b', 2);
+      Check('two keys give two entries',  GMap.countsCount = 2);
+      Check('first key reads back',       GMap.GetCounts('a') = 1);
+      Check('second key reads back',      GMap.GetCounts('b') = 2);
+      Check('a present key is reported present', GMap.HasCounts('b'));
+
+      { Replace-or-append. An append-only Set passes every check above and
+        still corrupts the map, by putting a duplicate key on the wire. }
+      GMap.SetCounts('a', 99);
+      Check('re-setting a key REPLACES rather than appends',
+        GMap.countsCount = 2);
+      Check('the replaced value is the new one', GMap.GetCounts('a') = 99);
+
+      Check('a populated map IS emitted', EmitsTag(GMap, 2));
+
+      GMap.ClearCounts;
+      Check('ClearCounts empties the map', GMap.countsCount = 0);
+      Check('a cleared map emits nothing', not EmitsTag(GMap, 2));
+    finally
+      GMap.Free;
+    end;
+
+    { Boolean key. Both values used on purpose: `if entry.key = AKey` compiled
+      for the wrong type, or a scan that stopped at the first entry, would
+      still answer True for one of them. }
+    GMap := TMapMsg.Create;
+    try
+      GMap.SetFlags(True,  'yes');
+      GMap.SetFlags(False, 'no');
+      Check('bool key: two distinct entries', GMap.flagsCount = 2);
+      Check('bool key True reads back',  GMap.GetFlags(True)  = 'yes');
+      Check('bool key False reads back', GMap.GetFlags(False) = 'no');
+    finally
+      GMap.Free;
+    end;
+
+    { CANONICAL-1 meets MAP-1. An entry whose key AND value are both at their
+      default encodes as a ZERO-LENGTH submessage - every inner field is
+      omitted - but the ENTRY itself must still go on the wire, because a
+      repeated element is always emitted. protoc does exactly this; dropping
+      the entry would silently lose a key. }
+    GMap    := TMapMsg.Create;
+    GMapDst := TMapMsg.Create;
+    try
+      GMap.SetCounts('', 0);
+      Check('an all-default entry is still emitted', EmitsTag(GMap, 2));
+      GBytes := TProtoSerializer.Serialize(GMap);
+      TProtoSerializer.Deserialize(GBytes, GMapDst);
+      Check('round-trip: the all-default entry survives',
+        GMapDst.countsCount = 1);
+      Check('round-trip: its key is the empty string', GMapDst.HasCounts(''));
+    finally
+      GMap.Free;
+      GMapDst.Free;
+    end;
+
+    // ordinary round trip
+    GMap    := TMapMsg.Create;
+    GMapDst := TMapMsg.Create;
+    try
+      GMap.tag := 4;
+      GMap.SetCounts('x', 10);
+      GMap.SetCounts('y', 20);
+      GBytes := TProtoSerializer.Serialize(GMap);
+      TProtoSerializer.Deserialize(GBytes, GMapDst);
+      Check('round-trip: entry count survives', GMapDst.countsCount = 2);
+      Check('round-trip: values survive by key',
+        (GMapDst.GetCounts('x') = 10) and (GMapDst.GetCounts('y') = 20));
+      Check('round-trip: the plain field beside the map is untouched',
+        GMapDst.tag = 4);
+    finally
+      GMap.Free;
+      GMapDst.Free;
+    end;
+
+    { Message-VALUED map - the only shape here that owns heap. Three separate
+      ways to get it wrong, and all three are fatal rather than silent:
+      Set leaking the displaced instance, Set freeing an instance it then
+      stores, and the destructor missing the entries entirely. }
+    GOk  := False;
+    GErr := '';
+    try
+      GMap := TMapMsg.Create;
+      try
+        GPay := TPayload.Create;
+        GPay.id := 11;
+        GMap.SetItems(1, GPay);       // map takes ownership
+        Check('message-valued map stores the instance',
+          GMap.GetItems(1).id = 11);
+
+        { Replace. The displaced TPayload is freed by Set; if it were not,
+          this is a leak, and if the guard against self-assignment were
+          missing the NEXT read would touch freed memory. }
+        GPay := TPayload.Create;
+        GPay.id := 22;
+        GMap.SetItems(1, GPay);
+        Check('replacing a message value keeps one entry',
+          GMap.itemsCount = 1);
+        Check('replacing a message value yields the new instance',
+          GMap.GetItems(1).id = 22);
+
+        { Self-assignment: Set(k, GetItems(k)). Without the <> guard this
+          frees the instance and then stores the dangling pointer. }
+        GMap.SetItems(1, GMap.GetItems(1));
+        Check('re-setting a key to its OWN value does not free it',
+          GMap.GetItems(1).id = 22);
+
+        Check('absent message key reads as nil', GMap.GetItems(999) = nil);
+        GBytes := TProtoSerializer.Serialize(GMap);
+      finally
+        GMap.Free;      // frees the entry, which frees the TPayload
+      end;
+
+      GMapDst := TMapMsg.Create;
+      try
+        TProtoSerializer.Deserialize(GBytes, GMapDst);
+        GOk := (GMapDst.itemsCount = 1) and (GMapDst.GetItems(1) <> nil)
+               and (GMapDst.GetItems(1).id = 22);
+      finally
+        GMapDst.Free;   // frees the codec-allocated entry AND its payload
+      end;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+    Check('message-valued map round-trips and frees without double-free',
+          GOk, GErr);
+  end;
 
   WriteLn;
   WriteLn(Format('[ProtogenOptional] %d passed, %d failed', [GPass, GFail]));

@@ -6,6 +6,7 @@
 #  reason and the same -Fu list, which is why it all shares one script.
 #
 #  Stages:
+#    0  brace-scan.py                   lint          (advisory)
 #    1  Nghttp2ProtobufTests            build + run   (gates)
 #    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
 #    2b Nghttp2GrpcFramingTests         build + run   (gates; gRPC length-prefix
@@ -133,6 +134,28 @@ echo
 
 mkdir -p "$OUT"
 rm -f "$OUT"/*.ppu "$OUT"/*.o 2>/dev/null || true
+
+# ── 0 · brace-comment scan (runs before anything compiles) ──────────────────
+# A { } comment containing a `}` ends THERE, and the compiler then reports a
+# syntax error somewhere below it - at a line and column that belong to no
+# visible statement. Twice now that distance between cause and symptom has
+# cost a full build cycle to diagnose, so it is checked in under a second
+# rather than after two minutes of compiling.
+#
+# Advisory, not a gate: it is a lint over comments, and a build should not be
+# blocked by one. The compile that follows is the gate.
+if command -v python3 > /dev/null 2>&1 && [[ -f "$HERE/brace-scan.py" ]]; then
+  BRACE_FILES=$(find "$HERE/.." -name '*.pas' -o -name '*.dpr' | sort)
+  if [[ -n "$BRACE_FILES" ]]; then
+    BRACE_OUT=$(python3 "$HERE/brace-scan.py" $BRACE_FILES 2>&1)
+    if [[ "$BRACE_OUT" != *", 0 problem(s)"* ]]; then
+      echo "── brace-comment scan ─────────────────────────────────────────────"
+      echo "$BRACE_OUT" | sed 's/^/  /'
+      echo "  (advisory - the compile below is the gate)"
+      echo
+    fi
+  fi
+fi
 
 # -FU sends units to their own directory. Without it a stale .ppu built with
 # different defines is silently reused — FPC compares timestamps, not the
@@ -694,6 +717,13 @@ if [[ -f "$PROTOGEN/Protogen.dpr" ]]; then
   PBOUT="$OUT/protogen-bin"
   mkdir -p "$PBOUT"
   rm -f "$PBOUT"/*.ppu "$PBOUT"/*.o 2>/dev/null || true
+  # And the BINARY. A failed compile leaves the previous run's Protogen in
+  # place, and stages 12/12b gate only on `-x $PBOUT/Protogen` - so they would
+  # generate with a stale generator and report on code the current sources
+  # cannot even produce. Observed 2026-09-06: a parse error in
+  # Protogen.Parser.pas failed this stage, and C6b then refused a map using
+  # the message the previous build had compiled in.
+  rm -f "$PBOUT/Protogen" 2>/dev/null || true
   if "$TRUNK" -MDelphi -O1 \
        -FU"$PBOUT" -FE"$PBOUT" \
        -Fu"$PROTOGEN" \

@@ -201,9 +201,24 @@ $HDR
 message M { fixed32 v = 1; }
 EOF
 
-add_case map      refuse "Group C - needs a synthesised entry message" <<EOF
+# Was `refuse` until MAP-1. A proto3 map IS a synthesised entry message plus a
+# repeated field - the spec defines it that way - so the parser now builds
+# exactly that. Now an `ok` row.
+add_case map      accept "MAP-1 - synthesised <Field>Entry + repeated" <<EOF
 $HDR
 message M { map<string, int32> m = 1; }
+EOF
+
+# protoc refuses these too: a map is already repeated, and proto3 restricts
+# map keys to integral and string types.
+add_case map_labelled refuse "a map cannot also be repeated" <<EOF
+$HDR
+message M { repeated map<string, int32> m = 1; }
+EOF
+
+add_case map_float_key refuse "map keys are integral or string only" <<EOF
+$HDR
+message M { map<double, int32> m = 1; }
 EOF
 
 # Was `refuse` until ONEOF-1. A oneof has no wire framing of its own - each
@@ -263,7 +278,19 @@ message M {
 }
 EOF
 
-add_case wellknown_blocked refuse "Struct needs oneof - still refused" <<EOF
+# The stated reason has changed twice, so it is spelled out rather than left as
+# a shorthand that goes stale again. Struct is
+#
+#   Struct    { map<string, Value> fields = 1; }
+#   Value     { oneof kind { ... Struct struct_value = 5; ListValue ... } }
+#   ListValue { repeated Value values = 1; }
+#
+# oneof stopped being the blocker at ONEOF-1 and map stopped being one at
+# MAP-1. What still blocks it is (a) MESSAGE members inside a oneof - clearing
+# one means freeing it, which the generated group Clear does not do - and
+# (b) Struct and Value refer to each other, and the emitter writes classes in
+# declaration order with no forward declarations. Neither is about Struct.
+add_case wellknown_blocked refuse "needs oneof MESSAGE members + mutual recursion" <<EOF
 $HDR
 import "google/protobuf/struct.proto";
 message M { google.protobuf.Struct s = 1; }
