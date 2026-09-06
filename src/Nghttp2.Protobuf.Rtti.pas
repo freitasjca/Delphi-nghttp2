@@ -694,6 +694,42 @@ end;
 
 // ── TProtoSerializer ─────────────────────────────────────────────────────────
 
+{ CANONICAL-1. Is this singular value the proto3 default for its kind?
+
+  Only ever consulted for IMPLICIT-presence fields. A field with a has-bit
+  answers the emission question from the bit instead, precisely so that
+  "set to zero" stays distinguishable from "not set" — asking this function
+  about such a field would collapse that distinction again.
+
+  Repeated and submessage fields never reach here: an empty array and a nil
+  submessage are already skipped by their own branches above, which is the
+  same rule expressed where it belongs. }
+function IsDefaultValue(AKind: TProtoFieldKind; const AValue: TValue): Boolean;
+begin
+  case AKind of
+    pkInt32:  Result := AValue.AsInteger = 0;
+    pkInt64:  Result := AValue.AsInt64 = 0;
+    { AsOrdinal, not AsInteger — the FIX-PROTO-UINT32-1 lesson. A Cardinal
+      above MaxInt read through AsInteger comes back negative, which is not
+      zero either, so this particular test would still answer correctly; the
+      accessor is kept consistent so nobody has to re-derive that. }
+    pkUInt32: Result := AValue.AsOrdinal = 0;
+    pkUInt64: Result := AValue.AsType<UInt64> = 0;
+    pkBool:   Result := not AValue.AsBoolean;
+    pkString: Result := AValue.AsString = '';
+    pkBytes:  Result := Length(AValue.AsType<TBytes>) = 0;
+    pkFloat:  Result := AValue.AsType<Single> = 0;
+    pkDouble: Result := AValue.AsType<Double> = 0;
+    pkEnum:   Result := AValue.AsOrdinal = 0;
+  else
+    { pkSubmessage and anything added later: NOT default, so it is emitted.
+      Erring toward emitting keeps an unforeseen kind on the wire rather than
+      silently dropping it — a missing field is far harder to notice than a
+      redundant one. }
+    Result := False;
+  end;
+end;
+
 { proto3 packs repeated NUMERIC scalars by default: one LEN record holding the
   concatenated values, no per-element tag. string / bytes / submessage cannot
   be packed — their encodings are already length-delimited, so packing would be
@@ -827,16 +863,32 @@ begin
         Continue;
       end;
 
-      { PRESENCE-1 — proto3 `optional`. With a has-bit the field is emitted
-        only when it was actually set, which is what makes "set to zero"
-        distinguishable from "not set". Without one the field has IMPLICIT
-        presence and is emitted unconditionally, exactly as before — so this
-        clause changes nothing for any existing message.
+      { Presence decides emission, and the two kinds are mutually exclusive.
+
+        EXPLICIT (PRESENCE-1, a has-bit): emit iff the bit is raised. The
+        VALUE is irrelevant — that is the entire point, since a field set to
+        zero must go on the wire while an unset one must not.
 
         Read through RTTI rather than cached at discovery: the bit is per
         INSTANCE, while TProtoFieldInfo is per class. }
-      if (LField.HasBitProp <> nil)
-         and (not LField.HasBitProp.GetValue(AObj).AsBoolean) then
+      if LField.HasBitProp <> nil then
+      begin
+        if not LField.HasBitProp.GetValue(AObj).AsBoolean then
+          Continue;
+      end
+      { IMPLICIT (CANONICAL-1, the proto3 default): omit a field holding its
+        type's default value. This is what proto3 specifies, and what every
+        other implementation does; until now this codec emitted them, which
+        is the DEVIATES rows in the conformance probe.
+
+        Wire-compatible in both directions: a conforming decoder fills an
+        absent field with its default, so a peer reads the same value it
+        read before, from fewer bytes.
+
+        Floats compare against zero, so -0.0 is omitted and returns as +0.0.
+        That matches protobuf, which tests `value != 0` for implicit presence
+        and therefore drops negative zero too. }
+      else if IsDefaultValue(LField.Kind, LValue) then
         Continue;
 
       case LField.Kind of
@@ -911,6 +963,29 @@ begin
   end;
 end;
 
+{ MERGE semantics, not parse-from-scratch — protobuf's MergeFromString rather
+  than ParseFromString. Only fields PRESENT on the wire are written; anything
+  absent is left exactly as it was, and repeated fields ACCUMULATE.
+
+  So AObj should normally be a fresh instance. Every path in this library
+  already does that (the gRPC dispatcher and TGrpcStreamReader both construct
+  per message), and a caller wanting parse-from-scratch does the same.
+
+  Why not clear first, which would make this ParseFromString? Because a
+  has-bit field CANNOT be cleared from outside the class. PRESENCE-1 makes the
+  has-bit read-only on purpose, so SetValue on it fails; and writing the VALUE
+  goes through the setter, which RAISES the bit — the exact opposite of
+  clearing. The only route is a generated Clear<Field> method, which protogen
+  emits but a hand-written class need not have. The design that makes presence
+  impossible to desync also makes it impossible to reset generically.
+
+  This matters more since CANONICAL-1 than it did before, and the reason is
+  worth stating: a default-valued field is now ABSENT from the wire, so
+  merging an all-default message into a populated target leaves the old values
+  in place where it used to overwrite them with zeros. That hazard is not new
+  — it is what talking to any conforming peer (Python, Go, C++) has always
+  done, since they have always omitted defaults. Our own non-canonical output
+  merely used to mask it whenever both ends were this library. }
 class procedure TProtoSerializer.Deserialize(const AData: TBytes; AObj: TObject);
 begin
   { The counter is incremented BEFORE the test so that the outermost call sees

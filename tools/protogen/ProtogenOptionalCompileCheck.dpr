@@ -137,8 +137,17 @@ begin
     Check('unset optional string is not emitted',   not EmitsTag(GMsg, 3));
     Check('unset optional bool is not emitted',     not EmitsTag(GMsg, 4));
     Check('unset optional enum is not emitted',     not EmitsTag(GMsg, 5));
-    Check('implicit-presence field IS emitted',     EmitsTag(GMsg, 1));
     Check('empty repeated field is not emitted',    not EmitsTag(GMsg, 6));
+
+    { CANONICAL-1: an implicit-presence field at its DEFAULT is now omitted
+      too. This check asserted the opposite until CANONICAL-1, because it
+      left `plain` at 0 - the pre-canonical behaviour. }
+    Check('implicit-presence field at its DEFAULT is omitted',
+      not EmitsTag(GMsg, 1));
+
+    GMsg.plain := 5;
+    Check('implicit-presence field with a VALUE is emitted',
+      EmitsTag(GMsg, 1));
   finally
     GMsg.Free;
   end;
@@ -234,6 +243,12 @@ begin
       Check('unset members emit nothing',
         (not EmitsTag(GOne, 2)) and (not EmitsTag(GOne, 3))
         and (not EmitsTag(GOne, 4)));
+
+      { Non-default on purpose - since CANONICAL-1 a plain field at its
+        default is omitted like anything else, so leaving `before` at 0 would
+        assert pre-canonical behaviour. The point being made is that a oneof
+        group does not disturb the ordinary fields around it. }
+      GOne.before := 5;
       Check('a plain field beside the group still emits', EmitsTag(GOne, 1));
     finally
       GOne.Free;

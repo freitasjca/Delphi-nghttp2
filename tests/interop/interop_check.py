@@ -27,12 +27,22 @@ HOW IT WORKS
 The filename prefix names the message type, and the Pascal side dispatches on
 it: `s-` is Scalars, `c-` is Composite.
 
-Values are compared, not bytes, and that is deliberate. Our encoder emits
-default-valued scalars (the `DEVIATES` rows in the conformance probe) where
-canonical proto3 omits them. That is non-canonical but perfectly decodable —
-a peer reads the same value either way. Comparing bytes would fail on a known,
-benign difference and hide the real question, which is whether any VALUE
-changes crossing the boundary.
+Values are compared, not bytes, and that is deliberate.
+
+The original reason was that our encoder emitted default-valued scalars where
+canonical proto3 omits them — non-canonical but perfectly decodable, so a byte
+compare would have failed on a known-benign difference and hidden the real
+question. CANONICAL-1 has since removed that deviation, so for these scalar
+cases our bytes should now match Python's.
+
+The comparison stays on VALUES regardless, and not from inertia: what this
+file exists to catch is a peer reading a DIFFERENT VALUE from our bytes, which
+is exactly what FIX-PROTO-UINT32-1 did. Byte equality is a stricter condition
+that would also fail on differences nobody would care about, and a test that
+fails for uninteresting reasons gets relaxed or ignored rather than fixed. Two
+deviations also remain — zigzag and fixed-width, both structural in
+TProtoMemberAttribute — which a byte compare would trip over if those types
+were ever exercised here.
 
 C6c DEPTH — what the Composite cases add
 ----------------------------------------
@@ -92,7 +102,12 @@ import struct
 import subprocess
 import sys
 
-from google.protobuf import text_format
+# NOTE: google.protobuf is imported LAZILY, never at module level. The rest of
+# this file already follows that rule — generate_module() imports the generated
+# interop_pb2 only after putting it on sys.path — and breaking it costs more
+# than it looks: a top-level import makes the script die before argparse runs,
+# so `--help` fails and a missing dependency reports itself as a traceback from
+# line 1 rather than as the missing dependency it is.
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -319,6 +334,11 @@ def _fmt(value):
     silently disappears, which is the one half you need. text_format's
     as_one_line does the job properly for messages; lists of messages need it
     applied per element."""
+    # Imported here, not at module scope — see the note beside the imports.
+    # Only reached on a diff, so the repeated lookup costs nothing on the
+    # happy path and Python caches the module anyway.
+    from google.protobuf import text_format
+
     if hasattr(value, "DESCRIPTOR"):
         return "{%s}" % text_format.MessageToString(value, as_one_line=True)
     if isinstance(value, list):

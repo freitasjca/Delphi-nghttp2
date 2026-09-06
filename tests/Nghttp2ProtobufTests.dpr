@@ -468,19 +468,51 @@ var
   LSrc, LDst: TUserMessage;
   LBytes: TBytes;
 begin
-  Section('05  RTTI serializer - all-default (proto3 zero-value) round-trip');
+  Section('05  all-default message: canonical encoding + MERGE semantics');
   LSrc := TUserMessage.Create;
   LDst := TUserMessage.Create;
   try
     // Leave all fields at Pascal default (0 / '' / False).
     LBytes := TProtoSerializer.Serialize(LSrc);
-    // Proto3 default values MAY be omitted; we currently emit them, so the
-    // buffer isn't empty - but the sizes are small and it round-trips fine.
-    Check('serialize succeeds on default-valued instance', True,
+
+    { CANONICAL-1. Every field holds its proto3 default, so a canonical
+      encoder emits NOTHING. This used to be 8 bytes of tag+zero pairs. }
+    Check('all-default instance serialises to ZERO bytes',
+      Length(LBytes) = 0,
       IntToStr(Length(LBytes)) + ' bytes: ' + BytesToHex(LBytes));
 
-    // Pre-populate LDst so we can prove Deserialize overwrites with the
-    // zero-values sent over the wire.
+    // Into a FRESH target - the normal case, and what every path in this
+    // library actually does.
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('fresh target decodes to defaults',
+      (LDst.id = 0) and (LDst.name = '') and (not LDst.active)
+      and (LDst.balance = 0));
+  finally
+    LSrc.Free;
+    LDst.Free;
+  end;
+
+  { The other half, and this test USED to assert the opposite.
+
+    It pre-populated the target and checked that an all-default message
+    overwrote it with zeros - which passed only because we emitted those
+    zeros. Now they are absent from the wire, so nothing overwrites, and the
+    old values remain.
+
+    That is MERGE semantics (protobuf's MergeFromString), which is what
+    Deserialize has always implemented; the non-canonical output merely hid
+    it. It cannot be changed to clear-first either: PRESENCE-1 makes has-bits
+    read-only, so a has-bit field cannot be reset from outside its class.
+
+    Asserted rather than deleted, because leaving it untested would make the
+    contract discoverable only by being bitten by it. Note this is also
+    exactly what talking to Python/Go/C++ has always done - they have always
+    omitted defaults. }
+  LSrc := TUserMessage.Create;
+  LDst := TUserMessage.Create;
+  try
+    LBytes := TProtoSerializer.Serialize(LSrc);   // zero bytes
+
     LDst.id      := 999;
     LDst.name    := 'GARBAGE';
     LDst.active  := True;
@@ -488,10 +520,22 @@ begin
 
     TProtoSerializer.Deserialize(LBytes, LDst);
 
-    Check('empty-message overwrites id to 0',        LDst.id = 0);
-    Check('empty-message overwrites name to ""',     LDst.name = '');
-    Check('empty-message overwrites active to False', LDst.active = False);
-    Check('empty-message overwrites balance to 0',    LDst.balance = 0);
+    Check('MERGE: absent fields leave a populated target untouched',
+      (LDst.id = 999) and (LDst.name = 'GARBAGE') and LDst.active
+      and (LDst.balance = 999),
+      'Deserialize is MergeFromString, not ParseFromString - pass a fresh '
+      + 'instance if you want parse-from-scratch');
+
+    { The control that keeps the above honest: a field PRESENT on the wire
+      must still overwrite. Without this, the assertion above would also pass
+      if Deserialize had silently stopped writing anything at all. }
+    LSrc.id := 7;
+    LBytes := TProtoSerializer.Serialize(LSrc);
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('MERGE: a field PRESENT on the wire still overwrites',
+      LDst.id = 7);
+    Check('MERGE: and the others are still left alone',
+      LDst.name = 'GARBAGE');
   finally
     LSrc.Free;
     LDst.Free;
@@ -611,18 +655,24 @@ begin
     // Leave name, active, balance at defaults.
     LBytes := TProtoSerializer.Serialize(LSrc);
 
-    // Expected byte sequence (tags emitted in sort order: 1, 2, 3, 5):
-    //   [08 01]        tag 1 varint = 1
-    //   [12 00]        tag 2 LEN, length 0 (empty string)
-    //   [18 00]        tag 3 varint = 0 (False)
-    //   [28 00]        tag 5 varint = 0
-    SetLength(LExpected, 8);
-    LExpected[0] := $08; LExpected[1] := $01;
-    LExpected[2] := $12; LExpected[3] := $00;
-    LExpected[4] := $18; LExpected[5] := $00;
-    LExpected[6] := $28; LExpected[7] := $00;
+    { CANONICAL-1 changed this, and the change IS the feature.
+      Before: 8 bytes - every field emitted, defaults included.
+        [08 01] tag 1 = 1
+        [12 00] tag 2 LEN 0   (empty string)
+        [18 00] tag 3 = 0     (False)
+        [28 00] tag 5 = 0
+      Now: 2 bytes. Only the non-default field goes on the wire, which is
+      what proto3 specifies and what every other implementation emits. A
+      conforming decoder fills the three absent fields with their defaults,
+      so the peer reads exactly what it read before from a quarter of the
+      bytes.
 
-    Check('bytes match expected encoding',
+      This assertion is the byte-exact proof of the fix - the conformance
+      probe reports it, but only this compares against a literal. }
+    SetLength(LExpected, 2);
+    LExpected[0] := $08; LExpected[1] := $01;
+
+    Check('bytes match expected encoding (canonical: defaults omitted)',
       BytesEqual(LBytes, LExpected),
       'expected: ' + BytesToHex(LExpected) + '  got: ' + BytesToHex(LBytes));
   finally
@@ -1013,12 +1063,27 @@ begin
   // ── unset must NOT go out ────────────────────────────────────────────────
   LMsg := TOptionalMessage.Create;
   try
+    { `plain` is set to a NON-default value on purpose. Since CANONICAL-1 an
+      implicit-presence field at its default is omitted like any other, so
+      leaving it at 0 here would assert the pre-canonical behaviour - which is
+      exactly what this check did until CANONICAL-1 landed and failed it. The
+      intent is unchanged: an ordinary field beside an optional one still
+      works normally. }
+    LMsg.plain := 5;
     LEmitted := EmitsTag(LMsg, 2, LBytes);
     Check('optional field UNSET is not emitted', not LEmitted,
       BytesToHex(LBytes));
-    Check('implicit-presence field alongside it still IS emitted',
+    Check('a NON-default implicit-presence field beside it still emits',
       (Length(LBytes) >= 2) and (LBytes[0] = $08),
-      'plain must keep emitting unconditionally: ' + BytesToHex(LBytes));
+      BytesToHex(LBytes));
+
+    { The other half, and the new behaviour: at its DEFAULT the same field is
+      now omitted. Asserted here rather than left to the conformance probe,
+      because this suite is where a regression would be noticed. }
+    LMsg.plain := 0;
+    LEmitted := EmitsTag(LMsg, 1, LBytes);
+    Check('CANONICAL-1: an implicit-presence field at its DEFAULT is omitted',
+      not LEmitted, BytesToHex(LBytes));
   finally
     LMsg.Free;
   end;
