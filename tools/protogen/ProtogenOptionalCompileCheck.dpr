@@ -92,6 +92,8 @@ end;
 var
   GMsg, GDst: TOptMsg;
   GOne, GOneDst: TOneofMsg;      // ONEOF-1
+  GOwn, GOwnDst: TOwnerMsg;      // PROTOGEN-DTOR
+  GPayloads: TArray<TPayload>;
   GBytes: TBytes;
   GOk: Boolean;
   GErr: string;
@@ -338,6 +340,90 @@ begin
       GOneDst.Free;
     end;
   end;
+
+  // ── PROTOGEN-DTOR · the generated destructor ─────────────────────────────
+  //  What this CAN prove: the destructor compiles, and freeing a decoded
+  //  message does not double-free (which would AV here, loudly).
+  //
+  //  What it CANNOT prove: that the leak is gone. Absence of a leak needs
+  //  heap accounting - build this with -gh and read heaptrc's summary. Said
+  //  plainly because "destructor emitted, tests green" is exactly the kind of
+  //  claim that gets mistaken for "leak fixed".
+  WriteLn;
+  WriteLn('-- PROTOGEN-DTOR: generated destructor');
+
+  GOk  := False;
+  GErr := '';
+  try
+    GOwn := TOwnerMsg.Create;
+    try
+      GOwn.tag := 1;
+    finally
+      GOwn.Free;          // nothing allocated yet - both fields still empty
+    end;
+    GOk := True;
+  except
+    on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+  end;
+  Check('destructor is safe when nothing was ever allocated', GOk, GErr);
+
+  { Now the real case: let the CODEC allocate, then free. A destructor that
+    freed something it did not own, or freed twice, dies here. }
+  GOk  := False;
+  GErr := '';
+  try
+    GOwn := TOwnerMsg.Create;
+    try
+      GOwn.tag := 7;
+      GOwn.single := TPayload.Create;
+      GOwn.single.id := 42;
+      GBytes := TProtoSerializer.Serialize(GOwn);
+    finally
+      GOwn.Free;
+    end;
+
+    GOwnDst := TOwnerMsg.Create;
+    try
+      { Deserialize ALLOCATES TPayload for the singular field and one per
+        repeated element - this is the ownership the destructor answers. }
+      TProtoSerializer.Deserialize(GBytes, GOwnDst);
+      GOk := (GOwnDst.single <> nil) and (GOwnDst.single.id = 42);
+    finally
+      GOwnDst.Free;       // frees the codec-allocated TPayload
+    end;
+  except
+    on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+  end;
+  Check('decode allocates a submessage, and Free does not double-free',
+        GOk, GErr);
+
+  { Repeated: one instance per element, so the destructor must loop. }
+  GOk  := False;
+  GErr := '';
+  try
+    GOwn := TOwnerMsg.Create;
+    try
+      SetLength(GPayloads, 2);
+      GPayloads[0] := TPayload.Create; GPayloads[0].id := 1;
+      GPayloads[1] := TPayload.Create; GPayloads[1].id := 2;
+      GOwn.many := GPayloads;
+      GBytes := TProtoSerializer.Serialize(GOwn);
+    finally
+      GOwn.Free;
+    end;
+
+    GOwnDst := TOwnerMsg.Create;
+    try
+      TProtoSerializer.Deserialize(GBytes, GOwnDst);
+      GOk := (Length(GOwnDst.many) = 2) and (GOwnDst.many[1].id = 2);
+    finally
+      GOwnDst.Free;       // must free EACH element
+    end;
+  except
+    on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+  end;
+  Check('repeated submessage: every element freed, no double-free',
+        GOk, GErr);
 
   WriteLn;
   WriteLn(Format('[ProtogenOptional] %d passed, %d failed', [GPass, GFail]));

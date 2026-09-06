@@ -68,6 +68,28 @@ message OptMsg {
 // A message member is deliberately absent: clearing one means FREEING it, and
 // protogen emits no destructor, so the generator refuses that case outright.
 
+// PROTOGEN-DTOR. The codec ALLOCATES a submessage instance during decode and
+// hands ownership to the containing class - its own comment says "the message
+// class is responsible for freeing them in its destructor". protogen never
+// emitted one, so every generated class with a message-typed field leaked an
+// instance per decode.
+//
+// Nothing in the repo generated such a class, which is why it went unnoticed:
+// echo.proto and greeter.proto are all scalars. This message exists so the
+// generator is made to emit a destructor at all, in both shapes that own
+// instances - one singular and one repeated.
+
+message Payload {
+  int32  id   = 1;
+  string note = 2;
+}
+
+message OwnerMsg {
+  int32            tag      = 1;
+  Payload          single   = 2;   // one owned instance
+  repeated Payload many     = 3;   // one owned instance PER ELEMENT
+}
+
 message OneofMsg {
   int32 before = 1;
 

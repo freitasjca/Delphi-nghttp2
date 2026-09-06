@@ -55,11 +55,15 @@ type
     procedure EmitMessage(AMsg: TProtoMessageNode);
     // PRESENCE-1 — proto3 `optional`
     function  NeedsHasBit(AField: TProtoFieldNode): Boolean;
-    procedure EmitOptionalBodies;
+    procedure EmitImplementationBodies;
     // ONEOF-1 — proto3 `oneof`
     function  OneofGroups(AMsg: TProtoMessageNode): TArray<string>;
     procedure EmitOneofCaseEnums(AMsg: TProtoMessageNode);
     procedure EmitOneofBodies(AMsg: TProtoMessageNode);
+    // PROTOGEN-DTOR — ownership of allocated submessages
+    function  IsMessageField(AField: TProtoFieldNode): Boolean;
+    function  OwnsMessages(AMsg: TProtoMessageNode): Boolean;
+    procedure EmitDestructorBody(AMsg: TProtoMessageNode);
   public
     // The generated has-bit property name for a field's Pascal property name.
     // Public so the C2 gate can assert against it rather than re-deriving the
@@ -276,6 +280,30 @@ begin
     [QuotedStr(AField.Name), AField.TypeName, AField.TypeName]);
 end;
 
+{ PROTOGEN-DTOR. Does this field hold MESSAGE instance(s) the class must free?
+
+  `psNone` means "not a built-in scalar", which covers both message and enum
+  references; an enum is an ordinary ordinal and owns nothing, so it is the
+  message case that matters. Well-known types count: `Timestamp` maps to a
+  CLASS (`TProtobufTimestamp`) and the codec allocates it like any other
+  submessage.
+
+  Deliberately non-raising, unlike NeedsHasBit, because it is asked about
+  every field of every message rather than only about ones the author marked. }
+function TMessagesEmitter.IsMessageField(AField: TProtoFieldNode): Boolean;
+begin
+  Result := (AField.Scalar = psNone) and (FFile.FindEnum(AField.TypeName) = nil);
+end;
+
+function TMessagesEmitter.OwnsMessages(AMsg: TProtoMessageNode): Boolean;
+var
+  I: Integer;
+begin
+  for I := 0 to AMsg.Fields.Count - 1 do
+    if IsMessageField(AMsg.Fields[I]) then Exit(True);
+  Result := False;
+end;
+
 { Upper-cases the first character only. proto names are conventionally
   lower_snake, and the generated identifiers built from them read as Pascal. }
 function CapFirst(const S: string): string;
@@ -476,9 +504,19 @@ begin
     W('    function Get' + CapFirst(LGroups[I]) + 'Case: ' +
       CaseEnumName(PascalTypeName(AMsg.QualifiedName), LGroups[I]) + ';');
 
+  { PROTOGEN-DTOR. The codec ALLOCATES submessage instances during decode
+    (`ASubmessageClass.Create`) and its own comment states the contract: "the
+    message class is responsible for freeing them in its destructor". protogen
+    never emitted one, so every generated class with a message-typed field has
+    leaked one instance per decode since codegen existed. }
+  if OwnsMessages(AMsg) or LAnyOptional then
+    W('  public');
+
+  if OwnsMessages(AMsg) then
+    W('    destructor Destroy; override;');
+
   if LAnyOptional then
   begin
-    W('  public');
     for I := 0 to AMsg.Fields.Count - 1 do
     begin
       LField := AMsg.Fields[I];
@@ -534,10 +572,18 @@ begin
   W;
 end;
 
-{ Method bodies for every optional field, emitted into the implementation
-  section. Declaration and body are produced from the same PascalFieldName and
-  HasBitName calls, so they cannot drift - a drift there is a link error. }
-procedure TMessagesEmitter.EmitOptionalBodies;
+{ Every method body the emitter produces, for every message: the PRESENCE-1
+  setters and Clears, the ONEOF-1 group Clears and case-getters, and the
+  PROTOGEN-DTOR destructor.
+
+  Declarations and bodies are produced from the same PascalFieldName /
+  HasBitName / CaseEnumName calls, so they cannot drift apart - a drift there
+  is a link error rather than a silent wrong result.
+
+  Named for what it does rather than for PRESENCE-1 alone, which is what it
+  started as; a procedure emitting three unrelated body kinds under the name
+  EmitOptionalBodies would mislead the next reader. }
+procedure TMessagesEmitter.EmitImplementationBodies;
 var
   M, I: Integer;
   LMsg: TProtoMessageNode;
@@ -578,7 +624,57 @@ begin
       W;
     end;
     EmitOneofBodies(LMsg);
+    EmitDestructorBody(LMsg);
   end;
+end;
+
+{ PROTOGEN-DTOR body. Frees every message instance the class owns.
+
+  Repeated message fields free each ELEMENT: the codec allocates one instance
+  per element and hands the array ownership, the same contract a scalar
+  submessage property has. `.Free` is nil-safe, so an unset singular field and
+  an empty array both cost nothing.
+
+  Only message-typed fields appear here. Scalars own nothing, enums own
+  nothing, and a repeated SCALAR array is managed by the RTL. }
+procedure TMessagesEmitter.EmitDestructorBody(AMsg: TProtoMessageNode);
+var
+  I: Integer;
+  LField: TProtoFieldNode;
+  LClass, LProp, LRenamed: string;
+  LNeedsLoopVar: Boolean;
+begin
+  if not OwnsMessages(AMsg) then Exit;
+  LClass := PascalTypeName(AMsg.QualifiedName);
+
+  LNeedsLoopVar := False;
+  for I := 0 to AMsg.Fields.Count - 1 do
+    if IsMessageField(AMsg.Fields[I]) and AMsg.Fields[I].IsRepeated then
+      LNeedsLoopVar := True;
+
+  W('destructor ' + LClass + '.Destroy;');
+  if LNeedsLoopVar then
+  begin
+    W('var');
+    W('  I: Integer;');
+  end;
+  W('begin');
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    LField := AMsg.Fields[I];
+    if not IsMessageField(LField) then Continue;
+    LProp := PascalFieldName(LField.Name, LRenamed);
+    if LField.IsRepeated then
+    begin
+      W('  for I := 0 to High(F' + LProp + ') do');
+      W('    F' + LProp + '[I].Free;');
+    end
+    else
+      W('  F' + LProp + '.Free;');
+  end;
+  W('  inherited;');
+  W('end;');
+  W;
 end;
 
 { ONEOF-1 bodies: one Clear and one case-getter per group.
@@ -659,7 +755,7 @@ begin
   EmitTypeSection;
   W('implementation');
   W;
-  EmitOptionalBodies;
+  EmitImplementationBodies;
   W('end.');
 end;
 
