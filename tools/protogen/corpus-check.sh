@@ -202,10 +202,10 @@ else
   while IFS=$'\t' read -r _bracket f; do
     [[ -f "$f" ]] || continue
     set=""
-    # The Struct family travels together - Value is defined in terms of Struct
-    # and ListValue, so they are one closure, not four.
-    grep -Eq 'google\.protobuf\.(Struct|Value|ListValue|NullValue)\b' "$f" \
-      && set+=" struct-family"
+    # struct-family was here until STRUCT-1 bundled it. Leaving it in reported
+    # 13 files as wanting "struct-family any" when Any alone was blocking them -
+    # a closure list that outlived its gap, which is the same way an oracle note
+    # goes stale. The check at the end of this section now catches that.
     grep -Eq 'google\.protobuf\.Any\b' "$f" && set+=" any"
     grep -Eq '\b(sint32|sint64|fixed32|fixed64|sfixed32|sfixed64)\b' "$f" \
       && set+=" group-b"
@@ -254,6 +254,50 @@ else
     echo "             construct this scan does not know to look for."
   fi
 
+  # A closure group that MATCHES files but that the parser never actually
+  # refuses is a group that outlived its gap. Detected by asking whether any
+  # first-refusal bracket belongs to it: the brackets are what the parser really
+  # said, the group patterns are only a guess about why.
+  #
+  # Not hypothetical. struct-family sat here for one run after STRUCT-1 closed
+  # it, reporting 13 files as wanting "struct-family any" when Any alone was
+  # blocking them - a closure list that outlived its gap, which is exactly how
+  # an oracle note goes stale.
+  group_is_live() {
+    local g="$1" b
+    for b in "${!GAP[@]}"; do
+      case "$g" in
+        any)           [[ "$b" == *Any* ]] && return 0 ;;
+        group-b)       [[ "$b" == sint32 || "$b" == sint64   || "$b" == fixed32 \
+                       || "$b" == fixed64 || "$b" == sfixed32 || "$b" == sfixed64 ]] \
+                       && return 0 ;;
+        proto2)        [[ "$b" == extend || "$b" == extensions || "$b" == required \
+                       || "$b" == group  || "$b" == proto2     || "$b" == syntax ]] \
+                       && return 0 ;;
+        other-wkt)     [[ "$b" == google.protobuf.* ]] && return 0 ;;
+        struct-family) [[ "$b" == *Struct* || "$b" == *ListValue* \
+                       || "$b" == *NullValue* ]] && return 0 ;;
+      esac
+    done
+    return 1
+  }
+
+  STALE=""
+  for combo in "${!COMBO[@]}"; do
+    for one in $combo; do
+      [[ "$one" == "other" ]] && continue
+      [[ " $STALE " == *" $one "* ]] && continue
+      group_is_live "$one" || STALE="$STALE $one"
+    done
+  done
+  if [[ -n "$STALE" ]]; then
+    echo
+    echo "   !! STALE CLOSURE GROUP(S):$STALE"
+    echo "      These match files, but the parser refuses NOTHING for them -"
+    echo "      the gap closed and the detection above did not. Remove them, or"
+    echo "      every count here is inflated by a gap that no longer exists."
+  fi
+
   echo
   echo "   what each refused file actually wants (top 12):"
   for k in "${!COMBO[@]}"; do printf "     %6d  %s\n" "${COMBO[$k]}" "$k"; done \
@@ -287,6 +331,7 @@ echo "Baselines to compare against (googleapis, ~7300 files):"
 echo "  51%  2026-08-30  after nested flattening"
 echo "  85%  2026-09-05  after WKT bundling + PRESENCE-1 + ONEOF-1"
 echo "  94%  2026-09-06  after MAP-1"
+echo "  98%  2026-09-06  after STRUCT-1  (7217/7301, 84 refusals)"
 echo
 echo "These are RECORDED RESULTS, not targets - update the list when a"
 echo "stage legitimately moves it, so a regression shows as a drop rather"
