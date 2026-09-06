@@ -113,6 +113,7 @@ declare -A GAP UNKNOWN
 ACC=0; REF=0; UNK=0; ERR=0; TOTAL=0
 : > "$OUT/unknown.txt"
 : > "$OUT/errors.txt"
+: > "$OUT/refused.tsv"
 
 echo "scanning $CORPUS ..."
 while IFS= read -r -d '' f; do
@@ -126,6 +127,7 @@ while IFS= read -r -d '' f; do
        b="${line#*[}"; b="${b%%]*}"
        if is_known "$b"; then
          REF=$((REF+1)); GAP["$b"]=$(( ${GAP["$b"]:-0} + 1 ))
+         printf '%s\t%s\n' "$b" "$f" >> "$OUT/refused.tsv"
        else
          UNK=$((UNK+1)); UNKNOWN["$b"]=$(( ${UNKNOWN["$b"]:-0} + 1 ))
          echo "$line" >> "$OUT/unknown.txt"
@@ -137,6 +139,11 @@ done < <(find "$CORPUS" -name '*.proto' -print0)
 
 # ── report ───────────────────────────────────────────────────────────────────
 pct() { [[ $TOTAL -eq 0 ]] && echo 0 || echo $(( $1 * 100 / TOTAL )); }
+# One decimal, because the closure rows are small fractions of a large corpus
+# and integer division renders 37 files as "0%" - a number that reads as
+# "nothing" for what is actually the second-largest opportunity on the list.
+pct1() { [[ $TOTAL -eq 0 ]] && echo 0.0 \
+         || awk -v n="$1" -v t="$TOTAL" 'BEGIN{printf "%.1f", n*100/t}'; }
 
 echo
 echo "==========================================================="
@@ -148,11 +155,115 @@ printf "  ERROR          %6d   (%d%%)  <- crashes\n" "$ERR" "$(pct "$ERR")"
 echo "==========================================================="
 
 echo
-echo "-- deliberate gaps, by construct (files MENTIONING it) -----"
-echo "   These OVERLAP: one file can want map AND an unbundled WKT,"
-echo "   so the rows do NOT sum to the refusal count, and closing a"
-echo "   gap does not accept its whole row."
+echo "-- deliberate gaps, by FIRST construct refused ------------"
+echo "   The parser is fail-fast, so each file reports exactly ONE"
+echo "   construct and these rows sum to the refusal count above."
+echo "   They do NOT overlap - but they ARE ORDER-DEPENDENT, which"
+echo "   is worse: a file wanting Struct AND Any is counted under"
+echo "   whichever the parser reached first. So a row is NOT the"
+echo "   gain from closing that gap - the file may simply fall"
+echo "   through to its next blocker. The closure section below is"
+echo "   what answers that question."
 for k in "${!GAP[@]}"; do printf "%8d  %s\n" "${GAP[$k]}" "$k"; done | sort -rn
+
+# ── what-if closure ──────────────────────────────────────────────────────────
+# "Which gap is worth closing next" cannot be read off the table above, because
+# fail-fast reports only a file's FIRST blocker. Closing the biggest row can
+# gain nothing if every one of its files also wants something else.
+#
+# So: for each refused file, find EVERY gap it contains, then count the files a
+# given closure would actually accept - the ones where that gap is the ONLY
+# thing in the way.
+#
+# The detection is TEXTUAL, and deliberately so: making the parser report all
+# blockers means continuing after an error, which is a real change to it, and
+# the point here is to decide what to build BEFORE building it. Two consequences
+# worth stating rather than discovering later:
+#
+#   - a construct named in a COMMENT counts as a blocker. That over-counts
+#     blockers, so every "would accept" figure below is a LOWER BOUND. Erring
+#     toward under-selling a gain is the safe direction for a build decision.
+#   - it cannot see a blocker the parser would find but the text does not name,
+#     e.g. a schema-invalid field number. Those land in `other`.
+echo
+echo "-- what-if: files a closure would ACTUALLY accept ----------"
+
+if [[ $REF -eq 0 ]]; then
+  echo "   nothing refused - nothing to close."
+else
+  # Bundled well-known types are NOT blockers; everything else under
+  # google.protobuf. is. Anchored at both ends so StringValue is not mistaken
+  # for Value.
+  BUNDLED='^google\.protobuf\.(Timestamp|Duration|FieldMask|Empty|DoubleValue'
+  BUNDLED+='|FloatValue|Int64Value|UInt64Value|Int32Value|UInt32Value'
+  BUNDLED+='|BoolValue|StringValue|BytesValue)$'
+
+  declare -A COMBO SINGLE
+  while IFS=$'\t' read -r _bracket f; do
+    [[ -f "$f" ]] || continue
+    set=""
+    # The Struct family travels together - Value is defined in terms of Struct
+    # and ListValue, so they are one closure, not four.
+    grep -Eq 'google\.protobuf\.(Struct|Value|ListValue|NullValue)\b' "$f" \
+      && set+=" struct-family"
+    grep -Eq 'google\.protobuf\.Any\b' "$f" && set+=" any"
+    grep -Eq '\b(sint32|sint64|fixed32|fixed64|sfixed32|sfixed64)\b' "$f" \
+      && set+=" group-b"
+    # Anchored to line start: `required` and `extensions` are common English.
+    grep -Eq '^[[:space:]]*(extend|extensions|required)\b|syntax[[:space:]]*=[[:space:]]*"proto2"' "$f" \
+      && set+=" proto2"
+    if grep -oE 'google\.protobuf\.[A-Za-z_]+' "$f" 2>/dev/null | sort -u \
+         | grep -qvE "$BUNDLED|^google\.protobuf\.(Struct|Value|ListValue|NullValue|Any)$"; then
+      set+=" other-wkt"
+    fi
+    [[ -z "$set" ]] && set=" other"
+    set="${set# }"
+    COMBO["$set"]=$(( ${COMBO["$set"]:-0} + 1 ))
+    # A single-element set means this gap is the ONLY thing blocking the file.
+    [[ "$set" != *" "* ]] && SINGLE["$set"]=$(( ${SINGLE["$set"]:-0} + 1 ))
+  done < "$OUT/refused.tsv"
+
+  echo "   closing ONE gap, in isolation (lower bound):"
+  # Counted BEFORE the pipeline, not inside it: `for ... done | sort` runs the
+  # loop in a subshell, so a counter incremented there is discarded and the
+  # empty-case message fires even when there are rows. Caught by the control
+  # fixture in .oracle-out - the kind of thing a syntax check never sees.
+  CLOSABLE=0
+  for k in "${!SINGLE[@]}"; do
+    [[ "$k" == "other" ]] || CLOSABLE=$((CLOSABLE+1))
+  done
+  if [[ $CLOSABLE -eq 0 ]]; then
+    echo "        every refused file wants more than one gap closed"
+  else
+    for k in "${!SINGLE[@]}"; do
+      [[ "$k" == "other" ]] && continue    # residue, not a closure - see below
+      printf "     %6d  %-16s  %s%% of the corpus\n" \
+        "${SINGLE[$k]}" "$k" "$(pct1 "${SINGLE[$k]}")"
+    done | sort -rn
+  fi
+
+  # `other` is not a gap anyone can close - it is the files whose refusal the
+  # TEXT SCAN could not explain. A large or growing count here means the scan
+  # has drifted from what the parser actually refuses, so it is called out
+  # rather than sorted in among the build options as though it were one.
+  if [[ -n "${SINGLE[other]:-}" ]]; then
+    echo
+    printf "     %6d  refusals the text scan cannot explain (%s%%).\n" \
+      "${SINGLE[other]}" "$(pct1 "${SINGLE[other]}")"
+    echo "             Not a closure - either schema-invalid files, or a"
+    echo "             construct this scan does not know to look for."
+  fi
+
+  echo
+  echo "   what each refused file actually wants (top 12):"
+  for k in "${!COMBO[@]}"; do printf "     %6d  %s\n" "${COMBO[$k]}" "$k"; done \
+    | sort -rn | head -12
+  echo
+  echo "   Read the FIRST list for build order: it is the number of"
+  echo "   files that stop being refused if you close that one gap and"
+  echo "   nothing else. The second says which gaps are entangled, so"
+  echo "   a pair worth doing together shows up as one row."
+fi
 
 if [[ $UNK -gt 0 ]]; then
   echo
