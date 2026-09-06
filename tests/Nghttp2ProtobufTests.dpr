@@ -238,6 +238,100 @@ type
   TUnmarkedEmptyMessage = class
   end;
 
+  // ── PRESENCE-1 · proto3 `optional` (explicit presence) ────────────────────
+  //
+  //  The has-bit is READ-ONLY and raised by the value's setter. That is the
+  //  whole mechanism: deserialisation writes the value through SetValue, which
+  //  calls SetOpt, which raises FhasOpt. A writable bit is refused at
+  //  discovery precisely so this is the only path.
+  //
+  //  `plain` sits alongside deliberately - it has IMPLICIT presence and must
+  //  keep being emitted unconditionally, proving the feature is additive.
+
+  [TGrpcMessage]
+  TOptionalMessage = class
+  private
+    Fplain:  Integer;
+    Fopt:    Integer;
+    FhasOpt: Boolean;
+    procedure SetOpt(const AValue: Integer);
+  public
+    procedure ClearOpt;
+  published
+    [TProtoMember(1)] property plain:  Integer read Fplain write Fplain;
+    [TProtoMember(2)] property opt:    Integer read Fopt   write SetOpt;
+    [TProtoHas(2)]    property hasOpt: Boolean read FhasOpt;
+  end;
+
+  { Five refusals. Each declares something that ENCODES and DECODES fine while
+    meaning something other than the schema said - a field that never
+    transmits, or a presence that is always False. Silent-wrong is the failure
+    mode being designed out, so each must raise. }
+
+  [TGrpcMessage]
+  TBadWritableHas = class          // has-bit the author could desync by hand
+  private
+    Fv: Integer; Fhas: Boolean;
+  published
+    [TProtoMember(1)] property v:   Integer read Fv   write Fv;
+    [TProtoHas(1)]    property has: Boolean read Fhas write Fhas;
+  end;
+
+  [TGrpcMessage]
+  TBadNonBooleanHas = class        // has-bit that is not a Boolean
+  private
+    Fv: Integer; Fhas: Integer;
+  published
+    [TProtoMember(1)] property v:   Integer read Fv;
+    [TProtoHas(1)]    property has: Integer read Fhas;
+  end;
+
+  [TGrpcMessage]
+  TBadOrphanHas = class            // has-bit naming a tag no field carries
+  private
+    Fv: Integer; Fhas: Boolean;
+  published
+    [TProtoMember(1)] property v:   Integer read Fv;
+    [TProtoHas(7)]    property has: Boolean read Fhas;
+  end;
+
+  [TGrpcMessage]
+  TBadRepeatedHas = class          // repeated has no presence to express
+  private
+    Fids: TArray<Integer>; Fhas: Boolean;
+  published
+    [TProtoMember(1)] property ids: TArray<Integer> read Fids;
+    [TProtoHas(1)]    property has: Boolean read Fhas;
+  end;
+
+  [TGrpcMessage]
+  TBadSubmessageHas = class        // submessage already has presence via nil
+  private
+    Faddr: TAddress; Fhas: Boolean;
+  published
+    [TProtoMember(1)] property addr: TAddress read Faddr;
+    [TProtoHas(1)]    property has:  Boolean  read Fhas;
+  end;
+
+// ── PRESENCE-1 · TOptionalMessage members ───────────────────────────────────
+
+{ The setter IS the mechanism. Deserialisation reaches it through
+  TRttiProperty.SetValue, so a field arriving on the wire raises the bit with
+  no deserialiser-side code at all. }
+procedure TOptionalMessage.SetOpt(const AValue: Integer);
+begin
+  Fopt    := AValue;
+  FhasOpt := True;
+end;
+
+{ Clearing needs its own path: assigning 0 through the setter would SET the
+  field to zero, which on the wire is the opposite of absent. }
+procedure TOptionalMessage.ClearOpt;
+begin
+  Fopt    := 0;
+  FhasOpt := False;
+end;
+
 // ── Destructor for TAdvancedMessage — implementation outside type block ─────
 
 destructor TAdvancedMessage.Destroy;
@@ -852,6 +946,188 @@ begin
     'the {$M+} diagnostic must survive');
 end;
 
+{ Serialises AObj and reports whether tag ATag actually appears as a FIELD.
+
+  Decoded with the real reader rather than scanned for the tag byte. A byte
+  scan is subtly wrong: tag 2 varint is $10, and a preceding field holding the
+  VALUE 16 also puts $10 in the buffer, so `plain := 16` would make an absent
+  optional field read as present. It does not fire while plain is 0 - which is
+  exactly what would make it a false pass discovered much later. }
+function EmitsTag(AObj: TObject; ATag: Integer; out ABytes: TBytes): Boolean;
+var
+  LReader: TProtoReader;
+  LTag:    Integer;
+  LWire:   TProtoWireType;
+begin
+  ABytes := TProtoSerializer.Serialize(AObj);
+  Result := False;
+  LReader := TProtoReader.Create(ABytes);
+  try
+    while LReader.ReadTag(LTag, LWire) do
+    begin
+      if LTag = ATag then Exit(True);
+      LReader.SkipField(LWire);
+    end;
+  finally
+    LReader.Free;
+  end;
+end;
+
+{ Runs discovery on a deliberately-malformed class and reports whether it was
+  refused AND whether the message explains itself.
+
+  Asserting only "it raised" would pass for an access violation, and a
+  diagnostic that merely restates the construct sends the reader hunting for a
+  typo - so the message must also mention ANEEDLE. Same three-part rule the
+  protogen negative tests use. }
+function RefusedWithReason(AObj: TObject; const ANeedle: string;
+  out AMsg: string): Boolean;
+begin
+  Result := False;
+  AMsg   := '';
+  try
+    TProtoSerializer.Serialize(AObj);
+  except
+    on E: EProtoRttiError do
+    begin
+      AMsg   := E.Message;
+      Result := Pos(LowerCase(ANeedle), LowerCase(E.Message)) > 0;
+    end;
+  end;
+end;
+
+procedure TestExplicitPresence;
+var
+  LMsg, LDst: TOptionalMessage;
+  LBytes: TBytes;
+  LEmitted: Boolean;
+  LText: string;
+  LBadW: TBadWritableHas;
+  LBadN: TBadNonBooleanHas;
+  LBadO: TBadOrphanHas;
+  LBadR: TBadRepeatedHas;
+  LBadS: TBadSubmessageHas;
+begin
+  Section('14  explicit presence - proto3 `optional` (PRESENCE-1)');
+
+  // ── unset must NOT go out ────────────────────────────────────────────────
+  LMsg := TOptionalMessage.Create;
+  try
+    LEmitted := EmitsTag(LMsg, 2, LBytes);
+    Check('optional field UNSET is not emitted', not LEmitted,
+      BytesToHex(LBytes));
+    Check('implicit-presence field alongside it still IS emitted',
+      (Length(LBytes) >= 2) and (LBytes[0] = $08),
+      'plain must keep emitting unconditionally: ' + BytesToHex(LBytes));
+  finally
+    LMsg.Free;
+  end;
+
+  // ── set to ZERO must go out. This is the entire point of the feature ─────
+  LMsg := TOptionalMessage.Create;
+  try
+    LMsg.opt := 0;
+    LEmitted := EmitsTag(LMsg, 2, LBytes);
+    Check('optional field SET TO ZERO is emitted', LEmitted,
+      'set-to-zero must be distinguishable from unset: ' + BytesToHex(LBytes));
+    Check('assigning through the setter raised the has-bit', LMsg.hasOpt);
+  finally
+    LMsg.Free;
+  end;
+
+  // ── set to non-zero ──────────────────────────────────────────────────────
+  LMsg := TOptionalMessage.Create;
+  try
+    LMsg.opt := 42;
+    LEmitted := EmitsTag(LMsg, 2, LBytes);
+    Check('optional field set to non-zero is emitted', LEmitted);
+  finally
+    LMsg.Free;
+  end;
+
+  // ── ClearOpt puts it back to absent ──────────────────────────────────────
+  LMsg := TOptionalMessage.Create;
+  try
+    LMsg.opt := 7;
+    LMsg.ClearOpt;
+    LEmitted := EmitsTag(LMsg, 2, LBytes);
+    Check('ClearOpt returns the field to absent', not LEmitted);
+    Check('ClearOpt lowered the has-bit', not LMsg.hasOpt);
+  finally
+    LMsg.Free;
+  end;
+
+  // ── ROUND TRIP: set-to-zero survives as PRESENT ──────────────────────────
+  //  The check that proves the deserialise side needs no code of its own:
+  //  SetValue goes through SetOpt, which raises the bit.
+  LMsg := TOptionalMessage.Create;
+  LDst := TOptionalMessage.Create;
+  try
+    LMsg.opt := 0;
+    LBytes := TProtoSerializer.Serialize(LMsg);
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('round-trip: set-to-zero arrives with value 0', LDst.opt = 0);
+    Check('round-trip: set-to-zero arrives PRESENT (has-bit raised by setter)',
+      LDst.hasOpt, 'deserialise must reach the setter, not the field');
+  finally
+    LMsg.Free;
+    LDst.Free;
+  end;
+
+  // ── ROUND TRIP: unset stays unset ────────────────────────────────────────
+  LMsg := TOptionalMessage.Create;
+  LDst := TOptionalMessage.Create;
+  try
+    LBytes := TProtoSerializer.Serialize(LMsg);
+    TProtoSerializer.Deserialize(LBytes, LDst);
+    Check('round-trip: unset arrives ABSENT', not LDst.hasOpt);
+  finally
+    LMsg.Free;
+    LDst.Free;
+  end;
+
+  // ── the five refusals ────────────────────────────────────────────────────
+  LBadW := TBadWritableHas.Create;
+  try
+    Check('writable has-bit is refused, naming read-only',
+      RefusedWithReason(LBadW, 'read-only', LText), LText);
+  finally
+    LBadW.Free;
+  end;
+
+  LBadN := TBadNonBooleanHas.Create;
+  try
+    Check('non-Boolean has-bit is refused, naming Boolean',
+      RefusedWithReason(LBadN, 'boolean', LText), LText);
+  finally
+    LBadN.Free;
+  end;
+
+  LBadO := TBadOrphanHas.Create;
+  try
+    Check('has-bit with no matching field is refused',
+      RefusedWithReason(LBadO, 'no published property', LText), LText);
+  finally
+    LBadO.Free;
+  end;
+
+  LBadR := TBadRepeatedHas.Create;
+  try
+    Check('has-bit on a repeated field is refused',
+      RefusedWithReason(LBadR, 'repeated', LText), LText);
+  finally
+    LBadR.Free;
+  end;
+
+  LBadS := TBadSubmessageHas.Create;
+  try
+    Check('has-bit on a submessage field is refused',
+      RefusedWithReason(LBadS, 'submessage', LText), LText);
+  finally
+    LBadS.Free;
+  end;
+end;
+
 procedure TestUnsignedWireForm;
 var
   LSrc, LDst: TUnsignedMessage;
@@ -918,6 +1194,7 @@ begin
     TestRepeatedAcceptsUnpackedNumeric;
     TestUnsignedWireForm;
     TestEmptyMessage;
+    TestExplicitPresence;
 
     WriteLn;
     WriteLn(Format('[Nghttp2Protobuf] %d passed, %d failed', [GPassCount, GFailCount]));

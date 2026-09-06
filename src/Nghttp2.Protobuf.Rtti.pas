@@ -123,6 +123,18 @@ type
     IsRepeated:     Boolean;          // property is TArray<T>, T <> Byte
     ArrayTypeInfo:  PTypeInfo;        // the TArray<T> type — for TValue.FromArray
     ElemTypeInfo:   PTypeInfo;        // T — for building element TValues
+
+    // ── Explicit presence — proto3 `optional` (PRESENCE-1) ─────────────────
+    { The published read-only Boolean marked [TProtoHas(Tag)], or nil when the
+      field has IMPLICIT presence (the proto3 default). When set, Serialize
+      emits the field only if this reads True.
+
+      Nothing is needed on the DESERIALISE side, and that is by design rather
+      than by omission: the value is written through TRttiProperty.SetValue,
+      which invokes the property's setter, and the setter is what raises the
+      bit. Requiring the bit to be read-only is what guarantees that is the
+      only path — see TProtoHasAttribute's comment. }
+    HasBitProp:     TRttiProperty;
   end;
 
   // ── Cached info about ONE message class ──────────────────────────────────
@@ -452,6 +464,123 @@ begin
     AField.Kind, AField.SubmessageClass);
 end;
 
+{ Is this property a Pascal Boolean?
+
+  The two compilers disagree about how Boolean is TYPED, and by kind alone it
+  is ambiguous on Delphi: Boolean there is an ENUMERATION, so `tkEnumeration`
+  covers both Boolean and every proto3 enum. Disambiguated by handle, exactly
+  as InferScalarKind already does — see point 4 of this unit's header. Writing
+  `Kind = tkBool` alone would compile on both and be wrong on one. }
+function IsBooleanProperty(AProp: TRttiProperty): Boolean;
+begin
+  Result := False;
+  if (AProp = nil) or (AProp.PropertyType = nil) then Exit;
+{$IF DEFINED(FPC)}
+  { FPC gives Boolean its own kind. ByteBool/WordBool/LongBool land here too;
+    all are acceptable as a has-bit. }
+  if AProp.PropertyType.TypeKind = tkBool then Exit(True);
+{$IFEND}
+  Result := (AProp.PropertyType.TypeKind = tkEnumeration)
+            and (AProp.PropertyType.Handle = System.TypeInfo(Boolean));
+end;
+
+{ PRESENCE-1 — pair every [TProtoHas(n)] Boolean with the [TProtoMember(n)]
+  field it describes, validating as it goes.
+
+  Every failure here is raised rather than ignored, and that is the point. Each
+  one produces a message that still ENCODES and DECODES fine while meaning
+  something different from what the schema said — a field that never
+  transmits, or one whose presence is always False. That is the same silent
+  shape as the three core/provider slot mismatches, and the only defence is
+  refusing at startup instead of at 3am. }
+procedure AttachHasBits(AType: TRttiType; AList: TList<TProtoFieldInfo>;
+  AClass: TClass);
+var
+  LProp:  TRttiProperty;
+  LAttr:  TCustomAttribute;
+  LHas:   TProtoHasAttribute;
+  LField: TProtoFieldInfo;
+  I:      Integer;
+  LFound: Boolean;
+begin
+  for LProp in AType.GetProperties do
+  begin
+    if LProp.Visibility <> mvPublished then Continue;
+
+    LHas := nil;
+    for LAttr in LProp.GetAttributes do
+      if LAttr is TProtoHasAttribute then
+      begin
+        LHas := TProtoHasAttribute(LAttr);
+        Break;
+      end;
+    if LHas = nil then Continue;
+
+    if not IsBooleanProperty(LProp) then
+      raise EProtoRttiError.CreateFmt(
+        '%s.%s is marked [TProtoHas(%d)] but is not a Boolean. A has-bit '
+        + 'records whether the field was set, so it can only be Boolean.',
+        [AClass.ClassName, LProp.Name, LHas.Tag]);
+
+    { Read-only is load-bearing, not tidiness. Deserialisation raises the bit
+      by writing the VALUE through its setter; a writable bit means the author
+      maintains it by hand, and a decoded field would then arrive with its
+      value set and its bit still False — present on the wire, absent to the
+      program, with nothing raised. Refusing the writable form leaves exactly
+      one mechanism, which cannot desync. }
+    if LProp.IsWritable then
+      raise EProtoRttiError.CreateFmt(
+        '%s.%s is marked [TProtoHas(%d)] but is writable. A has-bit must be '
+        + 'read-only (declare it `read F%s` with no writer) and be raised by '
+        + 'the field''s own setter — otherwise a decoded field arrives with '
+        + 'its value set and its presence still False.',
+        [AClass.ClassName, LProp.Name, LHas.Tag, LProp.Name]);
+
+    LFound := False;
+    for I := 0 to AList.Count - 1 do
+    begin
+      LField := AList[I];
+      if LField.Tag <> LHas.Tag then Continue;
+      LFound := True;
+
+      if LField.HasBitProp <> nil then
+        raise EProtoRttiError.CreateFmt(
+          '%s: tag %d has more than one [TProtoHas] Boolean (%s and %s). '
+          + 'A field can have only one has-bit.',
+          [AClass.ClassName, LHas.Tag, LField.HasBitProp.Name, LProp.Name]);
+
+      { Repeated and submessage already carry presence of their own, so a
+        has-bit there is not merely redundant - it is a second, contradictory
+        source of truth. Empty-vs-absent is not expressible for a repeated
+        field at all, and nil already means absent for a submessage. }
+      if LField.IsRepeated then
+        raise EProtoRttiError.CreateFmt(
+          '%s.%s: [TProtoHas(%d)] refers to repeated field "%s". A repeated '
+          + 'field has no presence to express — proto3 cannot distinguish '
+          + 'empty from absent, and both decode to length 0.',
+          [AClass.ClassName, LProp.Name, LHas.Tag, LField.Name]);
+
+      if LField.Kind = pkSubmessage then
+        raise EProtoRttiError.CreateFmt(
+          '%s.%s: [TProtoHas(%d)] refers to submessage field "%s", which '
+          + 'already has explicit presence — nil means absent and is skipped '
+          + 'on the wire. Remove the has-bit and leave the property nil.',
+          [AClass.ClassName, LProp.Name, LHas.Tag, LField.Name]);
+
+      LField.HasBitProp := LProp;
+      AList[I] := LField;          // TProtoFieldInfo is a RECORD — write back
+      Break;
+    end;
+
+    if not LFound then
+      raise EProtoRttiError.CreateFmt(
+        '%s.%s is marked [TProtoHas(%d)] but no published property carries '
+        + '[TProtoMember(%d)]. A has-bit whose tag names no field would '
+        + 'silently do nothing.',
+        [AClass.ClassName, LProp.Name, LHas.Tag, LHas.Tag]);
+  end;
+end;
+
 class function TProtobufRtti.BuildTypeInfo(AClass: TClass): TProtoTypeInfo;
 var
   LType:  TRttiType;
@@ -501,6 +630,14 @@ begin
 
       LList.Add(LField);
     end;
+
+    { ── PRESENCE-1 · attach has-bits ─────────────────────────────────────────
+      A SECOND pass, because a [TProtoHas] may be declared before or after the
+      field it belongs to and GetProperties yields declaration order. Pairing
+      inside the first loop would work only for one of the two orderings, and
+      would fail silently for the other — the field would simply keep implicit
+      presence and always transmit, which looks like nothing is wrong. }
+    AttachHasBits(LType, LList, AClass);
 
     // A zero-field result is ambiguous: it means EITHER the author forgot
     // {$M+} / `published` / the attribute import, OR the message genuinely has
@@ -689,6 +826,18 @@ begin
 
         Continue;
       end;
+
+      { PRESENCE-1 — proto3 `optional`. With a has-bit the field is emitted
+        only when it was actually set, which is what makes "set to zero"
+        distinguishable from "not set". Without one the field has IMPLICIT
+        presence and is emitted unconditionally, exactly as before — so this
+        clause changes nothing for any existing message.
+
+        Read through RTTI rather than cached at discovery: the bit is per
+        INSTANCE, while TProtoFieldInfo is per class. }
+      if (LField.HasBitProp <> nil)
+         and (not LField.HasBitProp.GetValue(AObj).AsBoolean) then
+        Continue;
 
       case LField.Kind of
         pkInt32:   LWriter.WriteInt32Field(LField.Tag, LValue.AsInteger);

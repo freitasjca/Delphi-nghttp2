@@ -93,6 +93,44 @@ type
     property Tag: Integer read FTag;
   end;
 
+  { Marks a published Boolean as the has-bit for the proto field carrying the
+    SAME tag — proto3 explicit presence, i.e. the `optional` keyword.
+
+    Without one, a scalar field has IMPLICIT presence: it is always emitted,
+    and "set to zero" is indistinguishable from "not set". With one, the field
+    is emitted only when the bit is True, so both states survive the wire.
+
+    The has-bit property MUST be read-only, and that is enforced at discovery
+    rather than left to convention. The reason is mechanical, not stylistic:
+    deserialisation sets the VALUE through TRttiProperty.SetValue, which
+    invokes the property's setter, and it is the setter that raises the bit. A
+    writable bit implies the author is maintaining it by hand, and then a
+    decoded field would arrive with its value set and its bit still False —
+    present on the wire, absent to the program, silently. Requiring read-only
+    means there is exactly one mechanism and it cannot desync.
+
+    So the shape is:
+
+      private
+        Fb: Integer;  FhasB: Boolean;
+        procedure SetB(const AValue: Integer);   // Fb := AValue; FhasB := True
+      published
+        [TProtoMember(3)] property b:    Integer read Fb write SetB;
+        [TProtoHas(3)]    property hasB: Boolean read FhasB;
+
+    Only scalars and enums need this. A proto3 MESSAGE field already has
+    explicit presence — nil means absent and the serialiser already skips it —
+    and a repeated field has none to express, since empty and absent are the
+    same thing on the wire. Both are rejected at discovery if given a has-bit,
+    rather than silently ignoring it. }
+  TProtoHasAttribute = class(TCustomAttribute)
+  private
+    FTag: Integer;
+  public
+    constructor Create(ATag: Integer);
+    property Tag: Integer read FTag;
+  end;
+
   // ── Exceptions ────────────────────────────────────────────────────────────
   EProtoDecodeError = class(Exception);
   EProtoEncodeError = class(Exception);
@@ -265,6 +303,19 @@ begin
   if (ATag < 1) or (ATag > 536870911) or ((ATag >= 19000) and (ATag <= 19999)) then
     raise EProtoEncodeError.CreateFmt(
       'ProtoMember tag %d is out of range (must be 1..2^29-1 excluding the 19000-19999 reserved range).', [ATag]);
+  FTag := ATag;
+end;
+
+constructor TProtoHasAttribute.Create(ATag: Integer);
+begin
+  inherited Create;
+  { Same range rule as TProtoMember, and deliberately duplicated rather than
+    delegated: the tag must name a real field, so a tag this constructor would
+    reject could never match one anyway. Catching it here names the has-bit as
+    the culprit; catching it later would name the field. }
+  if (ATag < 1) or (ATag > 536870911) or ((ATag >= 19000) and (ATag <= 19999)) then
+    raise EProtoEncodeError.CreateFmt(
+      'ProtoHas tag %d is out of range (must be 1..2^29-1 excluding the 19000-19999 reserved range).', [ATag]);
   FTag := ATag;
 end;
 
