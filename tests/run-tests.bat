@@ -12,6 +12,9 @@ REM                                                     + reassembly chunking
 REM    2c ProtoOptionalProbe              build + run   (gates) - what this
 REM                                                     compiler permits as a
 REM                                                     published property
+REM   C6b ProtogenOptionalCompileCheck    build + run   (gates) - compiles AND
+REM                                                     runs generated
+REM                                                     `optional` code
 REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
 REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
 REM    5  ProtogenParserTests             build + run   (gates) - in
@@ -269,6 +272,61 @@ echo -- ProtogenGeneratedCompileCheck (C6a) ------------------------------------
 echo    SKIP  greeter.proto not found - needs the horse-provider-nghttp2 sibling checkout
 
 :after_gencheck
+
+REM -- C6b. Compile AND RUN protogen's `optional` output --------------------
+REM
+REM    C6a above generates from greeter.proto, which has no optional fields,
+REM    so PRESENCE-1's emitter checks all compare TEXT TO TEXT - the very hole
+REM    C6a exists to close, reopened one feature along. On its first FPC run
+REM    this stage caught generated Pascal that did not compile (fields emitted
+REM    after a method in the same visibility section) while fourteen C2 checks
+REM    were green on that same output.
+REM
+REM    Unlike C6a this needs no sibling checkout: optional.proto lives here.
+REM    It also declares no service, so nothing reaches RegisterService<T>.
+REM
+REM    Same scratch-directory rule as C6a, and for the same reason: the
+REM    no-overwrite contract preserves an existing .Service.pas, so a dirty
+REM    directory compiles the previous run's output.
+if not exist "..\tools\protogen\ProtogenOptionalCompileCheck.dpr" goto :no_optcheck
+if not exist "..\tools\protogen\Protogen.exe" goto :no_optcheck_bin
+if not exist "..\tools\protogen\optional.proto" goto :no_optcheck_proto
+
+echo.
+set "OPTOUT=%TEMP%\protogen-optcheck"
+if exist "%OPTOUT%" rmdir /s /q "%OPTOUT%"
+pushd "..\tools\protogen"
+Protogen.exe -i "optional.proto" -o "%OPTOUT%" --unit-prefix Sample.Opt > nul
+if errorlevel 1 (
+  echo -- ProtogenOptionalCompileCheck ^(C6b^) ------------------------------------------------
+  echo    FAIL  Protogen.exe could not generate from optional.proto
+  set /a FAILED+=1
+  popd
+  goto :after_optcheck
+)
+set "STAGE=ProtogenOptionalCompileCheck"
+set "GATES=1"
+set "STAGEUNITS=%OPTOUT%;..\..\src"
+call :build_run
+popd
+set "STAGEUNITS=..\src"
+goto :after_optcheck
+
+:no_optcheck
+echo -- ProtogenOptionalCompileCheck (C6b) ------------------------------------------------
+echo    SKIP  ..\tools\protogen\ProtogenOptionalCompileCheck.dpr not present
+goto :after_optcheck
+
+:no_optcheck_bin
+echo -- ProtogenOptionalCompileCheck (C6b) ------------------------------------------------
+echo    SKIP  Protogen.exe not built - run the Protogen compile-only stage first
+goto :after_optcheck
+
+:no_optcheck_proto
+echo -- ProtogenOptionalCompileCheck (C6b) ------------------------------------------------
+echo    SKIP  ..\tools\protogen\optional.proto not present
+
+:after_optcheck
 
 echo.
 echo ===========================================================================
