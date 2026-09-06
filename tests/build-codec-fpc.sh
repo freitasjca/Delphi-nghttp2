@@ -17,6 +17,9 @@
 #                                                      permits as a published
 #                                                      property — the bound on
 #                                                      what the codec can express)
+#    2d ProtoStructProbe                build + run   (reports; can the
+#                                                      runtime carry
+#                                                      google.protobuf.Struct)
 #    3  Nghttp2AllocBench               build + run   (reports, never gates)
 #    3b Nghttp2ProtobufConformance      build + run   (reports; gates only on
 #                                                      a BROKEN probe)
@@ -325,6 +328,40 @@ if [[ -f "$PROBE" ]]; then
   fi
 else
   echo "  SKIP  ProtoOptionalProbe.dpr not present"
+fi
+
+# ── 2d · Struct feasibility probe (report only, not a gate) ─────────────────
+# Asks whether the runtime can carry google.protobuf.Struct BEFORE anyone
+# writes the bundle: a oneof mixing has-bit scalars with nil-signalled
+# submessages, and a mutually recursive class graph. The C1c tally puts 286 of
+# 7301 corpus files behind exactly this, so it is the next decision to make.
+#
+# Reports rather than gates: it measures a capability nothing ships against
+# yet. The day the bundle lands it becomes a gate - and until then a NO here
+# is a finding to read, not a build to stop.
+echo
+echo "── Struct feasibility probe (report only, not a gate) ───────────────"
+SPROBE="$HERE/ProtoStructProbe.dpr"
+if [[ -f "$SPROBE" ]]; then
+  SPOUT="$OUT/structprobe"
+  mkdir -p "$SPOUT"
+  rm -f "$SPOUT"/*.ppu "$SPOUT"/*.o "$SPOUT/ProtoStructProbe" 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+       -FU"$SPOUT" -FE"$SPOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$SPROBE" > "$SPOUT/build.log" 2>&1 && [[ -x "$SPOUT/ProtoStructProbe" ]]; then
+    "$SPOUT/ProtoStructProbe" < /dev/null | sed 's/^/  /'
+  else
+    # A compile failure IS the answer to Q1 - the mixed-presence oneof is not
+    # expressible - so it is reported as a result, not as a broken stage.
+    echo "  the probe did not COMPILE. That is itself an answer: the shape"
+    echo "  Struct needs is not expressible as written."
+    grep -E "Error|Fatal" "$SPOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $SPOUT/build.log"
+  fi
+else
+  echo "  SKIP  ProtoStructProbe.dpr not present"
 fi
 
 # ── allocation benchmark — reported, never a gate ────────────────────────────
