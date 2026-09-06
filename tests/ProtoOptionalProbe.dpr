@@ -1,7 +1,21 @@
 program ProtoOptionalProbe;
 
 // ============================================================================
-//  ProtoOptionalProbe - how can proto3 `optional` be expressed in this codec?
+//  ProtoOptionalProbe - what may a published property BE, on each compiler?
+//
+//  Written as a one-off feasibility probe for proto3 `optional` (see below),
+//  and kept as a GATE, because the thing it measures is an assumption the
+//  whole RTTI layer rests on and one that can change under you between
+//  compiler versions. Every proto field must be a published property -
+//  Nghttp2.Protobuf.Rtti filters on `LProp.Visibility <> mvPublished`
+//  deliberately, since public and protected RTTI are unreliable across the two
+//  compilers - so "what is publishable" decides what the codec can express.
+//
+//  It exits non-zero if any construct it expects to be discoverable is not.
+//  A compiler upgrade that withdrew read-only published properties, or that
+//  started refusing generic class properties, would break PRESENCE-1 and the
+//  submessage path respectively; this stage says so in one line instead of
+//  leaving it to be re-derived from a confusing downstream failure.
 //
 //  ROUND 1 RESULT (2026-09-06) - the record design is DEAD:
 //
@@ -57,8 +71,12 @@ program ProtoOptionalProbe;
 //  -FE/-FU do not:
 //    mkdir -p .fpc-out/probe
 //
-//  A COMPILE FAILURE IS A RESULT. Paste the error and the line numbers rather
-//  than working around it - the line tells us which candidate died.
+//  Wired as stage 2c of build-codec-fpc.sh and of run-tests.bat.
+//
+//  A COMPILE FAILURE IS A RESULT, and here it is the MOST informative one: it
+//  means a construct this codec depends on is no longer publishable. The line
+//  number names which. Do not work around it - the four candidates are on
+//  consecutive published lines precisely so the failure localises itself.
 // ============================================================================
 
 {$APPTYPE CONSOLE}

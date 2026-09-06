@@ -12,6 +12,10 @@
 #                                                      framing + reassembly
 #                                                      under adversarial chunk
 #                                                      boundaries)
+#    2c ProtoOptionalProbe              build + run   (gates; what this compiler
+#                                                      permits as a published
+#                                                      property — the bound on
+#                                                      what the codec can express)
 #    3  Nghttp2AllocBench               build + run   (reports, never gates)
 #    3b Nghttp2ProtobufConformance      build + run   (reports; gates only on
 #                                                      a BROKEN probe)
@@ -241,6 +245,57 @@ if [[ -f "$FRAMING" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2GrpcFramingTests.dpr not present"
+fi
+
+# ── 2c · what may a published property BE, on this compiler? ─────────────────
+# Every proto field must be a published property — Nghttp2.Protobuf.Rtti filters
+# on mvPublished deliberately, since public/protected RTTI is unreliable across
+# the two compilers — so "what is publishable" bounds what the codec can express.
+#
+# That is not a fixed fact. It differs BETWEEN the compilers today: a published
+# record is accepted by Delphi 36.0 and refused outright by FPC 3.3.1, which is
+# what killed the obvious TProtoOptional<T> design for PRESENCE-1. A generic
+# CLASS publishes fine on both, so the restriction is about records, not
+# generics. Those results were measured, not recalled, and this stage is what
+# keeps them measured.
+#
+# It gates because a compiler upgrade withdrawing read-only published properties
+# would break PRESENCE-1, and one refusing generic class properties would break
+# the submessage path — each otherwise surfacing as a confusing failure
+# somewhere downstream.
+echo
+echo "── published-property capability (PRESENCE-1 foundation) ────────────"
+PROBE="$HERE/ProtoOptionalProbe.dpr"
+if [[ -f "$PROBE" ]]; then
+  POUT="$OUT/probe"
+  mkdir -p "$POUT"
+  rm -f "$POUT"/*.ppu "$POUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+       -FU"$POUT" -FE"$POUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$PROBE" > "$POUT/build.log" 2>&1 && [[ -x "$POUT/ProtoOptionalProbe" ]]; then
+    "$POUT/ProtoOptionalProbe" < /dev/null
+    PRC=$?
+    if [[ $PRC -ne 0 ]]; then
+      echo "  capability probe: FAILED — a construct the codec relies on is"
+      echo "                    no longer discoverable as a published property"
+      [[ $RC -eq 0 ]] && RC=1
+    else
+      echo "  capability probe: PASSED"
+    fi
+  else
+    # A COMPILE failure here is the most informative outcome, not the least:
+    # it means the compiler now refuses a construct the codec depends on. The
+    # line number names which candidate.
+    echo "  FAIL  ProtoOptionalProbe.dpr did not compile — a published-property"
+    echo "        form this codec depends on may no longer be accepted."
+    grep -E "Error|Fatal" "$POUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $POUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  ProtoOptionalProbe.dpr not present"
 fi
 
 # ── allocation benchmark — reported, never a gate ────────────────────────────

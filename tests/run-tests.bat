@@ -9,6 +9,9 @@ REM    1  Nghttp2ProtobufTests            build + run   (gates)
 REM    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
 REM    2b Nghttp2GrpcFramingTests         build + run   (gates) - gRPC framing
 REM                                                     + reassembly chunking
+REM    2c ProtoOptionalProbe              build + run   (gates) - what this
+REM                                                     compiler permits as a
+REM                                                     published property
 REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
 REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
 REM    5  ProtogenParserTests             build + run   (gates) - in
@@ -98,6 +101,18 @@ REM message per frame and corrupts against every real one"; nothing tested that
 REM until 2026-09-06. The variable under test is the chop pattern, and the
 REM suite asserts the patterns genuinely differed rather than trusting them to.
 set "STAGE=Nghttp2GrpcFramingTests"
+set "GATES=1"
+call :build_run
+
+REM Stage 2c. What may a published property BE on this compiler? Every proto
+REM field must be one (Nghttp2.Protobuf.Rtti filters on mvPublished), so this
+REM bounds what the codec can express - and it is NOT the same on both
+REM compilers: a published record is accepted here and refused by FPC 3.3.1,
+REM which is what killed the obvious TProtoOptional<T> design for PRESENCE-1.
+REM Gates because a compiler upgrade withdrawing read-only published properties
+REM would break PRESENCE-1, and one refusing generic class properties would
+REM break the submessage path.
+set "STAGE=ProtoOptionalProbe"
 set "GATES=1"
 call :build_run
 
