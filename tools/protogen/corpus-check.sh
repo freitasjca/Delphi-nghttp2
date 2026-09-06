@@ -202,11 +202,12 @@ else
   while IFS=$'\t' read -r _bracket f; do
     [[ -f "$f" ]] || continue
     set=""
-    # struct-family was here until STRUCT-1 bundled it. Leaving it in reported
-    # 13 files as wanting "struct-family any" when Any alone was blocking them -
-    # a closure list that outlived its gap, which is the same way an oracle note
-    # goes stale. The check at the end of this section now catches that.
-    grep -Eq 'google\.protobuf\.Any\b' "$f" && set+=" any"
+    # Two groups have been removed from here, each when its gap closed:
+    # struct-family at STRUCT-1, any at ANY-1. Both were caught the same way -
+    # a closure list outliving its gap inflates every count with something that
+    # no longer blocks anything. struct-family was found by hand, one run late;
+    # `any` was found by the STALE check below, on the run after ANY-1 shipped,
+    # which is what that check exists for.
     grep -Eq '\b(sint32|sint64|fixed32|fixed64|sfixed32|sfixed64)\b' "$f" \
       && set+=" group-b"
     # Anchored to line start: `required` and `extensions` are common English.
@@ -332,6 +333,7 @@ echo "  51%  2026-08-30  after nested flattening"
 echo "  85%  2026-09-05  after WKT bundling + PRESENCE-1 + ONEOF-1"
 echo "  94%  2026-09-06  after MAP-1"
 echo "  98%  2026-09-06  after STRUCT-1  (7217/7301, 84 refusals)"
+echo "  99%  2026-09-06  after ANY-1     (7267/7301, 34 refusals)"
 echo
 echo "These are RECORDED RESULTS, not targets - update the list when a"
 echo "stage legitimately moves it, so a regression shows as a drop rather"
