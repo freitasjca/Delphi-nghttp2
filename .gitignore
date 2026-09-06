@@ -89,3 +89,8 @@ tools/protogen/ProtogenCheck
 .interop-*/
 __pycache__/
 tests/interop/Nghttp2InteropCodec
+
+# corpus-check.sh scratch: a multi-hundred-MB clone and a compiled
+# binary with no extension (so *.exe does not cover it).
+tools/protogen/.corpus/
+tools/protogen/.corpus-out/
