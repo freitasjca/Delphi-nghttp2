@@ -8,6 +8,10 @@
 #  Stages:
 #    1  Nghttp2ProtobufTests            build + run   (gates)
 #    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
+#    2b Nghttp2GrpcFramingTests         build + run   (gates; gRPC length-prefix
+#                                                      framing + reassembly
+#                                                      under adversarial chunk
+#                                                      boundaries)
 #    3  Nghttp2AllocBench               build + run   (reports, never gates)
 #    3b Nghttp2ProtobufConformance      build + run   (reports; gates only on
 #                                                      a BROKEN probe)
@@ -190,6 +194,53 @@ if [[ -f "$NEG" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2ProtobufNegativeTests.dpr not present"
+fi
+
+# ── 2b · gRPC framing + reassembly under adversarial chunking ────────────────
+# Added 2026-09-06. Nghttp2.Grpc.StreamReader's own header warns that decoding
+# per DATA frame "works perfectly against a test client that sends one message
+# per frame and corrupts against every real one" — and until this stage nothing
+# tested it. The reassembly buffer was covered only end to end by the M6a/M6b
+# streaming suites, whose chunk boundaries are whatever the client happened to
+# produce, i.e. exactly the shape the warning is about. A reader that decoded
+# per chunk would have passed all 24 of those checks.
+#
+# The variable under test is the CHOP PATTERN: one byte stream, seven delivery
+# patterns, identical message sequence required from each. The suite also
+# asserts that the patterns genuinely differed (read counts), because seven
+# passes from seven identical deliveries would prove one thing seven times.
+#
+# -dNGHTTP2_GRPC_NO_FFI for the same reason as the negative suite above:
+# IGrpcStreamReader lives in Nghttp2.Grpc.Registry, which pulls in ffi.manager,
+# and nothing here dispatches a call.
+echo
+echo "── gRPC framing + reassembly (chop patterns) ────────────────────────"
+FRAMING="$HERE/Nghttp2GrpcFramingTests.dpr"
+if [[ -f "$FRAMING" ]]; then
+  FOUT="$OUT/framing"
+  mkdir -p "$FOUT"
+  rm -f "$FOUT"/*.ppu "$FOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+       -FU"$FOUT" -FE"$FOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$FRAMING" > "$FOUT/build.log" 2>&1 && [[ -x "$FOUT/Nghttp2GrpcFramingTests" ]]; then
+    "$FOUT/Nghttp2GrpcFramingTests" < /dev/null
+    FRC=$?
+    if [[ $FRC -ne 0 ]]; then
+      echo "  framing suite: FAILED ($FRC checks)"
+      [[ $RC -eq 0 ]] && RC=1
+    else
+      echo "  framing suite: PASSED"
+    fi
+  else
+    echo "  FAIL  Nghttp2GrpcFramingTests.dpr did not compile"
+    grep -E "Error|Fatal" "$FOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $FOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2GrpcFramingTests.dpr not present"
 fi
 
 # ── allocation benchmark — reported, never a gate ────────────────────────────

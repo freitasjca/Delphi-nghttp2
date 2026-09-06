@@ -7,6 +7,8 @@ REM  The Windows counterpart to build-codec-fpc.sh. Same stages, same gating:
 REM
 REM    1  Nghttp2ProtobufTests            build + run   (gates)
 REM    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
+REM    2b Nghttp2GrpcFramingTests         build + run   (gates) - gRPC framing
+REM                                                     + reassembly chunking
 REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
 REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
 REM    5  ProtogenParserTests             build + run   (gates) - in
@@ -86,6 +88,16 @@ set "GATES=1"
 call :build_run
 
 set "STAGE=Nghttp2ProtobufNegativeTests"
+set "GATES=1"
+call :build_run
+
+REM Stage 2b. gRPC length-prefix framing and, more to the point, reassembly
+REM under adversarial chunk boundaries. StreamReader's own header warns that
+REM per-frame decoding "works perfectly against a test client that sends one
+REM message per frame and corrupts against every real one"; nothing tested that
+REM until 2026-09-06. The variable under test is the chop pattern, and the
+REM suite asserts the patterns genuinely differed rather than trusting them to.
+set "STAGE=Nghttp2GrpcFramingTests"
 set "GATES=1"
 call :build_run
 
