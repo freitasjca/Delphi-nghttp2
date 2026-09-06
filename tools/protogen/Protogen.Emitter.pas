@@ -295,6 +295,20 @@ begin
   W('  [TGrpcMessage]');
   W('  ' + PascalTypeName(AMsg.QualifiedName) + ' = class');
   W('  private');
+
+  { TWO passes, and the split is a language requirement rather than a style
+    choice: within one visibility section Pascal demands every FIELD precede
+    any METHOD or PROPERTY. Emitting field/has-bit/setter per iteration puts
+    the second field after the first setter and the unit does not compile -
+
+      Error: Fields cannot appear after a method or property definition,
+             start a new visibility section first
+
+    Found by the C6b gate on its first run, after fourteen text-comparison
+    checks had passed against exactly this output. Emitting valid-LOOKING
+    Pascal is not the same as emitting Pascal. }
+
+  // Pass 1 - every backing field, including has-bits.
   for I := 0 to AMsg.Fields.Count - 1 do
   begin
     LField     := AMsg.Fields[I];
@@ -306,12 +320,21 @@ begin
     begin
       LAnyOptional := True;
       W('    F' + HasBitName(LPropName) + ': Boolean;');
-      { The setter is the mechanism, not a convenience: deserialisation writes
-        through TRttiProperty.SetValue, which calls this, which raises the bit.
-        That is why the bit below is read-only and why nothing on the decode
-        side has to know about presence at all. }
-      W('    procedure Set' + LPropName + '(const AValue: ' + LFieldType + ');');
     end;
+  end;
+
+  // Pass 2 - the setters, which must come after every field above.
+  { The setter is the mechanism, not a convenience: deserialisation writes
+    through TRttiProperty.SetValue, which calls it, which raises the bit. That
+    is why the has-bit property is read-only, and why nothing on the decode
+    side has to know about presence at all. }
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    LField := AMsg.Fields[I];
+    if not NeedsHasBit(LField) then Continue;
+    LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
+    LFieldType := PascalFieldType(LField, FFile);
+    W('    procedure Set' + LPropName + '(const AValue: ' + LFieldType + ');');
   end;
 
   if LAnyOptional then

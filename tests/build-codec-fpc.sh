@@ -31,6 +31,12 @@
 #   12  protogen GENERATED output (C6a) build + run   (gates; skips without
 #                                                      the horse-provider-nghttp2
 #                                                      sibling checkout)
+#   12b protogen 'optional' output      build + run   (gates; C6b — compiles
+#                                                      AND runs generated
+#                                                      presence code, so the
+#                                                      emitter and the RTTI
+#                                                      validator are checked
+#                                                      against each other)
 #   13  cross-language interop (§7.5)   build + run   (gates; skips without
 #                                                      grpc_tools. The only
 #                                                      stage whose verdict comes
@@ -768,6 +774,62 @@ else
     grep -E "Error|Fatal" "$GCOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $GCOUT/build.log"
     echo "    generated units kept for inspection: $GENOUT"
+    [[ $RC -eq 0 ]] && RC=2
+  fi
+fi
+
+# ── 12b · C6b — compile AND RUN protogen's `optional` output ────────────────
+# C6a above generates from greeter.proto, which has no optional fields. So
+# PRESENCE-1's emitter checks all compare TEXT TO TEXT — the very hole C6a
+# exists to close, reopened one feature along.
+#
+# Two things are under test, and the second is the one that matters: that the
+# generated unit compiles, and that AttachHasBits ACCEPTS it at run time. The
+# emitter and the RTTI validator were written to the same contract in the same
+# session, so they agree with each other by construction; until this stage
+# nothing had put that agreement in front of a compiler and a live registry.
+#
+# No -Fu libffi here, unlike C6a: optional.proto declares no service, so
+# nothing reaches RegisterService<T> and the IInvokable path is not involved.
+echo
+echo "── protogen 'optional' output — compile + run (C6b) ─────────────────"
+OPTPROTO="$PROTOGEN/optional.proto"
+OPTCHECK="$PROTOGEN/ProtogenOptionalCompileCheck.dpr"
+if [[ ! -x "$PBOUT/Protogen" ]]; then
+  echo "  SKIP  Protogen binary not built (earlier stage is compile-only)"
+elif [[ ! -f "$OPTPROTO" || ! -f "$OPTCHECK" ]]; then
+  echo "  SKIP  optional.proto / ProtogenOptionalCompileCheck.dpr not present"
+else
+  OPTGEN="$OUT/optgen"
+  OPTOUT="$OUT/optcheck"
+  # Wiped, not reused: §6.4 PRESERVES an existing .Service.pas and writes a
+  # .new.pas beside it, so a second run would compile the stale one.
+  rm -rf "$OPTGEN" "$OPTOUT"
+  mkdir -p "$OPTGEN" "$OPTOUT"
+
+  if ! "$PBOUT/Protogen" -i "$OPTPROTO" -o "$OPTGEN" \
+         --unit-prefix Sample.Opt > "$OPTOUT/generate.log" 2>&1; then
+    echo "  FAIL  Protogen could not generate from optional.proto"
+    sed 's/^/    /' "$OPTOUT/generate.log" | head -12
+    [[ $RC -eq 0 ]] && RC=2
+  elif "$TRUNK" -MDelphi -O1 \
+         -FU"$OPTOUT" -FE"$OPTOUT" \
+         -Fu"$OPTGEN" -Fu"$SRC" \
+         $TRUNK_UNIT_PATHS \
+         "$OPTCHECK" > "$OPTOUT/build.log" 2>&1 \
+       && [[ -x "$OPTOUT/ProtogenOptionalCompileCheck" ]]; then
+    "$OPTOUT/ProtogenOptionalCompileCheck" < /dev/null | sed 's/^/  /'
+    if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+      echo "  PASS  generated \`optional\` code compiles and behaves"
+    else
+      echo "  FAIL  generated \`optional\` code compiled but misbehaved"
+      [[ $RC -eq 0 ]] && RC=2
+    fi
+  else
+    echo "  FAIL  protogen's \`optional\` output did not compile under FPC"
+    grep -E "Error|Fatal" "$OPTOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $OPTOUT/build.log"
+    echo "    generated units kept for inspection: $OPTGEN"
     [[ $RC -eq 0 ]] && RC=2
   fi
 fi

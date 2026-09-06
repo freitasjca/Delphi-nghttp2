@@ -1,0 +1,48 @@
+// optional.proto — the C6b fixture: a schema whose GENERATED Pascal is put in
+// front of a compiler and then run.
+//
+// Exists because every PRESENCE-1 emitter check compares text to text. That is
+// the same hole C6a was created to close for the greeter path: an emitter can
+// produce plausible-looking Pascal that does not compile, or that compiles and
+// is then rejected by the RTTI layer at first use. The emitter and
+// AttachHasBits were written to the same contract in the same session, so they
+// agree with each other by construction — which is exactly the kind of
+// agreement that proves nothing.
+//
+// Every field here earns its place:
+//
+//   plain   implicit presence — the control. Must still be emitted
+//           unconditionally, and must NOT acquire a has-bit.
+//   i32     the ordinary case.
+//   s       a length-delimited scalar; the has-bit skip must apply to
+//           pkString too, not only to varints.
+//   b       Boolean VALUE next to Boolean has-bits — the one shape where a
+//           mix-up in AttachHasBits would be easiest to make and hardest to
+//           see, since both properties are the same Pascal type.
+//   col     an enum, so the generated Clear emits Default(TOptColour). Enums
+//           are varints on the wire and take a has-bit like any scalar.
+//   ids     repeated, alongside. Must be untouched: proto3 cannot express
+//           empty-vs-absent, so it has no presence and gets no bit.
+//
+// No service is declared on purpose. This fixture tests message emission, and
+// a service would drag the IInvokable/RTTI registration path — and libffi on
+// FPC — into a check that has nothing to do with either.
+
+syntax = "proto3";
+
+package opt;
+
+enum OptColour {
+  OPT_COLOUR_UNSET = 0;
+  OPT_COLOUR_RED   = 1;
+  OPT_COLOUR_BLUE  = 2;
+}
+
+message OptMsg {
+  int32           plain = 1;
+  optional int32  i32   = 2;
+  optional string s     = 3;
+  optional bool   b     = 4;
+  optional OptColour col = 5;
+  repeated int32  ids   = 6;
+}
