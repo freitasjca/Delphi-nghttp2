@@ -42,7 +42,8 @@ uses
 {$IFEND}
   Nghttp2.Protobuf,
   Nghttp2.Protobuf.Rtti,
-  Nghttp2.Protobuf.WellKnown;
+  Nghttp2.Protobuf.WellKnown,
+  Nghttp2.Protobuf.Any;
 
 var
   GPassCount: Integer = 0;
@@ -1411,6 +1412,260 @@ end;
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+// ── 16 · google.protobuf.Any (ANY-1) ────────────────────────────────────────
+//  Any is the only well-known type whose payload is a MESSAGE identified by a
+//  string that ARRIVES FROM THE PEER. So the checks that matter are not the
+//  round trip - that is two fields - but the refusals: what happens when
+//  type_url does not say what the caller assumed.
+//
+//  Registration order matters here, so the registry is cleared first and last.
+//  That is the only reason TProtoAnyRegistry.Clear exists.
+
+type
+  // One try/except serving many cases. Anonymous procedures would read better,
+  // but FPC in Delphi mode refuses them without a modeswitch and nothing else
+  // in this repo uses one - so the shape is a case statement rather than a
+  // closure. Same reason Horse.CORS is a plain unit-scope procedure.
+  TAnyCase = (acEmptyName, acNilClass, acUrlAsName, acDupName, acDupClass,
+              acPackNil, acPackUnregistered, acUnpackNewUnknown,
+              acUnpackToUnknown);
+
+function AnyRefused(ACase: TAnyCase; AAny: TProtobufAny;
+  out AMsg: string): Boolean;
+var
+  LTmp: TObject;
+begin
+  Result := False;
+  AMsg   := '';
+  LTmp   := nil;
+  try
+    try
+      case ACase of
+        acEmptyName:
+          TProtoAnyRegistry.RegisterType('', TProtobufTimestamp);
+        acNilClass:
+          TProtoAnyRegistry.RegisterType('x.Y', nil);
+        acUrlAsName:
+          TProtoAnyRegistry.RegisterType('type.googleapis.com/x.Y',
+            TProtobufTimestamp);
+        acDupName:
+          TProtoAnyRegistry.RegisterType('google.protobuf.Timestamp',
+            TProtobufDuration);
+        acDupClass:
+          TProtoAnyRegistry.RegisterType('other.Name', TProtobufTimestamp);
+        acPackNil:
+          TProtoAny.Pack(AAny, nil);
+        acPackUnregistered:
+          begin
+            LTmp := TProtobufFieldMask.Create;
+            TProtoAny.Pack(AAny, LTmp);
+          end;
+        acUnpackNewUnknown:
+          LTmp := TProtoAny.UnpackNew(AAny);
+        acUnpackToUnknown:
+          begin
+            LTmp := TProtobufTimestamp.Create;
+            TProtoAny.UnpackTo(AAny, LTmp);
+          end;
+      end;
+    except
+      on E: EProtoAnyError do
+      begin
+        Result := True;
+        AMsg   := E.Message;
+      end;
+    end;
+  finally
+    LTmp.Free;
+  end;
+end;
+
+procedure TestAny;
+var
+  LAny:  TProtobufAny;
+  LTs:   TProtobufTimestamp;
+  LDur:  TProtobufDuration;
+  LOut:  TObject;
+  LOk:   Boolean;
+  LMsg:  string;
+begin
+  Section('16  google.protobuf.Any (ANY-1)');
+
+  TProtoAnyRegistry.Clear;
+  Check('a cleared registry is empty', TProtoAnyRegistry.Count = 0);
+
+  { type_url parsing first, because everything below depends on it. Only the
+    segment after the LAST slash is significant - the host part is decoration
+    and must never be fetched. }
+  Check('TypeNameOf strips the conventional prefix',
+    TProtoAny.TypeNameOf('type.googleapis.com/google.protobuf.Duration')
+      = 'google.protobuf.Duration');
+  Check('TypeNameOf accepts a bare name',
+    TProtoAny.TypeNameOf('google.protobuf.Duration')
+      = 'google.protobuf.Duration');
+  Check('TypeNameOf takes the LAST segment, not the first',
+    TProtoAny.TypeNameOf('a/b/c.D') = 'c.D');
+  Check('TypeNameOf of a trailing slash is empty',
+    TProtoAny.TypeNameOf('x/') = '');
+  Check('TypeNameOf of empty is empty', TProtoAny.TypeNameOf('') = '');
+
+  // ── registration invariants ──────────────────────────────────────────────
+  LOk := AnyRefused(acEmptyName, nil, LMsg);
+  Check('an empty proto name is refused', LOk, LMsg);
+
+  LOk := AnyRefused(acNilClass, nil, LMsg);
+  Check('a nil class is refused', LOk, LMsg);
+
+  { A type_url where a proto NAME belongs registers happily and then never
+    matches an incoming url, because that one gets its prefix stripped and
+    this one does not. Silent, so it is refused where the mistake is made. }
+  LOk := AnyRefused(acUrlAsName, nil, LMsg);
+  Check('a type_url passed as a proto name is refused', LOk, LMsg);
+  Check('  and the message shows the name to use instead',
+    Pos('x.Y', LMsg) > 0, LMsg);
+
+  TProtoAnyRegistry.RegisterType('google.protobuf.Timestamp', TProtobufTimestamp);
+  TProtoAnyRegistry.RegisterType('google.protobuf.Duration',  TProtobufDuration);
+  Check('two types registered', TProtoAnyRegistry.Count = 2);
+
+  { Idempotent, so a unit registering in its initialization section stays safe
+    if it is pulled in twice. }
+  TProtoAnyRegistry.RegisterType('google.protobuf.Timestamp', TProtobufTimestamp);
+  Check('re-registering the SAME pair is a no-op', TProtoAnyRegistry.Count = 2);
+
+  LOk := AnyRefused(acDupName, nil, LMsg);
+  Check('one name for two classes is refused', LOk, LMsg);
+
+  LOk := AnyRefused(acDupClass, nil, LMsg);
+  Check('one class under two names is refused', LOk, LMsg);
+  Check('  and neither conflict left a partial entry',
+    TProtoAnyRegistry.Count = 2);
+
+  // ── pack / unpack round trip ─────────────────────────────────────────────
+  LAny := TProtobufAny.Create;
+  try
+    LTs := TProtobufTimestamp.Create;
+    try
+      LTs.seconds := 1700000000;
+      LTs.nanos   := 42;
+      TProtoAny.Pack(LAny, LTs);
+      Check('Pack wrote the conventional type_url',
+        LAny.type_url = 'type.googleapis.com/google.protobuf.Timestamp',
+        LAny.type_url);
+      Check('Pack wrote a non-empty payload', Length(LAny.value) > 0);
+      Check('IsType recognises the packed type',
+        TProtoAny.IsType(LAny, TProtobufTimestamp));
+      Check('IsType rejects a different type',
+        not TProtoAny.IsType(LAny, TProtobufDuration));
+    finally
+      LTs.Free;
+    end;
+
+    LTs := TProtobufTimestamp.Create;
+    try
+      TProtoAny.UnpackTo(LAny, LTs);
+      Check('UnpackTo restored seconds', LTs.seconds = 1700000000);
+      Check('UnpackTo restored nanos',   LTs.nanos = 42);
+    finally
+      LTs.Free;
+    end;
+
+    { THE security check, and the reason these two types were chosen: Timestamp
+      and Duration have IDENTICAL field numbers and types, so decoding one as
+      the other SUCCEEDS and is silently wrong. A test using two dissimilar
+      messages would pass because the decode happened to fail, proving nothing
+      about the type check. Written inline rather than through AnyRefused so
+      the destination can be inspected afterwards. }
+    LDur := TProtobufDuration.Create;
+    try
+      LOk  := False;
+      LMsg := '';
+      try
+        TProtoAny.UnpackTo(LAny, LDur);
+      except
+        on E: EProtoAnyError do
+        begin
+          LOk  := True;
+          LMsg := E.Message;
+        end;
+      end;
+      Check('UnpackTo REFUSES a wire-compatible type mismatch', LOk, LMsg);
+      Check('  and the message names both types',
+        (Pos('Timestamp', LMsg) > 0) and (Pos('Duration', LMsg) > 0), LMsg);
+      Check('  and the destination was left untouched', LDur.seconds = 0);
+    finally
+      LDur.Free;
+    end;
+
+    // UnpackNew resolves through the registry and hands over ownership.
+    LOut := TProtoAny.UnpackNew(LAny);
+    try
+      Check('UnpackNew built the registered class', LOut is TProtobufTimestamp);
+      Check('UnpackNew decoded the payload',
+        (LOut as TProtobufTimestamp).seconds = 1700000000);
+    finally
+      LOut.Free;
+    end;
+  finally
+    LAny.Free;
+  end;
+
+  // ── refusals on hostile or incomplete input ──────────────────────────────
+  LAny := TProtobufAny.Create;
+  try
+    { An empty type_url is what a default-constructed Any carries, and what a
+      peer sends when it wants the payload interpreted by guesswork. }
+    LOk := AnyRefused(acUnpackNewUnknown, LAny, LMsg);
+    Check('an empty type_url is refused', LOk, LMsg);
+
+    LAny.type_url := 'type.googleapis.com/nobody.Knows';
+    LOk := AnyRefused(acUnpackNewUnknown, LAny, LMsg);
+    Check('an UNREGISTERED type is refused, not returned as nil', LOk, LMsg);
+    Check('  and the message names the unknown type',
+      Pos('nobody.Knows', LMsg) > 0, LMsg);
+
+    LOk := AnyRefused(acUnpackToUnknown, LAny, LMsg);
+    Check('UnpackTo also refuses an unknown type_url', LOk, LMsg);
+
+    LOk := AnyRefused(acPackNil, LAny, LMsg);
+    Check('Pack refuses a nil message', LOk, LMsg);
+
+    { Pack must not invent a type_url from the Pascal class name -
+      'TProtobufFieldMask' is not a proto name and no other implementation
+      would recognise it. }
+    LOk := AnyRefused(acPackUnregistered, LAny, LMsg);
+    Check('Pack refuses an unregistered class rather than guessing', LOk, LMsg);
+    Check('  and the message says how to register it',
+      Pos('RegisterType', LMsg) > 0, LMsg);
+  finally
+    LAny.Free;
+  end;
+
+  { The explicit-name overload needs no registry at all - the path for a
+    program that only ever PRODUCES Any values. }
+  LAny := TProtobufAny.Create;
+  try
+    LDur := TProtobufDuration.Create;
+    try
+      LDur.seconds := 7;
+      TProtoAny.Pack(LAny, LDur, 'custom.Thing');
+      Check('the explicit-name overload bypasses the registry',
+        LAny.type_url = 'type.googleapis.com/custom.Thing', LAny.type_url);
+    finally
+      LDur.Free;
+    end;
+
+    { And an Any is an ordinary submessage to the codec - which is the whole
+      claim that ANY-1 needed no codec change. }
+    Check('a packed Any serialises through the ordinary path',
+      Length(TProtoSerializer.Serialize(LAny)) > 0);
+  finally
+    LAny.Free;
+  end;
+
+  TProtoAnyRegistry.Clear;
+end;
+
 begin
   try
     WriteLn('Nghttp2ProtobufTests - M1 wire codec + M1b RTTI serializer');
@@ -1431,6 +1686,7 @@ begin
     TestEmptyMessage;
     TestExplicitPresence;
     TestStructFamily;
+    TestAny;
 
     WriteLn;
     WriteLn(Format('[Nghttp2Protobuf] %d passed, %d failed', [GPassCount, GFailCount]));

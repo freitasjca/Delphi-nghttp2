@@ -290,13 +290,23 @@ import "google/protobuf/struct.proto";
 message M { google.protobuf.Struct s = 1; }
 EOF
 
-# The control for the row above. Without a still-refused well-known type,
-# "the table is right" is indistinguishable from "the table accepts anything
-# under google.protobuf.".
-add_case wellknown_blocked refuse "Any needs run-time type-URL resolution" <<EOF
+# ANY-1 - the class was always two fields; what was missing was a way to put
+# anything in or get anything out. Nghttp2.Protobuf.Any supplies that.
+add_case wellknown_any accept "ANY-1 - Any bundled, with a type registry" <<EOF
 $HDR
 import "google/protobuf/any.proto";
 message M { google.protobuf.Any a = 1; }
+EOF
+
+# The control for the two rows above, and it MUST keep existing: without a
+# still-refused well-known type, "the table is right" is indistinguishable from
+# "the table accepts anything under google.protobuf.". Was Struct, then Any;
+# both got bundled. Api is protobuf's own reflection machinery, so it is the
+# one least likely to move.
+add_case wellknown_blocked refuse "Api is reflection machinery, not user data" <<EOF
+$HDR
+import "google/protobuf/api.proto";
+message M { google.protobuf.Api a = 1; }
 EOF
 
 add_case proto2_syntax refuse "proto2 - valid to protoc, out of scope for us" <<EOF

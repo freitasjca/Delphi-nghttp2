@@ -34,6 +34,7 @@ package opt;
 
 import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
 
 enum OptColour {
   OPT_COLOUR_UNSET = 0;
@@ -154,9 +155,14 @@ message OneofMsg {
 //       is what prevents it, and this field is what would catch its absence.
 //   t   a WKT that was ALREADY bundled - the control. If this one broke too,
 //       the cause is the WKT path generally rather than anything STRUCT-1 did.
+//   a   ANY-1. Also just a bundled message WKT to the emitter, but it is the
+//       one the C6b run uses to pack a GENERATED class (Payload, above) - the
+//       registry is otherwise only ever exercised against hand-written
+//       well-known classes, which are not what a user packs.
 message WktMsg {
   int32                     tag = 1;
   google.protobuf.Struct    s   = 2;
   google.protobuf.NullValue n   = 3;
   google.protobuf.Timestamp t   = 4;
+  google.protobuf.Any       a   = 5;
 }

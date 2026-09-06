@@ -298,13 +298,13 @@ begin
       Exit;   // bundled — nothing to refuse
 
     RefuseAt(ALine, ACol, ATypeName,
-      Format('Field %s refers to a well-known type that is not bundled. Any ' +
-             'needs dynamic type resolution - it carries a type URL and an ' +
-             'opaque payload, so decoding one means a run-time registry ' +
-             'mapping URLs to classes. Api, Type and DescriptorProto are ' +
-             'protobuf''s own reflection machinery. Timestamp, Duration, ' +
-             'FieldMask, Empty, the scalar wrappers, and Struct, Value, ' +
-             'ListValue and NullValue ARE supported.',
+      Format('Field %s refers to a well-known type that is not bundled. Api, ' +
+             'Type and DescriptorProto are protobuf''s own reflection ' +
+             'machinery - they describe .proto files rather than carrying ' +
+             'user data, and a program that needs them wants a descriptor ' +
+             'library. Everything else IS supported: Timestamp, Duration, ' +
+             'FieldMask, Empty, the scalar wrappers, Struct, Value, ' +
+             'ListValue, NullValue and Any.',
              [QuotedStr(AFieldName)]));
   end;
 end;

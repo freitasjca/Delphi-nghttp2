@@ -20,13 +20,15 @@ unit Nghttp2.Protobuf.WellKnown;
 //  above their declarations below. The corpus tally put 286 of 7301 files
 //  behind that family alone.
 //
+//  Any joined them in ANY-1, with the registry that makes it honest living in
+//  Nghttp2.Protobuf.Any — see the note on TProtobufAny below.
+//
 //  ── What is deliberately NOT here ──
 //
-//  Any, Api, Type, DescriptorProto. Any carries a type URL and an opaque
-//  payload, so it needs dynamic type resolution — a registry mapping URLs to
-//  classes at run time, which is a feature rather than four classes. The rest
-//  are protobuf's own reflection machinery. 37 files want Any; 6 want the
-//  others. Refusing them is honest where a half-working Any would not be.
+//  Api, Type, DescriptorProto — protobuf's own reflection machinery, which
+//  describes .proto files rather than carrying user data. 6 files in the
+//  corpus want them, and a program that needs them wants a descriptor library,
+//  not four more classes.
 //
 //  ── Wire compatibility ──
 //
@@ -186,6 +188,35 @@ type
     Fvalue: TBytes;
   published
     [TProtoMember(1)] property value: TBytes read Fvalue write Fvalue;
+  end;
+
+  // ── google.protobuf.Any ───────────────────────────────────────────────────
+  //
+  //  ANY-1, 2026-09-06. Structurally the simplest well-known type in this
+  //  unit - a string and a byte array - and semantically the most dangerous,
+  //  because `value` holds a SERIALISED MESSAGE whose type is named only by
+  //  `type_url`. Nothing about the bytes says what they are.
+  //
+  //  The class is here because it is data. Everything that gives it meaning -
+  //  packing, unpacking, and the registry mapping a type name to a Pascal
+  //  class - lives in Nghttp2.Protobuf.Any, because it needs TProtoSerializer
+  //  and this unit deliberately depends on nothing but Nghttp2.Protobuf.
+  //
+  //  Use the helpers there rather than touching these two properties by hand:
+  //  a type_url written by hand and a `value` from a different class is a
+  //  mismatch nothing downstream can detect, and the peer decodes garbage.
+  //
+  //  type_url is conventionally 'type.googleapis.com/<package>.<Message>'.
+  //  Only the part after the LAST '/' is significant - the host part carries
+  //  no meaning and must never be fetched.
+  [TGrpcMessage]
+  TProtobufAny = class
+  private
+    Ftype_url: string;
+    Fvalue:    TBytes;
+  published
+    [TProtoMember(1)] property type_url: string read Ftype_url write Ftype_url;
+    [TProtoMember(2)] property value:    TBytes read Fvalue    write Fvalue;
   end;
 
   // ── google.protobuf.Struct / Value / ListValue / NullValue ────────────────

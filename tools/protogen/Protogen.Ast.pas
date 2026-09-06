@@ -369,6 +369,12 @@ begin
   else if LName = 'google.protobuf.Value'       then Result := 'TProtobufValue'
   else if LName = 'google.protobuf.ListValue'   then Result := 'TProtobufListValue'
   else if LName = 'google.protobuf.NullValue'   then Result := 'TProtobufNullValue'
+  // ANY-1. The CLASS is two fields and always could have been bundled; what
+  // was missing was a way to put anything in it or get anything out. That is
+  // Nghttp2.Protobuf.Any - TProtoAnyRegistry plus Pack/UnpackTo/UnpackNew -
+  // which a generated unit does not reference, so nothing changes here beyond
+  // the mapping.
+  else if LName = 'google.protobuf.Any'         then Result := 'TProtobufAny'
   else Result := '';
 end;
 

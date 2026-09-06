@@ -45,6 +45,7 @@ uses
   Nghttp2.Protobuf,
   Nghttp2.Protobuf.Rtti,
   Nghttp2.Protobuf.WellKnown,   // STRUCT-1 - the bundled Struct family
+  Nghttp2.Protobuf.Any,         // ANY-1 - the registry + Pack/Unpack
   Sample.Opt.Messages;      // <- generated. The point of the exercise.
 
 var
@@ -96,6 +97,8 @@ var
   GOwn, GOwnDst: TOwnerMsg;      // PROTOGEN-DTOR
   GMap, GMapDst: TMapMsg;        // MAP-1
   GWkt, GWktDst: TWktMsg;        // STRUCT-1
+  GAnyOk: Boolean;               // ANY-1
+  GAnyErr: string;
   GPay: TPayload;
   GPayloads: TArray<TPayload>;
   GBytes: TBytes;
@@ -673,6 +676,56 @@ begin
       GWkt.Free;        { the generated destructor frees s and t }
       GWktDst.Free;     { and the codec-allocated ones }
     end;
+    { ANY-1 end-to-end, and the only place the registry meets GENERATED code.
+      Section 16 of the codec suite registers hand-written well-known classes;
+      what a user actually packs is a class protogen emitted, so that is what
+      is packed here. }
+    GAnyOk  := False;
+    GAnyErr := '';
+    try
+      TProtoAnyRegistry.RegisterType('opt.Payload', TPayload);
+
+      GWkt := TWktMsg.Create;
+      GWktDst := TWktMsg.Create;
+      try
+        GPay := TPayload.Create;
+        try
+          GPay.id   := 77;
+          GPay.note := 'packed into an Any';
+          GWkt.a := TProtobufAny.Create;
+          TProtoAny.Pack(GWkt.a, GPay);
+        finally
+          GPay.Free;      { Pack COPIES - the caller keeps ownership }
+        end;
+
+        Check('Pack resolved a GENERATED class through the registry',
+          GWkt.a.type_url = 'type.googleapis.com/opt.Payload', GWkt.a.type_url);
+
+        GBytes := TProtoSerializer.Serialize(GWkt);
+        TProtoSerializer.Deserialize(GBytes, GWktDst);
+
+        Check('round-trip: the Any field survives as a submessage',
+          (GWktDst.a <> nil) and (Length(GWktDst.a.value) > 0));
+        Check('round-trip: and still names the packed type',
+          (GWktDst.a <> nil) and TProtoAny.IsType(GWktDst.a, TPayload));
+
+        GPay := TPayload.Create;
+        try
+          TProtoAny.UnpackTo(GWktDst.a, GPay);
+          GAnyOk := (GPay.id = 77) and (GPay.note = 'packed into an Any');
+        finally
+          GPay.Free;
+        end;
+      finally
+        GWkt.Free;
+        GWktDst.Free;
+      end;
+    except
+      on E: Exception do GAnyErr := E.ClassName + ': ' + E.Message;
+    end;
+    Check('a generated class round-trips through a generated Any field',
+          GAnyOk, GAnyErr);
+    TProtoAnyRegistry.Clear;
   end;
 
   WriteLn;

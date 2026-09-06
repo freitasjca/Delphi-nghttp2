@@ -493,11 +493,18 @@ begin
   Check('Timestamp is NOT flagged as an enum', not WellKnownIsEnum('google.protobuf.Timestamp'));
   Check('a user type is not flagged as an enum', not WellKnownIsEnum('myapp.NullValue'));
 
-  { Any stays refused, and it is the control for the whole table: without a
-    still-unbundled entry, "the table is right" would be indistinguishable
-    from "the table accepts everything". }
-  Check('Any is STILL not bundled',
-    WellKnownPascalClass('google.protobuf.Any') = '');
+  { ANY-1 bundled Any, so the control moves to Api. There must ALWAYS be a
+    still-unbundled entry asserted here: without one, "the table is right" is
+    indistinguishable from "the table accepts everything under
+    google.protobuf.", and the refusal path would rot unnoticed. }
+  Check('Any now maps to TProtobufAny',
+    WellKnownPascalClass('google.protobuf.Any') = 'TProtobufAny');
+  Check('Api is STILL not bundled',
+    WellKnownPascalClass('google.protobuf.Api') = '');
+  Check('DescriptorProto is STILL not bundled',
+    WellKnownPascalClass('google.protobuf.DescriptorProto') = '');
+  Check('Any is NOT flagged as an enum',
+    not WellKnownIsEnum('google.protobuf.Any'));
   Check('a user type is not mistaken for well-known',
     WellKnownPascalClass('myapp.Timestamp') = '');
 
@@ -511,10 +518,12 @@ begin
     '  google.protobuf.Value     v = 2;'#10 +
     '  google.protobuf.ListValue l = 3;'#10 +
     '  google.protobuf.NullValue n = 4;'#10 +
+    '  google.protobuf.Any       a = 5;'#10 +
     '}'#10);
   try
     M := F.FindMessage('M');
-    Check('the Struct family parses as fields', (M <> nil) and (M.Fields.Count = 4));
+    Check('the Struct family and Any parse as fields',
+      (M <> nil) and (M.Fields.Count = 5));
     if M <> nil then
       Check('  each kept as a type reference, not a scalar',
         (M.Fields[0].Scalar = psNone) and (M.Fields[3].Scalar = psNone));
@@ -586,15 +595,19 @@ begin
     HDR + 'message M { google.protobuf.Api a = 1; }',
     'google.protobuf.Api');
 
-  ExpectRefusal('well-known Any (dynamic typing)',
-    HDR + 'message M { google.protobuf.Any a = 1; }',
-    'google.protobuf.Any');
+  { Was Any until ANY-1. DescriptorProto replaces it so this case keeps
+    testing what it was written to test - a second unbundled WKT, spelled
+    differently from the one above - rather than being deleted along with the
+    gap it happened to name. }
+  ExpectRefusal('well-known reflection type (not bundled)',
+    HDR + 'message M { google.protobuf.DescriptorProto d = 1; }',
+    'google.protobuf.DescriptorProto');
 
   { The rpc-type check, which did not exist before the well-known split. }
   ExpectRefusal('unbundled well-known type as an rpc response',
     HDR + 'message Q { int32 a = 1; }'#10 +
-    'service S { rpc Go (Q) returns (google.protobuf.Any); }',
-    'google.protobuf.Any');
+    'service S { rpc Go (Q) returns (google.protobuf.Api); }',
+    'google.protobuf.Api');
 
   { Nested declarations are no longer refused — see TestNesting. Left as a
     comment rather than deleted so the change is visible to anyone diffing
