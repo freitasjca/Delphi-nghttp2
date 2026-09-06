@@ -53,7 +53,15 @@ type
     procedure EmitTypeSection;
     procedure EmitEnum(AEnum: TProtoEnumNode);
     procedure EmitMessage(AMsg: TProtoMessageNode);
+    // PRESENCE-1 — proto3 `optional`
+    function  NeedsHasBit(AField: TProtoFieldNode): Boolean;
+    procedure EmitOptionalBodies;
   public
+    // The generated has-bit property name for a field's Pascal property name.
+    // Public so the C2 gate can assert against it rather than re-deriving the
+    // rule and agreeing with itself.
+    class function HasBitName(const APropName: string): string;
+
     // Emit a complete .Messages.pas into ALines. ALines is cleared first.
     // AUnitPrefix: dotted name prefix, e.g. 'Sample.Greeter' -- the unit
     // name becomes '<AUnitPrefix>.Messages'.
@@ -210,12 +218,80 @@ begin
   W;
 end;
 
+{ PRESENCE-1. True when this field needs a has-bit: `optional` on something the
+  codec treats as a scalar on the wire.
+
+  A message field is excluded and REFUSED rather than silently downgraded — it
+  already carries explicit presence through nil, so a has-bit would be a
+  second, contradictory source of truth, and the RTTI layer rejects that
+  pairing outright. An ENUM is included: it is a varint on the wire like any
+  other scalar and needs a bit exactly as much.
+
+  The parser cannot make this distinction — psNone means only "not a built-in
+  scalar", and a forward reference is unresolvable there — so it is made here,
+  where the whole file is in hand. }
+function TMessagesEmitter.NeedsHasBit(AField: TProtoFieldNode): Boolean;
+begin
+  Result := False;
+  if AField.FieldLabel <> plOptional then Exit;
+
+  if AField.Scalar <> psNone then Exit(True);      // a built-in scalar
+
+  if FFile.FindEnum(AField.TypeName) <> nil then
+    Exit(True);                                    // enum: varint, needs a bit
+
+  raise EEmitError.CreateFmt(
+    'Field %s is `optional %s`, and %s is a message. A message field already ' +
+    'has explicit presence - unset means nil, and nil is not emitted - so a ' +
+    'has-bit would be a second, contradictory source of truth and the ' +
+    'serializer refuses that pairing. Drop `optional`.',
+    [QuotedStr(AField.Name), AField.TypeName, AField.TypeName]);
+end;
+
+{ The generated has-bit / setter / clear names for one optional field.
+
+  `Has` + PropName rather than the proto convention `has_x`, because the
+  emitted identifier is Pascal and reads as Pascal. Pascal is case-insensitive,
+  so a proto field literally named `hasOpt` alongside `optional opt` WOULD
+  collide - caught in EmitMessage rather than left to produce a duplicate-
+  identifier error in generated code the user did not write. }
+class function TMessagesEmitter.HasBitName(const APropName: string): string;
+begin
+  Result := 'Has' + APropName;
+end;
+
 procedure TMessagesEmitter.EmitMessage(AMsg: TProtoMessageNode);
 var
-  I: Integer;
-  LField: TProtoFieldNode;
+  I, J: Integer;
+  LField, LOther: TProtoFieldNode;
   LPropName, LRenamedFrom, LBackField, LFieldType: string;
+  LOtherName, LOtherRenamed: string;
+  LAnyOptional: Boolean;
 begin
+  { Collision check first, so the diagnostic names the two proto fields rather
+    than surfacing as a duplicate identifier in generated Pascal. }
+  for I := 0 to AMsg.Fields.Count - 1 do
+  begin
+    LField := AMsg.Fields[I];
+    if not NeedsHasBit(LField) then Continue;
+    LPropName := PascalFieldName(LField.Name, LRenamedFrom);
+    for J := 0 to AMsg.Fields.Count - 1 do
+    begin
+      if J = I then Continue;
+      LOther     := AMsg.Fields[J];
+      LOtherName := PascalFieldName(LOther.Name, LOtherRenamed);
+      if SameText(LOtherName, HasBitName(LPropName)) then
+        raise EEmitError.CreateFmt(
+          'Field %s is `optional`, so the generator emits a has-bit named ' +
+          '%s - but field %s already takes that name. Pascal is ' +
+          'case-insensitive, so the two would collide. Rename one of them.',
+          [QuotedStr(LField.Name), QuotedStr(HasBitName(LPropName)),
+           QuotedStr(LOther.Name)]);
+    end;
+  end;
+
+  LAnyOptional := False;
+
   W('  [TGrpcMessage]');
   W('  ' + PascalTypeName(AMsg.QualifiedName) + ' = class');
   W('  private');
@@ -226,7 +302,33 @@ begin
     LBackField := 'F' + LPropName;
     LFieldType := PascalFieldType(LField, FFile);
     W('    ' + LBackField + ': ' + LFieldType + ';');
+    if NeedsHasBit(LField) then
+    begin
+      LAnyOptional := True;
+      W('    F' + HasBitName(LPropName) + ': Boolean;');
+      { The setter is the mechanism, not a convenience: deserialisation writes
+        through TRttiProperty.SetValue, which calls this, which raises the bit.
+        That is why the bit below is read-only and why nothing on the decode
+        side has to know about presence at all. }
+      W('    procedure Set' + LPropName + '(const AValue: ' + LFieldType + ');');
+    end;
   end;
+
+  if LAnyOptional then
+  begin
+    W('  public');
+    for I := 0 to AMsg.Fields.Count - 1 do
+    begin
+      LField := AMsg.Fields[I];
+      if not NeedsHasBit(LField) then Continue;
+      LPropName := PascalFieldName(LField.Name, LRenamedFrom);
+      { Clearing needs its own entry point. Assigning the zero value through
+        the setter SETS the field to zero, which on the wire is the opposite
+        of absent. }
+      W('    procedure Clear' + LPropName + ';');
+    end;
+  end;
+
   W('  published');
   for I := 0 to AMsg.Fields.Count - 1 do
   begin
@@ -239,11 +341,60 @@ begin
         IntToStr(LField.Number) + '; renamed to ''' + LPropName +
         ''' because ''' + LRenamedFrom + ''' is a Delphi keyword');
     W('    [TProtoMember(' + IntToStr(LField.Number) + ')]');
-    W('    property ' + LPropName + ': ' + LFieldType +
-      ' read ' + LBackField + ' write ' + LBackField + ';');
+    if NeedsHasBit(LField) then
+    begin
+      W('    property ' + LPropName + ': ' + LFieldType +
+        ' read ' + LBackField + ' write Set' + LPropName + ';');
+      W('    [TProtoHas(' + IntToStr(LField.Number) + ')]');
+      { No writer. The serializer rejects a writable has-bit, because a bit the
+        author maintains by hand desyncs the moment a decoded field arrives. }
+      W('    property ' + HasBitName(LPropName) + ': Boolean read F' +
+        HasBitName(LPropName) + ';');
+    end
+    else
+      W('    property ' + LPropName + ': ' + LFieldType +
+        ' read ' + LBackField + ' write ' + LBackField + ';');
   end;
   W('  end;');
   W;
+end;
+
+{ Method bodies for every optional field, emitted into the implementation
+  section. Declaration and body are produced from the same PascalFieldName and
+  HasBitName calls, so they cannot drift - a drift there is a link error. }
+procedure TMessagesEmitter.EmitOptionalBodies;
+var
+  M, I: Integer;
+  LMsg: TProtoMessageNode;
+  LField: TProtoFieldNode;
+  LClass, LPropName, LRenamedFrom, LFieldType: string;
+begin
+  for M := 0 to FFile.Messages.Count - 1 do
+  begin
+    LMsg   := FFile.Messages[M];
+    LClass := PascalTypeName(LMsg.QualifiedName);
+    for I := 0 to LMsg.Fields.Count - 1 do
+    begin
+      LField := LMsg.Fields[I];
+      if not NeedsHasBit(LField) then Continue;
+      LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
+      LFieldType := PascalFieldType(LField, FFile);
+
+      W('procedure ' + LClass + '.Set' + LPropName +
+        '(const AValue: ' + LFieldType + ');');
+      W('begin');
+      W('  F' + LPropName + ' := AValue;');
+      W('  F' + HasBitName(LPropName) + ' := True;');
+      W('end;');
+      W;
+      W('procedure ' + LClass + '.Clear' + LPropName + ';');
+      W('begin');
+      W('  F' + LPropName + ' := Default(' + LFieldType + ');');
+      W('  F' + HasBitName(LPropName) + ' := False;');
+      W('end;');
+      W;
+    end;
+  end;
 end;
 
 // ── TMessagesEmitter -- public ───────────────────────────────────────────────
@@ -262,6 +413,7 @@ begin
   EmitTypeSection;
   W('implementation');
   W;
+  EmitOptionalBodies;
   W('end.');
 end;
 

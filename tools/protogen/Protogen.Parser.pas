@@ -456,12 +456,11 @@ begin
         'fields, which needs a synthesised message type per map. Model it as ' +
         'a repeated message with explicit key and value fields.');
 
-    if IsIdent('optional') then
-      Refuse('optional',
-        'proto3 explicit presence needs a has-bit, and the serializer has no ' +
-        'presence model — it currently emits even default-valued scalars, so ' +
-        '"set to zero" and "not set" are indistinguishable on the wire. Drop ' +
-        'the keyword: an implicit-presence field is the proto3 default.');
+    { `optional` was refused until PRESENCE-1 gave the serializer a has-bit
+      ([TProtoHas] on a read-only Boolean). It is now ACCEPTED and handled in
+      ParseField, which is also where the two shapes it CANNOT take are
+      rejected — `optional repeated` is illegal proto3, and a has-bit on a
+      message field is redundant. }
 
     if IsIdent('required') then
       Refuse('required',
@@ -499,6 +498,19 @@ begin
     begin
       NextTok;
       ParseField(AMsg, plRepeated, LLine, LCol);
+    end
+    else if IsIdent('optional') then
+    begin
+      NextTok;
+      { `optional repeated` is not a thing — proto3 permits exactly one label
+        per field. Caught here rather than in ParseField because only this
+        point still knows both keywords were written, and in that order. }
+      if IsIdent('repeated') then
+        Refuse('optional repeated',
+          'proto3 allows one label per field. A repeated field already has ' +
+          'no presence to express: empty and absent are the same on the ' +
+          'wire, so `optional` adds nothing. Drop `optional`.');
+      ParseField(AMsg, plOptional, LLine, LCol);
     end
     else
       ParseField(AMsg, plNone, LLine, LCol);
@@ -546,6 +558,19 @@ begin
       user has to make the edit. }
     CheckScalarSupported(LScalar, LField.Name, LTypeLine, LTypeCol);
     CheckTypeNameSupported(LTypeName, LField.Name, LTypeLine, LTypeCol);
+
+    { PRESENCE-1 note. `optional` on a MESSAGE field is legal proto3 and
+      redundant — a message field already has explicit presence, nil meaning
+      absent — whereas `optional` on an ENUM is meaningful, since an enum is a
+      scalar on the wire and needs a has-bit like any other.
+
+      Both arrive here as psNone, which is only "not a built-in scalar"; the
+      parser cannot tell an enum reference from a message reference, and a
+      forward reference is not resolvable at this point at all. So the
+      distinction is deliberately NOT made here. TMessagesEmitter resolves the
+      name against the whole file and refuses the message case there. Refusing
+      psNone outright here would have rejected `optional MyEnum`, which is
+      valid and which the codec supports. }
 
     ExpectSymbol('=');
     LField.Number := ExpectNumber;

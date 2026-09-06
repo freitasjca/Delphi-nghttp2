@@ -211,9 +211,17 @@ $HDR
 message M { oneof pick { int32 a = 1; string b = 2; } }
 EOF
 
-add_case optional refuse "Group C - no has-bit; defaults are still emitted" <<EOF
+# Was `refuse` until PRESENCE-1 gave the serializer a has-bit ([TProtoHas] on a
+# read-only Boolean). Now an `ok` row rather than a `gap`.
+add_case optional accept "PRESENCE-1 - has-bit via [TProtoHas]" <<EOF
 $HDR
 message M { optional int32 v = 1; }
+EOF
+
+# Still refused, and by protoc too: proto3 permits one label per field.
+add_case optional_repeated refuse "one label per field - not legal proto3" <<EOF
+$HDR
+message M { optional repeated int32 v = 1; }
 EOF
 
 add_case nested   accept "hoisted to file scope with a qualified name" <<EOF

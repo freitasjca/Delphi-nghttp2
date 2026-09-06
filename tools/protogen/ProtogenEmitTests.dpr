@@ -553,6 +553,117 @@ begin
     'Sample.Greeter', False);
 end;
 
+// ── PRESENCE-1 · proto3 `optional` emission ─────────────────────────────────
+
+{ Emits a schema and returns the generated text, unnormalized.
+
+  Deliberately NOT normalized: these assertions are about the exact shape of
+  declarations, and the read-only has-bit is distinguished from a writable one
+  ONLY by the absence of ` write `. Collapsing whitespace would still leave
+  that visible, but keeping the raw text means the assertions read like the
+  Pascal they are checking. }
+function EmitSource(const AProto: string): string;
+var
+  LFile: TProtoFileNode;
+begin
+  { Built on this file's existing Parse/EmitToString helpers rather than
+    re-driving TProtoParser directly - the emitter's own arity trap (C4) came
+    from exactly that kind of duplicated call site drifting out of step. }
+  LFile := Parse(AProto);
+  try
+    Result := EmitToString(LFile, 'Sample.Opt', 'opt.proto');
+  finally
+    LFile.Free;
+  end;
+end;
+
+function Has(const AHaystack, ANeedle: string): Boolean;
+begin
+  Result := Pos(LowerCase(ANeedle), LowerCase(AHaystack)) > 0;
+end;
+
+procedure TestEmitOptional;
+const
+  CProto =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum Colour { C_UNSET = 0; C_RED = 1; }'#10 +
+    'message M {'#10 +
+    '  int32 plain = 1;'#10 +
+    '  optional int32 opt = 2;'#10 +
+    '  optional Colour col = 3;'#10 +
+    '}';
+  CMsgProto =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message Inner { int32 id = 1; }'#10 +
+    'message M { optional Inner inner = 1; }';
+var
+  LSrc: string;
+  LRaised: Boolean;
+  LMsg: string;
+begin
+  WriteLn;
+  WriteLn('-- PRESENCE-1: `optional` emission');
+
+  LSrc := EmitSource(CProto);
+
+  // backing field + has-bit + setter declaration
+  Check('emits the has-bit backing field',
+    Has(LSrc, 'FHasOpt: Boolean;'), LSrc);
+  Check('emits the setter declaration',
+    Has(LSrc, 'procedure SetOpt(const AValue: Integer);'));
+  Check('emits a Clear method',
+    Has(LSrc, 'procedure ClearOpt;'));
+
+  // the property pair
+  Check('value property writes through the SETTER, not the field',
+    Has(LSrc, 'property opt: Integer read FOpt write SetOpt;'));
+  Check('emits [TProtoHas] with the SAME tag as the field',
+    Has(LSrc, '[TProtoHas(2)]'));
+
+  { The single most important assertion in this section. A has-bit with a
+    writer is refused at discovery, so emitting one would produce generated
+    code that compiles and then raises the first time it is used. }
+  Check('has-bit property is READ-ONLY (no write clause)',
+    Has(LSrc, 'property HasOpt: Boolean read FHasOpt;')
+    and not Has(LSrc, 'property HasOpt: Boolean read FHasOpt write'));
+
+  // method bodies
+  Check('setter body assigns the value',
+    Has(LSrc, 'FOpt := AValue;'));
+  Check('setter body RAISES the has-bit',
+    Has(LSrc, 'FHasOpt := True;'));
+  Check('Clear body lowers the has-bit',
+    Has(LSrc, 'FHasOpt := False;'));
+
+  // an enum is a scalar on the wire, so it takes a has-bit too
+  Check('optional ENUM also gets a has-bit',
+    Has(LSrc, 'FHasCol: Boolean;') and Has(LSrc, '[TProtoHas(3)]'));
+
+  { The regression guard: a non-optional field must be emitted exactly as
+    before, writing straight to its backing field. If this ever fails, the
+    feature stopped being additive. }
+  Check('implicit-presence field is untouched',
+    Has(LSrc, 'property plain: Integer read FPlain write FPlain;'));
+  Check('implicit-presence field gets NO has-bit',
+    not Has(LSrc, 'FHasPlain'));
+
+  // `optional <message>` is the emitter's job to refuse, not the parser's
+  LRaised := False;
+  LMsg    := '';
+  try
+    EmitSource(CMsgProto);
+  except
+    on E: EEmitError do
+    begin
+      LRaised := True;
+      LMsg    := E.Message;
+    end;
+  end;
+  Check('`optional <message>` is refused by the emitter', LRaised, LMsg);
+  Check('the refusal explains that nil already means absent',
+    LRaised and Has(LMsg, 'nil'), LMsg);
+end;
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 begin
@@ -560,6 +671,7 @@ begin
   TestFieldName;
   TestScalarType;
   TestTypeName;
+  TestEmitOptional;
   TestEmitEcho;
   TestEmitGreeter;
   WriteLn;

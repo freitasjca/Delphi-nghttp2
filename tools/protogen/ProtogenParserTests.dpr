@@ -503,8 +503,11 @@ begin
     HDR + 'message M { map<string, int32> m = 1; }', 'map');
   ExpectRefusal('oneof',
     HDR + 'message M { oneof pick { int32 a = 1; } }', 'oneof');
-  ExpectRefusal('optional',
-    HDR + 'message M { optional int32 v = 1; }', 'optional');
+  { `optional` USED to be refused here. PRESENCE-1 gave the serializer a
+    has-bit, so it is now accepted — see section 07. What remains refused is
+    `optional repeated`, which is not legal proto3 in the first place. }
+  ExpectRefusal('optional repeated',
+    HDR + 'message M { optional repeated int32 v = 1; }', 'optional repeated');
 
   ExpectRefusal('required (proto2)',
     HDR + 'message M { required int32 v = 1; }', 'required');
@@ -552,6 +555,74 @@ begin
     'package t;'#10'message M { int32 a = 1; }', 'syntax');
 end;
 
+// ── 07  proto3 `optional` is now ACCEPTED (PRESENCE-1) ──────────────────────
+
+procedure TestOptionalAccepted;
+const
+  { TestRefusals declares its own HDR as a LOCAL const, so it is not visible
+    here. Duplicated rather than hoisted to file scope: the two procedures are
+    independent, and a shared header would let an edit for one silently change
+    what the other is parsing. }
+  HDR = 'syntax = "proto3";'#10'package t;'#10;
+var
+  LFile: TProtoFileNode;
+  LMsg: TProtoMessageNode;
+begin
+  Section('07  `optional` accepted and labelled (PRESENCE-1)');
+
+  LFile := Parse(HDR +
+    'enum Colour { C_UNSET = 0; C_RED = 1; }'#10 +
+    'message Inner { int32 id = 1; }'#10 +
+    'message M {'#10 +
+    '  int32 plain = 1;'#10 +
+    '  optional int32 opt = 2;'#10 +
+    '  optional string s = 3;'#10 +
+    '  optional Colour col = 4;'#10 +
+    '  repeated int32 ids = 5;'#10 +
+    '  Inner inner = 6;'#10 +
+    '}');
+  try
+    LMsg := LFile.FindMessage('M');
+    Check('message M parsed', LMsg <> nil);
+    if LMsg = nil then Exit;
+
+    Check('6 fields', LMsg.Fields.Count = 6,
+      IntToStr(LMsg.Fields.Count));
+
+    { The label is the whole point - a parser that accepted the keyword and
+      then dropped it on the floor would pass a bare "it parsed" check while
+      generating a field with no presence at all. }
+    Check('plain is plNone',    LMsg.Fields[0].FieldLabel = plNone);
+    Check('opt is plOptional',  LMsg.Fields[1].FieldLabel = plOptional);
+    Check('s is plOptional',    LMsg.Fields[2].FieldLabel = plOptional);
+    Check('col is plOptional',  LMsg.Fields[3].FieldLabel = plOptional);
+    Check('ids is plRepeated',  LMsg.Fields[4].FieldLabel = plRepeated);
+    Check('inner is plNone',    LMsg.Fields[5].FieldLabel = plNone);
+
+    Check('optional did not disturb the field number',
+      LMsg.Fields[1].Number = 2);
+    Check('optional did not disturb the type',
+      LMsg.Fields[1].Scalar = psInt32);
+  finally
+    LFile.Free;
+  end;
+
+  { An `optional` MESSAGE field parses fine here on purpose: psNone means only
+    "not a built-in scalar", and the parser cannot tell a message reference
+    from an enum one - nor resolve a forward reference at all. The emitter
+    makes that distinction, with the whole file in hand. Refusing it here
+    would also have rejected `optional Colour`, which is valid. }
+  LFile := Parse(HDR +
+    'message Inner { int32 id = 1; }'#10 +
+    'message M { optional Inner inner = 1; }');
+  try
+    Check('`optional <message>` parses (emitter refuses it, not the parser)',
+      LFile.FindMessage('M') <> nil);
+  finally
+    LFile.Free;
+  end;
+end;
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 begin
@@ -564,6 +635,7 @@ begin
     TestNesting;
     TestWellKnown;
     TestRefusals;
+    TestOptionalAccepted;
 
     WriteLn;
     WriteLn(Format('[Protogen] %d passed, %d failed', [GPass, GFail]));
