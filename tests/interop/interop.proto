@@ -1,8 +1,8 @@
 // interop.proto — §7.5 cross-language interop schema.
 //
-// Deliberately restricted to the Group A scalars the codec supports, because
-// the point of this test is to check that the bytes we produce for values we
-// CLAIM to support are the bytes a reference implementation expects. Group B
+// Deliberately restricted to the constructs the codec supports, because the
+// point of this test is to check that the bytes we produce for values we CLAIM
+// to support are the bytes a reference implementation expects. Group B
 // (sint*/fixed*) and Group C (map/oneof/optional) are refused by the generator
 // and by the parser, so there is nothing to interoperate about.
 //
@@ -31,4 +31,63 @@ message Scalars {
   double f64    = 8;
   bytes  blob   = 9;
   Colour colour = 10;
+}
+
+// C6c depth — repeated fields and submessages.
+//
+// These reach the codec through code paths the Scalars message never touches,
+// and that is the whole reason they are here:
+//
+//   * Repeated numerics are PACKED — one length-delimited record holding the
+//     concatenated values with no per-element tag. Python emits packed by
+//     default for proto3, so this is the first time our DECODER has been fed
+//     packed input by an independent implementation, and the first time our
+//     packed OUTPUT has been judged by one.
+//
+//   * WritePackedElement is separate code from the singular field writer. It
+//     reads uint32 via TValue.AsOrdinal and uint64 via AsType<UInt64>, chosen
+//     deliberately to avoid the AsInteger overflow that caused
+//     FIX-PROTO-UINT32-1 — but chosen from reasoning, never checked against a
+//     reference. Repeated u32/u64 at their boundaries are the highest-value
+//     cases in this file.
+//
+//   * Submessages exercise recursion, and the nil/empty/populated distinction
+//     that proto3 draws between an absent field and a present-but-default one.
+
+message Inner {
+  int32  id   = 1;
+  string name = 2;
+}
+
+message Composite {
+  // Packed families. Each numeric width and each fixed-vs-varint form is
+  // present because they are framed differently on the wire.
+  repeated int32  r_i32    = 1;   // packed varint
+  repeated int64  r_i64    = 2;   // packed varint
+  repeated uint32 r_u32    = 3;   // packed varint  — FIX-PROTO-UINT32-1 territory
+  repeated uint64 r_u64    = 4;   // packed varint  — the still-unexercised arm
+  repeated bool   r_bool   = 5;   // packed varint
+  repeated Colour r_colour = 6;   // packed varint (enum)
+  repeated float  r_f32    = 7;   // packed fixed32
+  repeated double r_f64    = 8;   // packed fixed64
+
+  // Unpacked family — length-delimited encodings repeat the tag per element
+  // rather than packing, because packing them would be ambiguous.
+  repeated string r_str    = 9;   // unpacked LEN
+
+  // Tag 10 is deliberately UNUSED, and the gap is the documentation.
+  //
+  // `repeated bytes` is legal proto3 but has NO Pascal representation in this
+  // codec. proto3 `bytes` is TBytes = TArray<Byte>, so `repeated bytes` would
+  // be TArray<TArray<Byte>> — a nested dynamic array, which InferProtoKind
+  // refuses outright ("proto3 has no repeated repeated"). The refusal is
+  // correct for what it can see: it cannot distinguish TArray<TBytes> from a
+  // genuinely illegal TArray<TArray<Integer>>.
+  //
+  // This is a real gap, not an oversight, and it is left out of the round-trip
+  // schema on purpose — a case the codec cannot express is not an interop
+  // question. Closing it needs a wrapper message or a distinct bytes type.
+
+  Inner           inner    = 11;  // singular submessage — absent / empty / set
+  repeated Inner  r_inner  = 12;  // repeated submessage — unpacked LEN
 }

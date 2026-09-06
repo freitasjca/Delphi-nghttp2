@@ -26,7 +26,10 @@
 #   13  cross-language interop (§7.5)   build + run   (gates; skips without
 #                                                      grpc_tools. The only
 #                                                      stage whose verdict comes
-#                                                      from outside this repo)
+#                                                      from outside this repo.
+#                                                      Scalars + C6c depth:
+#                                                      repeated/packed fields
+#                                                      and submessages)
 #
 #  Exists because the obvious command is wrong. Typing
 #
@@ -674,6 +677,24 @@ fi
 # It must use BOUNDARY values — a naive interop test with small integers passes
 # against the broken code too, because 42 encodes identically whether or not
 # the encoder sign-extends.
+#
+# C6c depth (2026-09-06) added repeated fields and submessages to the same
+# harness. Those reach the codec through code the scalar cases never touch:
+# repeated numerics are PACKED, and Python emits packed by default, so this is
+# the only place our packed decoder is fed by an independent encoder and our
+# packed output is judged by one. WritePackedElement is separate code from the
+# singular field writer and reads uint32/uint64 through different TValue
+# accessors — chosen to dodge FIX-PROTO-UINT32-1, but by reasoning rather than
+# measurement until these cases existed.
+#
+# The Delphi half is NOT run here and is not platform-redundant: Delphi has no
+# unsigned-64 type kind and types UInt64 as tkInt64, reaching the packed writer
+# through a different arm than FPC's tkQWord — the same split that puts
+# Nghttp2ProtobufConformance in run-tests.bat. Windows usually has no
+# grpcio-tools, so interop_check.py supports a split run:
+#   python3 interop_check.py --emit-only  --work DIR     (here)
+#   Nghttp2InteropCodec.exe DIR\cases DIR\roundtrip      (on Windows)
+#   python3 interop_check.py --verify-only --work DIR    (back here)
 echo
 echo "── cross-language interop, boundary values (§7.5) ───────────────────"
 INTEROP="$HERE/interop"
