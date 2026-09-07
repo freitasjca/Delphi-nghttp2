@@ -1,0 +1,163 @@
+# Releasing Delphi-nghttp2
+
+Every step here exists because skipping it cost something. The reasons are kept
+inline — a checklist without them gets shortened by the next person in a hurry.
+
+---
+
+## 1 · Both toolchains, before anything else
+
+```bash
+# Linux / WSL
+cd Delphi-nghttp2/tests
+bash build-codec-fpc.sh 2>&1 | grep -nE "FAIL|Fatal:|error:" | head
+```
+
+```cmd
+REM Windows
+cd C:\lang\Repo\Delphi-nghttp2\tests
+run-tests.bat
+```
+
+Both must be clean. `run-tests.bat` ends with a plain `ALL STAGES PASSED`
+banner; **`build-codec-fpc.sh` has no such banner** — it ends on whatever the
+last stage printed, so a mid-run `FAIL` looks like success if you only read the
+tail. Hence the grep. And never pipe it through `tail` alone: a pipe discards
+the exit status too, so a failing build looks green twice over.
+
+> **1.13.0 shipped without a Windows run.** It passed later, but the risk was
+> real: `Boolean` is `tkEnumeration` on Delphi and `tkBool` on FPC, and several
+> features sit on that seam. Green on one compiler is not evidence for the
+> other.
+
+### If the generator changed
+
+```bash
+bash tools/protogen/corpus-check.sh      # parse + emit, ~99.5% of 7301 schemas
+bash tools/protogen/compile-check.sh --all   # 3019/3019 must compile
+```
+
+`--all`, not the default sample: a 10% sample once reported four defect classes
+and the full sweep found three more.
+
+---
+
+## 2 · Choose the number
+
+- **patch** (1.15.0 → 1.15.1) — a fix with no change to generated output or API.
+- **minor** (1.15.0 → 1.16.0) — anything additive: new accepted constructs, new
+  units, changed generated identifiers. Generated output changing is a minor
+  even when nothing breaks, because downstream sees different code.
+- **major** — a removal or a wire-format change. Has not happened yet.
+
+---
+
+## 3 · Bump, commit, push
+
+```bash
+sed -i 's/"version": "1.15.0"/"version": "1.16.0"/' boss.json
+git commit -am "chore(release): 1.16.0"
+git push origin main
+```
+
+`boss.json` alone. Boss resolves dependency floors from **git tags**, so the
+tag is what actually publishes the release; the version field is documentation.
+
+> **Never use backticks in `git commit -m "..."`.** zsh executes them as
+> command substitution and the words vanish silently — this ate `bytes` and
+> `none` from a commit message, leaving two nonsense sentences. Use
+> `git commit -F-` with a quoted heredoc:
+>
+> ```bash
+> git commit -F- <<'EOF'
+> subject line
+>
+> body with `backticks` that survive
+> EOF
+> ```
+
+---
+
+## 4 · Tag
+
+```bash
+git fetch origin
+git tag 1.16.0 origin/main
+git push origin 1.16.0
+```
+
+Three things, each load-bearing:
+
+- **`git fetch` first.** Tagging `origin/main` without it tags a stale ref.
+  Once, a typo (`git fetch origi`) made the fetch fail and the tag still landed
+  correctly — only because a push seconds earlier had already advanced the ref.
+  Do not conclude the fetch is optional.
+- **Tag `origin/main`, not `HEAD`.** They are the same when everything is
+  pushed and silently different when it is not.
+- **Push the tag explicitly.** `git push origin main` does **not** carry it,
+  and neither does `--follow-tags` for a lightweight tag. The push output looks
+  identical either way. This has bitten twice.
+
+---
+
+## 5 · Verify at the published artefact
+
+```bash
+curl -s https://raw.githubusercontent.com/freitasjca/Delphi-nghttp2/1.16.0/boss.json | grep version
+curl -s https://raw.githubusercontent.com/freitasjca/Delphi-nghttp2/1.16.0/src/SomeUnit.pas | grep -c SomeIdentifier
+```
+
+Fetch **at the tag**, not at `main`, and grep for **the change's own
+identifier** rather than the version string — a version string proves the bump
+committed, not that the code shipped. Both times the tag failed to push, this
+step is what noticed: the curl returned empty while every other output looked
+fine.
+
+---
+
+## 6 · The provider floor — usually leave it
+
+`horse-provider-nghttp2` declares `"github.com/freitasjca/Delphi-nghttp2": ">=1.10.0"`.
+A floor is a **minimum**, so a new library release is picked up without
+touching it. Raise it only when the provider actually calls the new code.
+Raising it gratuitously forces downstream upgrades for no benefit.
+
+If both repos release together, **tag the lower repo first** — the provider's
+floor must be satisfiable at the moment its own tag appears.
+
+---
+
+## 7 · Release notes
+
+Say what changed and who is affected. Two things worth stating explicitly:
+
+- **Whether generated output moves.** "Generated enum values change only where
+  they previously produced code that did not compile" tells a user their
+  working build is safe. Without it they must diff to find out.
+- **Which layer a number describes.** "99.5% of schemas" meant *parsing* for a
+  month while being quoted as evidence the *generator* worked. Say
+  "parses and emits" or "generates code that compiles" — never just "accepts".
+
+---
+
+## Quick reference
+
+```bash
+# 1  gates, both toolchains
+bash tests/build-codec-fpc.sh 2>&1 | grep -nE "FAIL|Fatal:|error:" | head
+run-tests.bat                                    # on Windows
+
+# 2  generator only
+bash tools/protogen/corpus-check.sh
+bash tools/protogen/compile-check.sh --all
+
+# 3  bump + push
+sed -i 's/"version": "X"/"version": "Y"/' boss.json
+git commit -am "chore(release): Y" && git push origin main
+
+# 4  tag
+git fetch origin && git tag Y origin/main && git push origin Y
+
+# 5  verify AT THE TAG, by the change's own identifier
+curl -s https://raw.githubusercontent.com/freitasjca/Delphi-nghttp2/Y/boss.json | grep version
+```
