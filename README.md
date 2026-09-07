@@ -39,7 +39,7 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
 | **gRPC layer** — protobuf codec, registry (procedural + `RegisterService<T>`), dispatcher, all four RPC shapes | **✓** (extracted from `horse-provider-nghttp2` 2026-08-23; the units never depended on Horse, only their names did) |
 | **`.proto` tooling** — parser, `ProtogenCheck` verdict CLI, `protoc` differential test (`tools/protogen`) | **✓** (26 cases, 0 disagreements `protoc` would call a defect, vs libprotoc 35.1). See [`doc/protogen.md`](doc/protogen.md) |
-| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **99.5%** of 7301 real googleapis schemas accepted (2026-09-06) |
+| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **99.5%** of 7301 real googleapis schemas parsed AND emitted (2026-09-07) |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
@@ -267,9 +267,17 @@ ProtogenCheck service.proto
 
 **What is refused**, measured against 7301 real googleapis schemas rather than
 guessed: `sint*`/`fixed*`/`sfixed*`, proto2 in any form, and
-`google.protobuf.Api`/`DescriptorProto`. That is 34 of 7301 files — everything
-else, including `map`, `oneof`, `optional`, the `Struct` family and `Any`, is
-supported. A refusal always names the construct and explains the obstacle.
+`google.protobuf.Api`/`DescriptorProto`. That is **35 of 7301 files** —
+everything else, including `map`, `oneof` (with message members), `optional`,
+the `Struct` family and `Any`, is supported. A refusal always names the
+construct and explains the obstacle.
+
+That figure counts schemas that **parse *and* emit**. Until 2026-09-07 the
+corpus tool ran the parser only, so an earlier "99.5%" said nothing about
+whether generated Pascal was produced at all — and behind it sat three emitter
+gaps worth 27% of the corpus, the largest being message members inside a
+`oneof`. The number is now measured end to end; the distinction is kept here
+because the old one was quoted as evidence the generator worked.
 
 ---
 

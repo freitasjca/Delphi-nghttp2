@@ -99,6 +99,7 @@ var
   GWkt, GWktDst: TWktMsg;        // STRUCT-1
   GFwd, GFwdDst: TUsesLater;     // FORWARD-1
   GMO, GMODst: TMsgOneof;        // ONEOF-2
+  GOF, GOFDst: TOptMsgFields;    // OPTMSG-1 + ENUMCOLLIDE-1
   GKeep: TPayload;
   GSelf: TSelfRef;
   GAnyOk: Boolean;               // ANY-1
@@ -920,6 +921,66 @@ begin
     end;
     Check('decoding a member CLEARS a previously-set sibling, freeing it',
           GOk, GErr);
+  end;
+
+  // ── OPTMSG-1 + ENUMCOLLIDE-1 · two reversals, one generated unit ─────────
+  //  That this unit COMPILED is most of the result for both. A renamed enum
+  //  value that collides anyway, or an `optional` message that acquired a
+  //  has-bit, fails at the compiler or at AttachHasBits - neither is visible
+  //  to a text comparison.
+  WriteLn;
+  WriteLn('-- OPTMSG-1 + ENUMCOLLIDE-1: optional message, renamed enum values');
+
+  GOk  := False;
+  GErr := '';
+  try
+    GOF    := TOptMsgFields.Create;
+    GOFDst := TOptMsgFields.Create;
+    try
+      { Both enums declare RED, so both were prefixed. The real proof is that
+        this unit COMPILED - two bare REDs would be a duplicate identifier and
+        nothing below would run. These reads only confirm the renamed names
+        resolve to the values they should. }
+      GOF.colour_a := OPTCOLOURA_RED;
+      GOF.colour_b := OPTCOLOURB_RED;
+      Check('both renamed identifiers resolve to their own value',
+        (GOF.colour_a = OPTCOLOURA_RED) and (GOF.colour_b = OPTCOLOURB_RED));
+      Check('  and they carry the ordinal from the .proto', Ord(GOF.colour_a) = 1);
+
+      { A non-colliding value keeps its .proto spelling - GREEN, not
+        OPTCOLOURA_GREEN. That it compiles is the assertion. }
+      GOF.colour_a := GREEN;
+      Check('a non-colliding value kept its spelling', GOF.colour_a = GREEN);
+
+      GOF.tag     := 4;
+      GOF.opt_pay := TPayload.Create;
+      GOF.opt_pay.note := 'optional on a message is a no-op label';
+
+      GBytes := TProtoSerializer.Serialize(GOF);
+      TProtoSerializer.Deserialize(GBytes, GOFDst);
+
+      GOk := (GOFDst.opt_pay <> nil)
+             and (GOFDst.opt_pay.note = 'optional on a message is a no-op label')
+             and (GOFDst.tag = 4)
+             and (GOFDst.colour_a = GREEN);
+    finally
+      GOF.Free;
+      GOFDst.Free;
+    end;
+  except
+    on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+  end;
+  Check('an `optional` message field round-trips as an ordinary one',
+        GOk, GErr);
+
+  { And unset means absent, which is what makes the label a no-op: no has-bit
+    exists to say otherwise. }
+  GOF := TOptMsgFields.Create;
+  try
+    Check('an unset `optional` message is nil', GOF.opt_pay = nil);
+    Check('  and is not emitted', not EmitsTag(GOF, 2));
+  finally
+    GOF.Free;
   end;
 
   WriteLn;

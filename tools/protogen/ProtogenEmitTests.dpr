@@ -589,28 +589,59 @@ end;
 procedure TestEnumValueCollision;
 const
   { LEGAL proto3 - each E is scoped to its message, each X to its enum's
-    parent - and protoc compiles it. Pascal cannot: both emit a bare X. }
+    parent - and protoc compiles it. Pascal cannot: both would emit a bare X. }
   CCollide =
     'syntax = "proto3";'#10'package t;'#10 +
-    'message A { enum E { X = 0; } E e = 1; }'#10 +
-    'message B { enum E { X = 0; } E e = 1; }';
-  { The control: two enums whose values are prefixed, as the proto style guide
-    recommends. Must still emit. }
+    'message A { enum E { X = 0; Y = 1; } E e = 1; }'#10 +
+    'message B { enum E { X = 0; Z = 1; } E e = 1; }';
+  { Two values in ONE enum. proto forbids it too, so there is no correct name
+    to rename to - the one enum collision that stays a refusal. }
+  CDupInOne =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum E { X = 0; X = 1; }';
+  { Legal proto3, illegal Pascal - the shape bigquery/v2/job.proto actually
+    has. `option allow_alias` lets them share a number as well. }
+  CCaseOnly =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum E { minimal = 0; MINIMAL = 1; }';
+  { The control: no collision, so nothing may be renamed. }
   CDistinct =
     'syntax = "proto3";'#10'package t;'#10 +
     'message A { enum E { A_X = 0; } E e = 1; }'#10 +
     'message B { enum E { B_X = 0; } E e = 1; }';
 var
+  LSrc, LMsg: string;
   LRaised: Boolean;
-  LMsg, LSrc: string;
 begin
   WriteLn;
   WriteLn('-- ENUMCOLLIDE-1: enum values share Pascal unit scope');
 
+  { REVISED 2026-09-07: this asserted a REFUSAL. The corpus said that cost 336
+    of 7301 real schemas for something with an obvious correct answer, so the
+    colliding value is now RENAMED instead. }
+  LSrc := EmitSource(CCollide);
+  Check('a colliding value is PREFIXED from its qualified name',
+    Has(LSrc, 'A_E_X = 0'));
+  Check('  and so is the other side of the collision',
+    Has(LSrc, 'B_E_X = 0'));
+  { Only the colliding ones. Renaming a whole enum because one of its values
+    clashes would change identifiers nobody asked about. }
+  Check('a NON-colliding value in the same enum keeps its spelling',
+    Has(LSrc, 'Y = 1') and (not Has(LSrc, 'A_E_Y')));
+  Check('  and so does the other enum''s', Has(LSrc, 'Z = 1'));
+  Check('the rename is called out in a comment',
+    Has(LSrc, 'prefixed, another enum in this file'));
+
+  { The control matters as much: a resolver that prefixed everything would pass
+    every check above. }
+  LSrc := EmitSource(CDistinct);
+  Check('no collision means NO renaming', Has(LSrc, 'A_X = 0'));
+  Check('  and nothing gains a qualified prefix', not Has(LSrc, 'A_E_A_X'));
+
   LRaised := False;
   LMsg    := '';
   try
-    EmitSource(CCollide);
+    EmitSource(CDupInOne);
   except
     on E: EEmitError do
     begin
@@ -618,32 +649,31 @@ begin
       LMsg    := E.Message;
     end;
   end;
-  Check('two enums sharing a value name are REFUSED', LRaised, LMsg);
-  Check('  the refusal names both enums',
-    Has(LMsg, 'A.E') and Has(LMsg, 'B.E'), LMsg);
-  Check('  and the colliding value', Has(LMsg, 'X'), LMsg);
-  { A refusal that only restates the problem sends the user hunting. This one
-    has to say WHY Pascal cannot do what proto can. }
-  Check('  and explains that Pascal enum values share unit scope',
-    Has(LMsg, 'unit scope'), LMsg);
-  { The suggestion has to RESOLVE the collision. Deriving it from the enum's
-    simple name - which is what the proto style guide literally says - gives
-    'E_X' for BOTH enums here, because they share the name E. That advice
-    collides again, and the first version of this message gave exactly it. }
-  Check('  suggests a prefix that actually disambiguates',
-    Has(LMsg, 'A_E_X'), LMsg);
-  Check('  and not the simple-name prefix, which collides again',
-    not Has(LMsg, '(E_X'), LMsg);
+  Check('a duplicate value WITHIN one enum is still refused', LRaised, LMsg);
+  Check('  and says proto3 forbids it too', Has(LMsg, 'forbids'), LMsg);
 
-  { The control matters as much as the refusal: a check that refused BOTH would
-    look identical on the failing case alone. }
-  LSrc := EmitSource(CDistinct);
-  Check('distinct value names still emit', Has(LSrc, 'A_X = 0'));
-  Check('  both enums present', Has(LSrc, 'B_X = 0'));
+  { The case that actually occurs in the wild - once in 7301 googleapis
+    schemas. LEGAL proto3, since identifiers there are case-sensitive; illegal
+    Pascal, since they are not. Refused rather than renamed because both values
+    share one enum, so any prefix lands on both. }
+  LRaised := False;
+  LMsg    := '';
+  try
+    EmitSource(CCaseOnly);
+  except
+    on E: EEmitError do
+    begin
+      LRaised := True;
+      LMsg    := E.Message;
+    end;
+  end;
+  Check('values differing only in CASE are refused', LRaised, LMsg);
+  Check('  and the message blames Pascal, not proto3',
+    Has(LMsg, 'legal proto3') and Has(LMsg, 'case-INSENSITIVE'), LMsg);
+  Check('  and says why a rename cannot be automatic',
+    Has(LMsg, 'same enum'), LMsg);
 end;
 
-
-// ── ONEOF-2: message members in a oneof ─────────────────────────────────────
 procedure TestEmitOneofMessageMember;
 const
   CProto =
@@ -852,21 +882,18 @@ begin
   Check('implicit-presence field gets NO has-bit',
     not Has(LSrc, 'FHasPlain'));
 
-  // `optional <message>` is the emitter's job to refuse, not the parser's
-  LRaised := False;
-  LMsg    := '';
-  try
-    EmitSource(CMsgProto);
-  except
-    on E: EEmitError do
-    begin
-      LRaised := True;
-      LMsg    := E.Message;
-    end;
-  end;
-  Check('`optional <message>` is refused by the emitter', LRaised, LMsg);
-  Check('the refusal explains that nil already means absent',
-    LRaised and Has(LMsg, 'nil'), LMsg);
+  { OPTMSG-1. This asserted a REFUSAL until 2026-09-07. In proto3 a message
+    field always has explicit presence, so `optional Foo x` and `Foo x` are the
+    same thing and protoc treats them identically - the refusal's reasoning
+    about has-bits was right, its verdict was not. Inverted rather than
+    deleted, so a reader sees the answer CHANGED. }
+  LSrc := EmitSource(CMsgProto);
+  Check('`optional <message>` is now ACCEPTED',
+    Has(LSrc, 'property inner: TInner'));
+  Check('  and takes NO has-bit - nil already carries presence',
+    not Has(LSrc, 'FHasinner'));
+  Check('  so it writes straight to its field, with no setter',
+    Has(LSrc, 'read Finner write Finner'));
 end;
 
 // ── Main ──────────────────────────────────────────────────────────────────────

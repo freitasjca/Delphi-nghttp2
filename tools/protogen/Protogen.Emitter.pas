@@ -53,6 +53,7 @@ type
     procedure EmitTypeSection;
     // ENUMCOLLIDE-1 — Pascal enum values share unit scope; proto's do not
     procedure CheckEnumValueCollisions;
+    function  EnumValueName(AEnum: TProtoEnumNode; AIndex: Integer): string;
     // FORWARD-1 — class forwards for messages referenced before they are declared
     function  MessageIndex(AMsg: TProtoMessageNode): Integer;
     procedure EmitForwardDecls;
@@ -300,7 +301,7 @@ begin
   W;
 end;
 
-// ENUMCOLLIDE-1. Refuses two enums in one file that share a VALUE name.
+// ENUMCOLLIDE-1, REVISED. Pascal enum values share UNIT scope; proto's do not.
 //
 // proto scopes an enum's values to the enum's ENCLOSING scope, so a nested enum
 // keeps its values inside its message. This is legal proto3 and protoc compiles
@@ -309,64 +310,81 @@ end;
 //     message A { enum E { X = 0; } }
 //     message B { enum E { X = 0; } }
 //
-// Pascal has no such scoping - enum values live at unit scope. Nested types are
-// flattened here, so both would emit a bare `X` and the unit would not compile
-// with a duplicate identifier.
+// Pascal has no such scoping, and nested types are flattened here, so both
+// would emit a bare `X` and the unit would not compile.
 //
-// This unit already knew the rule and applied it in ONE place: CaseValueName
-// derives every oneof discriminator value from its enum type name, and its
-// comment says why - "Pascal enum values are NOT scoped, so every value must be
-// unique across the whole unit". That reasoning was never carried across to
-// USER enums.
+// The FIRST version of this REFUSED the schema, to match the has-bit and map
+// collision checks. That was the wrong trade and the corpus said so: 336 of
+// 7301 googleapis files, 4%, turned away for something we can simply resolve.
+// Those other two checks fire on ambiguous USER INTENT - two fields fighting
+// over one identifier, where only the author can choose. This one has an
+// obvious correct answer, and the refusal message was already computing it.
 //
-// REFUSING rather than renaming, for the same reason the has-bit and map
-// collisions refuse: the user wrote the .proto, so the diagnostic has to be in
-// terms of the .proto. Auto-prefixing would change the generated API silently,
-// and prefixing only the colliding pair would make naming depend on what else
-// happens to be in the file.
+// So a colliding value is RENAMED, prefixed from the enum's qualified name:
+// A.E.X becomes A_E_X. Only the colliding ones - an enum whose values are
+// unique keeps its spelling, so the common case is untouched and the C2
+// byte-for-byte sample comparison keeps meaning what it meant.
+//
+// Still REFUSED: a duplicate value name WITHIN one enum. proto forbids it too,
+// so there is no legal schema to accept and nothing sensible to rename to.
 procedure TMessagesEmitter.CheckEnumValueCollisions;
 var
-  I, J, VI, VJ: Integer;
-  LA, LB: TProtoEnumNode;
+  I, VI, VJ: Integer;
+  LA: TProtoEnumNode;
 begin
   for I := 0 to FFile.Enums.Count - 1 do
   begin
     LA := FFile.Enums[I];
     for VI := 0 to LA.Values.Count - 1 do
-    begin
-      { Within ONE enum first - proto forbids it, but a parser that ever stopped
-        checking would otherwise produce a duplicate here rather than a
-        diagnostic. }
       for VJ := VI + 1 to LA.Values.Count - 1 do
         if SameText(LA.Values[VI].Name, LA.Values[VJ].Name) then
-          raise EEmitError.CreateFmt(
-            'Enum %s declares the value %s twice. Pascal cannot express that, '
-            + 'and neither can proto3.',
-            [QuotedStr(LA.Name), QuotedStr(LA.Values[VI].Name)]);
-
-      for J := I + 1 to FFile.Enums.Count - 1 do
-      begin
-        LB := FFile.Enums[J];
-        for VJ := 0 to LB.Values.Count - 1 do
-          if SameText(LA.Values[VI].Name, LB.Values[VJ].Name) then
+        begin
+          { Two DIFFERENT reasons, and saying the wrong one sends the reader to
+            the wrong place. Only the first is invalid proto3. }
+          if LA.Values[VI].Name = LA.Values[VJ].Name then
             raise EEmitError.CreateFmt(
-              'Enums %s and %s both declare the value %s. proto scopes enum '
-              + 'values to the enclosing message, so this is legal proto3 - '
-              + 'but Pascal enum values share UNIT scope and nested types are '
-              + 'flattened here, so both would emit a bare %s and the unit '
-              + 'would not compile. Prefix the values to disambiguate - e.g. '
-              + '%s in %s. The prefix is derived from the QUALIFIED name on '
-              + 'purpose: the proto style guide says to prefix with the enum '
-              + 'name, but these two enums SHARE a simple name, so that advice '
-              + 'alone would produce the same identifier twice and collide '
-              + 'again.',
-              [QuotedStr(LA.QualifiedName), QuotedStr(LB.QualifiedName),
-               QuotedStr(LA.Values[VI].Name), QuotedStr(LA.Values[VI].Name),
-               UpperCase(StringReplace(LA.QualifiedName, '.', '_',
-                 [rfReplaceAll])) + '_' + LA.Values[VI].Name,
-               QuotedStr(LA.QualifiedName)]);
+              'Enum %s declares the value %s twice. proto3 forbids that too, '
+              + 'so the schema is invalid rather than merely unrepresentable.',
+              [QuotedStr(LA.Name), QuotedStr(LA.Values[VI].Name)])
+          else
+            raise EEmitError.CreateFmt(
+              'Enum %s declares %s and %s, which differ ONLY IN CASE. That is '
+              + 'legal proto3 - identifiers there are case-sensitive, and with '
+              + 'option allow_alias both may even share a number - but Pascal '
+              + 'identifiers are case-INSENSITIVE, so the two would be one. '
+              + 'Unlike a collision BETWEEN enums this cannot be renamed '
+              + 'automatically: both values sit in the same enum, so any '
+              + 'prefix derived from it lands on both. Rename one in the '
+              + '.proto. (Seen once in 7301 googleapis schemas: '
+              + 'bigquery/v2/job.proto declares minimal and MINIMAL.)',
+              [QuotedStr(LA.Name), QuotedStr(LA.Values[VI].Name),
+               QuotedStr(LA.Values[VJ].Name)]);
+        end;
+  end;
+end;
+
+{ The Pascal identifier for one enum value: its own name, unless another enum
+  in this file declares the same name, in which case it is prefixed from the
+  qualified name. Consulted everywhere a value is emitted, so the declaration
+  and any reference to it cannot disagree. }
+function TMessagesEmitter.EnumValueName(AEnum: TProtoEnumNode;
+  AIndex: Integer): string;
+var
+  J, V: Integer;
+  LOther: TProtoEnumNode;
+begin
+  Result := AEnum.Values[AIndex].Name;
+  for J := 0 to FFile.Enums.Count - 1 do
+  begin
+    LOther := FFile.Enums[J];
+    if LOther = AEnum then Continue;
+    for V := 0 to LOther.Values.Count - 1 do
+      if SameText(LOther.Values[V].Name, Result) then
+      begin
+        Result := UpperCase(StringReplace(AEnum.QualifiedName, '.', '_',
+                    [rfReplaceAll])) + '_' + AEnum.Values[AIndex].Name;
+        Exit;
       end;
-    end;
   end;
 end;
 
@@ -396,7 +414,13 @@ begin
   W('  ' + PascalTypeName(AEnum.QualifiedName) + ' = (');
   for I := 0 to AEnum.Values.Count - 1 do
   begin
-    LLine := '    ' + AEnum.Values[I].Name + ' = ' + IntToStr(AEnum.Values[I].Number);
+    LLine := '    ' + EnumValueName(AEnum, I) + ' = ' +
+      IntToStr(AEnum.Values[I].Number);
+    { A renamed value is called out where it is declared, so the difference
+      from the .proto spelling is visible at the point of use. }
+    if not SameText(EnumValueName(AEnum, I), AEnum.Values[I].Name) then
+      W('    // proto3: ' + AEnum.Values[I].Name +
+        ' - prefixed, another enum in this file declares that name too');
     if I < AEnum.Values.Count - 1 then
       LLine := LLine + ',';
     W(LLine);
@@ -448,7 +472,8 @@ begin
   if FFile.FindEnum(AField.TypeName) <> nil then
     Exit(True);                                    // enum: varint, needs a bit
 
-  { A MESSAGE, which the two cases must refuse for different reasons. }
+  { A MESSAGE. Neither case takes a has-bit - nil already carries presence -
+    and neither is a reason to refuse the schema. }
 
   { ONEOF-2. This USED TO RAISE, on the grounds that clearing a oneof member
     means freeing it and protogen emitted no destructor. That reason expired
@@ -463,12 +488,20 @@ begin
     Nghttp2.Protobuf.WellKnown, which is the proof the shape works. }
   if AField.InOneof then Exit(False);
 
-  raise EEmitError.CreateFmt(
-    'Field %s is `optional %s`, and %s is a message. A message field already ' +
-    'has explicit presence - unset means nil, and nil is not emitted - so a ' +
-    'has-bit would be a second, contradictory source of truth and the ' +
-    'serializer refuses that pairing. Drop `optional`.',
-    [QuotedStr(AField.Name), AField.TypeName, AField.TypeName]);
+  { OPTMSG-1. This USED TO RAISE, and the reasoning it gave was correct: a
+    has-bit on a message WOULD be a second, contradictory source of truth, and
+    AttachHasBits rejects that pairing. But the conclusion did not follow.
+
+    In proto3 a message field ALWAYS has explicit presence, so `optional Foo x`
+    and `Foo x` mean exactly the same thing - the label is a no-op on a message
+    and protoc treats the two identically on the wire. The right answer was
+    never to reject the schema; it was to emit no has-bit and carry on. The
+    field then behaves as it always did: nil is absent, and nil is not emitted.
+
+    Second refusal in this file whose stated reason was true while its verdict
+    was wrong. ONEOF-2 was the first. Cost here: ~370 of 7301 googleapis
+    schemas. }
+  Result := False;
 end;
 
 { PROTOGEN-DTOR. Does this field hold MESSAGE instance(s) the class must free?

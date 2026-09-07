@@ -222,3 +222,37 @@ message MsgOneof {
   }
   int32 after = 5;
 }
+
+// OPTMSG-1 + ENUMCOLLIDE-1, both reversals of 2026-09-07, in one message so
+// the generated unit has to carry them together.
+//
+//   opt_pay   `optional` on a MESSAGE. Refused until OPTMSG-1 on reasoning that
+//             was true (a has-bit would contradict nil) but whose verdict was
+//             wrong: in proto3 a message field ALWAYS has explicit presence, so
+//             the label is a no-op and protoc treats it as a plain field.
+//   colour_a  an enum whose value name collides with ColourB's below. Refused
+//             until ENUMCOLLIDE-1 was revised from refuse to rename.
+//
+// The renamed identifiers are the point: RED appears in both enums, so both
+// become OPTCOLOURA_RED / OPTCOLOURB_RED, while GREEN and BLUE - unique - keep
+// their spelling. If the resolver prefixed everything, this fixture would still
+// compile and the C2 control is what catches that; if it prefixed nothing, this
+// one would not compile at all.
+enum OptColourA {
+  A_UNSET = 0;
+  RED     = 1;
+  GREEN   = 2;
+}
+
+enum OptColourB {
+  B_UNSET = 0;
+  RED     = 1;
+  BLUE    = 2;
+}
+
+message OptMsgFields {
+  int32             tag      = 1;
+  optional Payload  opt_pay  = 2;
+  OptColourA        colour_a = 3;
+  OptColourB        colour_b = 4;
+}

@@ -174,6 +174,18 @@ silently deleted, so a reader working from an older copy sees that the answer
 | `oneof` | ONEOF-1 | Needs no wire support at all — each member is an ordinary tagged field. The generated setter clears its siblings, and a `<Group>Case` discriminator reports which is set. |
 | `map<K,V>` | MAP-1 | A proto3 map **is** a repeated synthesised `<Field>Entry` with `key = 1` and `value = 2`. The parser builds exactly that; the emitter adds `<F>Count` / `Has<F>` / `Get<F>` / `Set<F>` / `Clear<F>` over the entry array. |
 | `Struct`, `Value`, `ListValue`, `NullValue`, `Any` | STRUCT-1, ANY-1 | Bundled as hand-written classes in `Nghttp2.Protobuf.WellKnown`. `Any` also needs `Nghttp2.Protobuf.Any` for `TProtoAnyRegistry` and Pack/Unpack. |
+| a **message member** inside a `oneof` | ONEOF-2 | It takes no has-bit — `AttachHasBits` refuses one on a submessage, because nil already carries presence. The group `Clear` frees it, the case getter tests nil, and the setter clears its siblings. |
+| `optional` on a **message** field | OPTMSG-1 | A no-op label: in proto3 a message field always has explicit presence, so `optional Foo x` and `Foo x` are the same thing and protoc treats them identically. |
+| two enums sharing a **value name** | ENUMCOLLIDE-1 | Pascal enum values share unit scope and proto's do not, so a colliding value is prefixed from its qualified name (`A.E.X` → `A_E_X`). Only the colliding ones; unique values keep their spelling. |
+
+**How the last three were found, because it says something about the numbers
+above.** `ProtogenCheck` used only the parser until 2026-09-07, so the corpus
+measured parse acceptance and had never run the emitter. Adding `--emit` took
+the figure from 99.5% to **73%** — not a regression, the first honest
+measurement. Two of the three gaps behind it were refusals whose stated
+reasoning was correct while their verdict was not, left in place for four
+releases; the third was added and reversed on the same day. A clean corpus run
+is evidence about the stage it exercises, and nothing more.
 
 One consequence worth knowing: since CANONICAL-1 the serializer **omits
 default-valued scalars**, which is what makes `optional` meaningful — "set to

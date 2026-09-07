@@ -690,7 +690,8 @@ begin
     'message Inner { int32 id = 1; }'#10 +
     'message M { optional Inner inner = 1; }');
   try
-    Check('`optional <message>` parses (emitter refuses it, not the parser)',
+    Check('`optional <message>` parses - OPTMSG-1 accepts it, since the label '
+      + 'is a no-op on a message in proto3',
       LFile.FindMessage('M') <> nil);
   finally
     LFile.Free;

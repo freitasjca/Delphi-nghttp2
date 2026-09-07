@@ -356,6 +356,13 @@ echo
 echo "  PARSE + EMIT - what the generator actually accepts:"
 echo "    73%  2026-09-07  first run with --emit (5351/7301, 1950 refusals)"
 echo "    90%  2026-09-07  after ONEOF-2  (6642/7301, 659 refusals)"
+echo "    99%  2026-09-07  after OPTMSG-1 + ENUMCOLLIDE-1 revised"
+echo "                     (7266/7301, 35 refusals, 1 of them emit-side)"
+echo
+echo "  The one remaining emit refusal is bigquery/v2/job.proto: an enum"
+echo "  declaring both `minimal` and `MINIMAL`. Legal proto3 - identifiers are"
+echo "  case-sensitive there - and impossible in Pascal, where they are not."
+echo "  Not renameable: both sit in one enum, so any prefix lands on both."
 echo
 echo "  The 99% -> 73% drop was NOT a regression. It was the first honest"
 echo "  measurement: 1391 files wanted a message member in a oneof, which the"
