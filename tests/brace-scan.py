@@ -78,6 +78,13 @@ def regions(s):
 
 
 def scan(path):
+    # Pascal ONLY. In .proto (and JSON, and C) `{ }` is a block, not a comment,
+    # so every brace looks like an unterminated comment and the report is pure
+    # noise. Guarded because it actually happened: a hand-typed invocation
+    # included optional.proto and produced two confident false positives.
+    if not path.lower().endswith(('.pas', '.dpr', '.inc', '.dpk', '.lpr')):
+        print('%s: SKIPPED - not a Pascal source file' % path)
+        return 0
     with open(path, encoding='utf-8') as f:
         s = f.read()
     bad = 0

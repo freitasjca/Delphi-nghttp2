@@ -584,6 +584,124 @@ end;
 
 
 // ── FORWARD-1: class forwards for out-of-order message references ───────────
+
+// ── ENUMCOLLIDE-1: enum values share Pascal unit scope ──────────────────────
+procedure TestEnumValueCollision;
+const
+  { LEGAL proto3 - each E is scoped to its message, each X to its enum's
+    parent - and protoc compiles it. Pascal cannot: both emit a bare X. }
+  CCollide =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message A { enum E { X = 0; } E e = 1; }'#10 +
+    'message B { enum E { X = 0; } E e = 1; }';
+  { The control: two enums whose values are prefixed, as the proto style guide
+    recommends. Must still emit. }
+  CDistinct =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message A { enum E { A_X = 0; } E e = 1; }'#10 +
+    'message B { enum E { B_X = 0; } E e = 1; }';
+var
+  LRaised: Boolean;
+  LMsg, LSrc: string;
+begin
+  WriteLn;
+  WriteLn('-- ENUMCOLLIDE-1: enum values share Pascal unit scope');
+
+  LRaised := False;
+  LMsg    := '';
+  try
+    EmitSource(CCollide);
+  except
+    on E: EEmitError do
+    begin
+      LRaised := True;
+      LMsg    := E.Message;
+    end;
+  end;
+  Check('two enums sharing a value name are REFUSED', LRaised, LMsg);
+  Check('  the refusal names both enums',
+    Has(LMsg, 'A.E') and Has(LMsg, 'B.E'), LMsg);
+  Check('  and the colliding value', Has(LMsg, 'X'), LMsg);
+  { A refusal that only restates the problem sends the user hunting. This one
+    has to say WHY Pascal cannot do what proto can. }
+  Check('  and explains that Pascal enum values share unit scope',
+    Has(LMsg, 'unit scope'), LMsg);
+  { The suggestion has to RESOLVE the collision. Deriving it from the enum's
+    simple name - which is what the proto style guide literally says - gives
+    'E_X' for BOTH enums here, because they share the name E. That advice
+    collides again, and the first version of this message gave exactly it. }
+  Check('  suggests a prefix that actually disambiguates',
+    Has(LMsg, 'A_E_X'), LMsg);
+  Check('  and not the simple-name prefix, which collides again',
+    not Has(LMsg, '(E_X'), LMsg);
+
+  { The control matters as much as the refusal: a check that refused BOTH would
+    look identical on the failing case alone. }
+  LSrc := EmitSource(CDistinct);
+  Check('distinct value names still emit', Has(LSrc, 'A_X = 0'));
+  Check('  both enums present', Has(LSrc, 'B_X = 0'));
+end;
+
+
+// ── ONEOF-2: message members in a oneof ─────────────────────────────────────
+procedure TestEmitOneofMessageMember;
+const
+  CProto =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message Payload { int32 id = 1; }'#10 +
+    'message M {'#10 +
+    '  oneof body {'#10 +
+    '    Payload a = 1;'#10 +
+    '    int32   n = 2;'#10 +
+    '  }'#10 +
+    '}';
+var
+  LSrc: string;
+begin
+  WriteLn;
+  WriteLn('-- ONEOF-2: message members in a oneof');
+
+  LSrc := EmitSource(CProto);
+
+  { No has-bit. AttachHasBits REFUSES one on a submessage, so emitting it would
+    be rejected at first Serialize - nil is the presence signal. }
+  Check('a message member gets NO has-bit backing field',
+    not Has(LSrc, 'FHasa'));
+  Check('  and no [TProtoHas] attribute for its tag',
+    not Has(LSrc, '[TProtoHas(1)]'));
+  Check('  while the SCALAR member in the same group still gets one',
+    Has(LSrc, '[TProtoHas(2)]'));
+
+  { The setter is the whole mechanism - without it the property writes straight
+    to the field and two members end up set at once. }
+  Check('the message member writes through its setter',
+    Has(LSrc, 'property a: TPayload read Fa write Seta'));
+
+  { DECLARED, not just defined. Emitting the body alone gives "Method
+    identifier expected" at the body line, which names the wrong thing - and
+    that is exactly what happened on the first run of this change. }
+  Check('Cleara is DECLARED in the class',
+    Has(LSrc, 'procedure Cleara;'));
+  Check('Seta is DECLARED in the class',
+    Has(LSrc, 'procedure Seta(const AValue: TPayload);'));
+
+  { Freed, not nilled - the class owns the instance. }
+  Check('the group Clear FREES the message member', Has(LSrc, 'Fa.Free'));
+  Check('  and nils it afterwards', Has(LSrc, 'Fa := nil'));
+  { FreeAndNil would need SysUtils, which a generated unit does not use. }
+  Check('  without reaching for FreeAndNil', not Has(LSrc, 'FreeAndNil'));
+
+  { Presence is nil for the message member and a bit for the scalar - the case
+    getter has to read each the right way. }
+  Check('the case getter tests nil for the message member',
+    Has(LSrc, 'if Fa <> nil then'));
+  Check('  and the has-bit for the scalar member', Has(LSrc, 'FHasn'));
+
+  { The self-assignment guard: Clear frees this very instance. }
+  Check('the setter guards against self-assignment',
+    Has(LSrc, 'if Fa = AValue then Exit'));
+end;
+
 procedure TestEmitForwardDecls;
 const
   { The shape that produced non-compiling Pascal until FORWARD-1. Ordinary
@@ -760,6 +878,8 @@ begin
   TestTypeName;
   TestEmitOptional;
   TestEmitForwardDecls;
+  TestEnumValueCollision;
+  TestEmitOneofMessageMember;
   TestEmitEcho;
   TestEmitGreeter;
   WriteLn;

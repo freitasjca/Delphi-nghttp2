@@ -11,7 +11,21 @@ program ProtogenCheck;
 //  comparison.
 //
 //  Usage:
-//    ProtogenCheck <file.proto>
+//    ProtogenCheck [--emit] <file.proto>
+//
+//  --emit also runs the EMITTER over the parsed AST and discards the output.
+//
+//  That flag exists because of what FORWARD-1 exposed on 2026-09-07: this tool
+//  used only Protogen.Parser, so the 7301-schema corpus measured PARSE
+//  ACCEPTANCE ONLY and had never run the emitter once. "99.5% accepted" was a
+//  statement about parsing, and was being read as coverage of generated output.
+//  Two emitter defects were sitting behind it - FORWARD-1 and ENUMCOLLIDE-1 -
+//  and neither was reachable by any corpus run.
+//
+//  What --emit CAN catch: an emitter refusal (EEmitError) and an emitter crash.
+//  What it CANNOT: output that emits happily and then fails to compile. That is
+//  why both defects above were fixed by making the emitter REFUSE rather than
+//  by leaving them to a compiler - a refusal is the shape a corpus can count.
 //
 //  Exit code:
 //    0  accepted — the parser built an AST
@@ -33,23 +47,37 @@ uses
 {$ELSE}
   System.SysUtils,
 {$IFEND}
+  Classes,
   Protogen.Ast,
   Protogen.Lexer,
-  Protogen.Parser;
+  Protogen.Parser,
+  Protogen.Emitter;
 
 var
   LFile: TProtoFileNode;
   LPath: string;
+  LEmit: Boolean;
+  LOut:  TStringList;
+  LEmitter: TMessagesEmitter;
+  I: Integer;
 
 begin
-  if ParamCount <> 1 then
+  LEmit := False;
+  LPath := '';
+  for I := 1 to ParamCount do
+    if ParamStr(I) = '--emit' then
+      LEmit := True
+    else if LPath = '' then
+      LPath := ParamStr(I)
+    else
+      LPath := #0;          // a second non-flag argument is a usage error
+
+  if (LPath = '') or (LPath = #0) then
   begin
-    WriteLn(ErrOutput, 'usage: ProtogenCheck <file.proto>');
+    WriteLn(ErrOutput, 'usage: ProtogenCheck [--emit] <file.proto>');
     ExitCode := 2;
     Exit;
   end;
-
-  LPath := ParamStr(1);
   if not FileExists(LPath) then
   begin
     WriteLn(ErrOutput, 'ERROR  file not found: ', LPath);
@@ -61,6 +89,25 @@ begin
   try
     try
       LFile := ParseProtoFile(LPath);
+
+      { The output is DISCARDED - what is under test is whether emitting
+        raises, not what it produced. Checking the text would need an expected
+        answer per schema, which a foreign corpus cannot supply. }
+      if LEmit then
+      begin
+        LOut := TStringList.Create;
+        try
+          LEmitter := TMessagesEmitter.Create;
+          try
+            LEmitter.Emit(LFile, 'Corpus.Probe', ExtractFileName(LPath), LOut);
+          finally
+            LEmitter.Free;
+          end;
+        finally
+          LOut.Free;
+        end;
+      end;
+
       WriteLn(Format('ACCEPT  %s  (%d message(s), %d enum(s), %d service(s))',
         [ExtractFileName(LPath), LFile.Messages.Count, LFile.Enums.Count,
          LFile.Services.Count]));
@@ -76,6 +123,17 @@ begin
       begin
         WriteLn(Format('REFUSE  %s  [%s]  %s',
           [ExtractFileName(LPath), E.Construct, E.Message]));
+        ExitCode := 1;
+      end;
+      { An EMITTER refusal is still this tool working - the same category as a
+        parser refusal, and reported the same way so a corpus tally sees it.
+        Bracketed `emit` rather than by construct: the emitter refuses for
+        whole-file reasons (an enum-value collision names two enums, not one
+        construct), so a per-construct bracket would be a lie. }
+      on E: EEmitError do
+      begin
+        WriteLn(Format('REFUSE  %s  [emit]  %s',
+          [ExtractFileName(LPath), E.Message]));
         ExitCode := 1;
       end;
       on E: EProtoLexError do

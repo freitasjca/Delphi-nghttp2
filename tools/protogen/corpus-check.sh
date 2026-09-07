@@ -18,6 +18,15 @@
 #
 #  THE CLASSIFICATION IS THE POINT
 #  -------------------------------
+#  Runs ProtogenCheck with --emit, so each schema is PARSED AND EMITTED. Until
+#  2026-09-07 it parsed only, which meant "99.5% accepted" was a claim about the
+#  parser being read as coverage of generated output - and two emitter defects
+#  (FORWARD-1, ENUMCOLLIDE-1) sat behind it, unreachable by any corpus run.
+#
+#  Note what --emit still cannot see: output that emits happily and then fails
+#  to compile. That is why both defects were fixed by making the emitter REFUSE.
+#  A refusal is the shape this script can count; a non-compiling unit is not.
+#
 #  ProtogenCheck reports BOTH a deliberate refusal and a parse failure as
 #  `REFUSE  <path>  [<bracket>]  <reason>`. For a deliberate refusal the
 #  bracket names the construct (`map`, `sint32`); for a parse failure it names
@@ -90,6 +99,11 @@ fi
 # real defect into a comfortable-looking "gap" row, which is the failure mode
 # this whole script exists to avoid.
 KNOWN=(
+  # `emit` is an EMITTER refusal - the generator declining to produce Pascal it
+  # knows would not compile. Added 2026-09-07 with ProtogenCheck --emit; before
+  # that this corpus ran the PARSER only and could not see emitter defects at
+  # all. FORWARD-1 and ENUMCOLLIDE-1 both hid behind that.
+  emit
   sint32 sint64 fixed32 fixed64 sfixed32 sfixed64
   map required group extend extensions proto2 syntax
   "optional repeated" "repeated inside oneof" "optional inside oneof"
@@ -118,7 +132,7 @@ ACC=0; REF=0; UNK=0; ERR=0; TOTAL=0
 echo "scanning $CORPUS ..."
 while IFS= read -r -d '' f; do
   TOTAL=$((TOTAL+1))
-  line="$("$CHECK" "$f" 2>>"$OUT/errors.txt")"
+  line="$("$CHECK" --emit "$f" 2>>"$OUT/errors.txt")"
   rc=$?
   case $rc in
     0) ACC=$((ACC+1)) ;;
@@ -329,11 +343,23 @@ fi
 
 echo
 echo "Baselines to compare against (googleapis, ~7300 files):"
-echo "  51%  2026-08-30  after nested flattening"
-echo "  85%  2026-09-05  after WKT bundling + PRESENCE-1 + ONEOF-1"
-echo "  94%  2026-09-06  after MAP-1"
-echo "  98%  2026-09-06  after STRUCT-1  (7217/7301, 84 refusals)"
-echo "  99%  2026-09-06  after ANY-1     (7267/7301, 34 refusals)"
+echo
+echo "  PARSE ONLY - not comparable with the numbers below. Until 2026-09-07"
+echo "  this script ran the parser and never the emitter, so these say nothing"
+echo "  about whether generated Pascal is produced at all:"
+echo "    51%  2026-08-30  after nested flattening"
+echo "    85%  2026-09-05  after WKT bundling + PRESENCE-1 + ONEOF-1"
+echo "    94%  2026-09-06  after MAP-1"
+echo "    98%  2026-09-06  after STRUCT-1"
+echo "    99%  2026-09-06  after ANY-1"
+echo
+echo "  PARSE + EMIT - what the generator actually accepts:"
+echo "    73%  2026-09-07  first run with --emit (5351/7301, 1950 refusals)"
+echo "    90%  2026-09-07  after ONEOF-2  (6642/7301, 659 refusals)"
+echo
+echo "  The 99% -> 73% drop was NOT a regression. It was the first honest"
+echo "  measurement: 1391 files wanted a message member in a oneof, which the"
+echo "  emitter refused for a reason that had expired four stages earlier."
 echo
 echo "These are RECORDED RESULTS, not targets - update the list when a"
 echo "stage legitimately moves it, so a regression shows as a drop rather"

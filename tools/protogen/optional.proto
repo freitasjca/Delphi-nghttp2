@@ -69,8 +69,8 @@ message OptMsg {
 //                     must not touch it - the commonest way to get group
 //                     clearing wrong is to clear every has-bit in the class.
 //
-// A message member is deliberately absent: clearing one means FREEING it, and
-// protogen emits no destructor, so the generator refuses that case outright.
+// A message member is absent from THIS group on purpose - MsgOneof below
+// covers that shape, so the two stay separable if one breaks.
 
 // PROTOGEN-DTOR. The codec ALLOCATES a submessage instance during decode and
 // hands ownership to the containing class - its own comment says "the message
@@ -196,4 +196,29 @@ message DeclaredLater {
 message SelfRef {
   int32   id   = 1;
   SelfRef next = 2;
+}
+
+// ONEOF-2. A oneof whose members are MESSAGES - the common shape of a real
+// oneof, and refused until 2026-09-07 on the grounds that clearing one means
+// freeing it and protogen emitted no destructor. PROTOGEN-DTOR removed that
+// blocker and the refusal outlived its reason; it cost 1391 of 7301 googleapis
+// schemas, 19% of the corpus.
+//
+// A message member takes NO has-bit - AttachHasBits refuses one on a submessage
+// because nil already carries presence - so this exercises a group where the
+// two presence mechanisms MIX, which is where they can interfere:
+//
+//   a, b   message members. Setting one must FREE the other, not just nil it,
+//          and freeing the wrong one (or twice) is fatal rather than silent.
+//   n      a scalar member in the SAME group, so its has-bit must be lowered
+//          when a message member is set, and vice versa.
+//   before / after   plain fields either side, untouched by any of it.
+message MsgOneof {
+  int32 before = 1;
+  oneof body {
+    Payload a = 2;
+    Payload b = 3;
+    int32   n = 4;
+  }
+  int32 after = 5;
 }

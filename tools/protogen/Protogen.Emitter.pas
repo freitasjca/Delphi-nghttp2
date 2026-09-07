@@ -51,6 +51,8 @@ type
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitTypeSection;
+    // ENUMCOLLIDE-1 — Pascal enum values share unit scope; proto's do not
+    procedure CheckEnumValueCollisions;
     // FORWARD-1 — class forwards for messages referenced before they are declared
     function  MessageIndex(AMsg: TProtoMessageNode): Integer;
     procedure EmitForwardDecls;
@@ -58,6 +60,9 @@ type
     procedure EmitMessage(AMsg: TProtoMessageNode);
     // PRESENCE-1 — proto3 `optional`
     function  NeedsHasBit(AField: TProtoFieldNode): Boolean;
+    // ONEOF-2 — a MESSAGE member of a oneof: nil is its presence, not a bit
+    function  IsOneofMessageMember(AField: TProtoFieldNode): Boolean;
+    function  NeedsSetter(AField: TProtoFieldNode): Boolean;
     procedure EmitImplementationBodies;
     // ONEOF-1 — proto3 `oneof`
     function  OneofGroups(AMsg: TProtoMessageNode): TArray<string>;
@@ -295,12 +300,85 @@ begin
   W;
 end;
 
+// ENUMCOLLIDE-1. Refuses two enums in one file that share a VALUE name.
+//
+// proto scopes an enum's values to the enum's ENCLOSING scope, so a nested enum
+// keeps its values inside its message. This is legal proto3 and protoc compiles
+// it happily:
+//
+//     message A { enum E { X = 0; } }
+//     message B { enum E { X = 0; } }
+//
+// Pascal has no such scoping - enum values live at unit scope. Nested types are
+// flattened here, so both would emit a bare `X` and the unit would not compile
+// with a duplicate identifier.
+//
+// This unit already knew the rule and applied it in ONE place: CaseValueName
+// derives every oneof discriminator value from its enum type name, and its
+// comment says why - "Pascal enum values are NOT scoped, so every value must be
+// unique across the whole unit". That reasoning was never carried across to
+// USER enums.
+//
+// REFUSING rather than renaming, for the same reason the has-bit and map
+// collisions refuse: the user wrote the .proto, so the diagnostic has to be in
+// terms of the .proto. Auto-prefixing would change the generated API silently,
+// and prefixing only the colliding pair would make naming depend on what else
+// happens to be in the file.
+procedure TMessagesEmitter.CheckEnumValueCollisions;
+var
+  I, J, VI, VJ: Integer;
+  LA, LB: TProtoEnumNode;
+begin
+  for I := 0 to FFile.Enums.Count - 1 do
+  begin
+    LA := FFile.Enums[I];
+    for VI := 0 to LA.Values.Count - 1 do
+    begin
+      { Within ONE enum first - proto forbids it, but a parser that ever stopped
+        checking would otherwise produce a duplicate here rather than a
+        diagnostic. }
+      for VJ := VI + 1 to LA.Values.Count - 1 do
+        if SameText(LA.Values[VI].Name, LA.Values[VJ].Name) then
+          raise EEmitError.CreateFmt(
+            'Enum %s declares the value %s twice. Pascal cannot express that, '
+            + 'and neither can proto3.',
+            [QuotedStr(LA.Name), QuotedStr(LA.Values[VI].Name)]);
+
+      for J := I + 1 to FFile.Enums.Count - 1 do
+      begin
+        LB := FFile.Enums[J];
+        for VJ := 0 to LB.Values.Count - 1 do
+          if SameText(LA.Values[VI].Name, LB.Values[VJ].Name) then
+            raise EEmitError.CreateFmt(
+              'Enums %s and %s both declare the value %s. proto scopes enum '
+              + 'values to the enclosing message, so this is legal proto3 - '
+              + 'but Pascal enum values share UNIT scope and nested types are '
+              + 'flattened here, so both would emit a bare %s and the unit '
+              + 'would not compile. Prefix the values to disambiguate - e.g. '
+              + '%s in %s. The prefix is derived from the QUALIFIED name on '
+              + 'purpose: the proto style guide says to prefix with the enum '
+              + 'name, but these two enums SHARE a simple name, so that advice '
+              + 'alone would produce the same identifier twice and collide '
+              + 'again.',
+              [QuotedStr(LA.QualifiedName), QuotedStr(LB.QualifiedName),
+               QuotedStr(LA.Values[VI].Name), QuotedStr(LA.Values[VI].Name),
+               UpperCase(StringReplace(LA.QualifiedName, '.', '_',
+                 [rfReplaceAll])) + '_' + LA.Values[VI].Name,
+               QuotedStr(LA.QualifiedName)]);
+      end;
+    end;
+  end;
+end;
+
 procedure TMessagesEmitter.EmitTypeSection;
 var
   I: Integer;
 begin
   if (FFile.Enums.Count = 0) and (FFile.Messages.Count = 0) then
     Exit;
+  { ENUMCOLLIDE-1 before a line is written, so the diagnostic is not buried
+    under partial output. }
+  CheckEnumValueCollisions;
   W('type');
   { FORWARD-1 first, so a forward precedes every possible use. }
   EmitForwardDecls;
@@ -339,6 +417,22 @@ end;
   The parser cannot make this distinction — psNone means only "not a built-in
   scalar", and a forward reference is unresolvable there — so it is made here,
   where the whole file is in hand. }
+{ ONEOF-2. A oneof member whose type is a message: presence is nil, not a bit. }
+function TMessagesEmitter.IsOneofMessageMember(AField: TProtoFieldNode): Boolean;
+begin
+  Result := AField.InOneof and IsMessageField(AField);
+end;
+
+{ Which fields get a generated Set<Prop>. Every has-bit field needs one (the
+  setter is what raises the bit), and so does a message oneof member - not for
+  a bit, but because the setter is where siblings are cleared. Without it the
+  property would write straight to its backing field and the group would end up
+  with two members set at once. }
+function TMessagesEmitter.NeedsSetter(AField: TProtoFieldNode): Boolean;
+begin
+  Result := NeedsHasBit(AField) or IsOneofMessageMember(AField);
+end;
+
 function TMessagesEmitter.NeedsHasBit(AField: TProtoFieldNode): Boolean;
 begin
   Result := False;
@@ -356,15 +450,18 @@ begin
 
   { A MESSAGE, which the two cases must refuse for different reasons. }
 
-  if AField.InOneof then
-    raise EEmitError.CreateFmt(
-      'Field %s is a message inside oneof %s. Clearing a oneof member means ' +
-      'FREEING the one previously set, and protogen emits no destructor for ' +
-      'generated message classes - a submessage field has no ownership story ' +
-      'here yet, so clearing one would either leak it or silently not clear ' +
-      'it. Move the field out of the oneof, or give the oneof a wrapper ' +
-      'message of its own.',
-      [QuotedStr(AField.Name), QuotedStr(AField.OneofName)]);
+  { ONEOF-2. This USED TO RAISE, on the grounds that clearing a oneof member
+    means freeing it and protogen emitted no destructor. That reason expired
+    when PROTOGEN-DTOR added destructors, and nobody revisited the refusal - a
+    refusal that outlived its cause. It cost 1391 of 7301 googleapis schemas,
+    19% of the corpus, and message members are the COMMON shape of a oneof.
+
+    A message member takes NO has-bit: AttachHasBits refuses one on a
+    submessage because nil already carries presence. So the group Clear frees
+    it, the case getter tests nil, and the setter clears its siblings - exactly
+    what the hand-written TProtobufValue.ClearKind does in
+    Nghttp2.Protobuf.WellKnown, which is the proof the shape works. }
+  if AField.InOneof then Exit(False);
 
   raise EEmitError.CreateFmt(
     'Field %s is `optional %s`, and %s is a message. A message field already ' +
@@ -639,7 +736,13 @@ begin
     begin
       LAnyOptional := True;
       W('    F' + HasBitName(LPropName) + ': Boolean;');
-    end;
+    end
+    { ONEOF-2. No has-bit - nil is the presence - but it still needs the
+      Clear<Prop> DECLARATION that this flag gates. Emitting the body without
+      it gives `Method identifier expected`, which names the Clear line and not
+      the missing declaration. }
+    else if IsOneofMessageMember(LField) then
+      LAnyOptional := True;
   end;
 
   // Pass 2 - the setters, which must come after every field above.
@@ -655,7 +758,7 @@ begin
   for I := 0 to AMsg.Fields.Count - 1 do
   begin
     LField := AMsg.Fields[I];
-    if not NeedsHasBit(LField) then Continue;
+    if not NeedsSetter(LField) then Continue;
     LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
     LFieldType := PascalFieldType(LField, FFile);
     W('    procedure Set' + LPropName + '(const AValue: ' + LFieldType + ');');
@@ -692,7 +795,7 @@ begin
     for I := 0 to AMsg.Fields.Count - 1 do
     begin
       LField := AMsg.Fields[I];
-      if not NeedsHasBit(LField) then Continue;
+      if not NeedsSetter(LField) then Continue;
       LPropName := PascalFieldName(LField.Name, LRenamedFrom);
       { Clearing needs its own entry point. Assigning the zero value through
         the setter SETS the field to zero, which on the wire is the opposite
@@ -736,6 +839,12 @@ begin
       W('    property ' + HasBitName(LPropName) + ': Boolean read F' +
         HasBitName(LPropName) + ';');
     end
+    else if IsOneofMessageMember(LField) then
+      { ONEOF-2. Through the SETTER, so siblings are cleared - but with no
+        [TProtoHas]: nil is the presence signal and AttachHasBits refuses a bit
+        on a submessage. }
+      W('    property ' + LPropName + ': ' + LFieldType +
+        ' read ' + LBackField + ' write Set' + LPropName + ';')
     else
       W('    property ' + LPropName + ': ' + LFieldType +
         ' read ' + LBackField + ' write ' + LBackField + ';');
@@ -769,9 +878,38 @@ begin
     for I := 0 to LMsg.Fields.Count - 1 do
     begin
       LField := LMsg.Fields[I];
-      if not NeedsHasBit(LField) then Continue;
+      if not NeedsSetter(LField) then Continue;
       LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
       LFieldType := PascalFieldType(LField, FFile);
+
+      { ONEOF-2. A message member owns its instance, so its setter and Clear
+        are about FREEING rather than about a bit. Same shape as MAP-1's
+        Set<Field> and as TProtobufValue in Nghttp2.Protobuf.WellKnown. }
+      if IsOneofMessageMember(LField) then
+      begin
+        W('procedure ' + LClass + '.Set' + LPropName +
+          '(const AValue: ' + LFieldType + ');');
+        W('begin');
+        { Self-assignment guard FIRST. Clear frees this very instance, so
+          without it Set(X, X) frees X and then stores the freed pointer -
+          the same trap MAP-1's Set had. }
+        W('  if F' + LPropName + ' = AValue then Exit;');
+        W('  Clear' + CapFirst(LField.OneofName) + ';');
+        W('  F' + LPropName + ' := AValue;');
+        W('end;');
+        W;
+        W('procedure ' + LClass + '.Clear' + LPropName + ';');
+        W('begin');
+        { Not FreeAndNil: SysUtils is not in a generated unit's uses clause,
+          and pulling it in for one call would change the imports of every
+          unit protogen has ever emitted. Free-then-nil is the same two
+          operations and is what the destructor already emits. }
+        W('  F' + LPropName + '.Free;');
+        W('  F' + LPropName + ' := nil;');
+        W('end;');
+        W;
+        Continue;
+      end;
 
       W('procedure ' + LClass + '.Set' + LPropName +
         '(const AValue: ' + LFieldType + ');');
@@ -1003,7 +1141,7 @@ procedure TMessagesEmitter.EmitOneofBodies(AMsg: TProtoMessageNode);
 var
   LGroups: TArray<string>;
   G, I: Integer;
-  LClass, LProp, LRenamed, LType, LEnum: string;
+  LClass, LProp, LRenamed, LType, LEnum, LTest: string;
   LFirst: Boolean;
 begin
   LGroups := OneofGroups(AMsg);
@@ -1021,8 +1159,18 @@ begin
       if not SameText(AMsg.Fields[I].OneofName, LGroups[G]) then Continue;
       LProp := PascalFieldName(AMsg.Fields[I].Name, LRenamed);
       LType := PascalFieldType(AMsg.Fields[I], FFile);
-      W('  F' + LProp + ' := Default(' + LType + ');');
-      W('  F' + HasBitName(LProp) + ' := False;');
+      { ONEOF-2. A message member is FREED, not nilled - the class owns it, the
+        same contract PROTOGEN-DTOR pinned for every other message field. }
+      if IsOneofMessageMember(AMsg.Fields[I]) then
+        begin
+          W('  F' + LProp + '.Free;');
+          W('  F' + LProp + ' := nil;');
+        end
+      else
+      begin
+        W('  F' + LProp + ' := Default(' + LType + ');');
+        W('  F' + HasBitName(LProp) + ' := False;');
+      end;
     end;
     W('end;');
     W;
@@ -1035,10 +1183,15 @@ begin
     begin
       if not SameText(AMsg.Fields[I].OneofName, LGroups[G]) then Continue;
       LProp := PascalFieldName(AMsg.Fields[I].Name, LRenamed);
-      if LFirst then
-        W('  if F' + HasBitName(LProp) + ' then')
+      { ONEOF-2. A message member has no has-bit - nil IS the answer. }
+      if IsOneofMessageMember(AMsg.Fields[I]) then
+        LTest := 'F' + LProp + ' <> nil'
       else
-        W('  else if F' + HasBitName(LProp) + ' then');
+        LTest := 'F' + HasBitName(LProp);
+      if LFirst then
+        W('  if ' + LTest + ' then')
+      else
+        W('  else if ' + LTest + ' then');
       W('    Result := ' + CaseValueName(LClass, LGroups[G], LProp));
       LFirst := False;
     end;

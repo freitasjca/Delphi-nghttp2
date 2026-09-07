@@ -98,6 +98,8 @@ var
   GMap, GMapDst: TMapMsg;        // MAP-1
   GWkt, GWktDst: TWktMsg;        // STRUCT-1
   GFwd, GFwdDst: TUsesLater;     // FORWARD-1
+  GMO, GMODst: TMsgOneof;        // ONEOF-2
+  GKeep: TPayload;
   GSelf: TSelfRef;
   GAnyOk: Boolean;               // ANY-1
   GAnyErr: string;
@@ -790,6 +792,135 @@ begin
     on E: Exception do GErr := E.ClassName + ': ' + E.Message;
   end;
   Check('a self-referencing message compiles and nests', GOk, GErr);
+
+  // ── ONEOF-2 · a oneof whose members are MESSAGES ─────────────────────────
+  //  The group mixes presence mechanisms: a and b signal by nil, n by a
+  //  has-bit. Everything here is about OWNERSHIP - a leak is invisible, a
+  //  double free is not, and getting the mix wrong shows up as one or the
+  //  other.
+  WriteLn;
+  WriteLn('-- ONEOF-2: message members in a oneof');
+
+  GOk  := False;
+  GErr := '';
+  GMO := TMsgOneof.Create;
+  try
+    try
+      TProtoSerializer.Serialize(GMO);
+      GOk := True;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+  finally
+    GMO.Free;
+  end;
+  Check('a oneof with message members is ACCEPTED by the RTTI layer', GOk, GErr);
+
+  if GOk then
+  begin
+    GMO := TMsgOneof.Create;
+    try
+      Check('fresh group reports None', GMO.BodyCase = MsgOneofBodyCaseNone);
+
+      GMO.a := TPayload.Create;
+      GMO.a.id := 1;
+      Check('setting a message member reports THAT member',
+        GMO.BodyCase = MsgOneofBodyCaseA);
+      Check('  and it is the only one on the wire',
+        EmitsTag(GMO, 2) and (not EmitsTag(GMO, 3)) and (not EmitsTag(GMO, 4)));
+
+      { The whole point. `a` must be FREED, not merely nilled - and if it were
+        freed twice, or the wrong one freed, this is where it dies. }
+      GMO.b := TPayload.Create;
+      GMO.b.id := 2;
+      Check('setting a second message member cleared the first', GMO.a = nil);
+      Check('  and the case moved', GMO.BodyCase = MsgOneofBodyCaseB);
+
+      { Mixed presence: a SCALAR member in the same group. Its has-bit must
+        rise, and the message member must be freed. }
+      GMO.n := 7;
+      Check('a scalar member clears the message member', GMO.b = nil);
+      Check('  and raises its own bit', GMO.HasN);
+      Check('  and reports its case', GMO.BodyCase = MsgOneofBodyCaseN);
+
+      { ...and back the other way, which is the direction that would be missed
+        by testing only message-clears-scalar. }
+      GMO.a := TPayload.Create;
+      Check('a message member lowers the scalar bit', not GMO.HasN);
+      Check('  and takes the case back', GMO.BodyCase = MsgOneofBodyCaseA);
+
+      { Self-assignment: Clear frees this very instance, so without the guard
+        this frees it and stores the freed pointer. }
+      GMO.a := GMO.a;
+      Check('re-setting a member to ITSELF does not free it', GMO.a <> nil);
+
+      GMO.ClearBody;
+      Check('ClearBody returns the group to None',
+        GMO.BodyCase = MsgOneofBodyCaseNone);
+      Check('  and freed the message member', GMO.a = nil);
+      Check('  so nothing is emitted', not EmitsTag(GMO, 2));
+    finally
+      GMO.Free;
+    end;
+
+    { Round trip, plus the plain fields either side. Decode reaches the setter,
+      so the group rule holds on the wire without the decoder knowing oneofs
+      exist - and the decoded instance must be freed exactly once. }
+    GOk  := False;
+    GErr := '';
+    try
+      GMO    := TMsgOneof.Create;
+      GMODst := TMsgOneof.Create;
+      try
+        GMO.before := 5;
+        GMO.after  := 9;
+        GMO.b := TPayload.Create;
+        GMO.b.note := 'through a message oneof';
+        GBytes := TProtoSerializer.Serialize(GMO);
+        TProtoSerializer.Deserialize(GBytes, GMODst);
+        GOk := (GMODst.b <> nil)
+               and (GMODst.b.note = 'through a message oneof')
+               and (GMODst.a = nil)
+               and (GMODst.BodyCase = MsgOneofBodyCaseB)
+               and (GMODst.before = 5) and (GMODst.after = 9);
+      finally
+        GMO.Free;
+        GMODst.Free;      { each frees its own member exactly once }
+      end;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+    Check('round-trip: member, case and neighbours all survive', GOk, GErr);
+
+    { Two members on the wire must leave only the LAST set - proto3's rule.
+      Built by hand because the encoder will not produce it. }
+    GOk  := False;
+    GErr := '';
+    try
+      GMO := TMsgOneof.Create;
+      try
+        GMO.a := TPayload.Create; GMO.a.id := 11;
+        GBytes := TProtoSerializer.Serialize(GMO);
+        GMO.a.id := 11;
+      finally
+        GMO.Free;
+      end;
+      GMODst := TMsgOneof.Create;
+      try
+        GKeep := TPayload.Create;
+        GKeep.id := 99;
+        GMODst.b := GKeep;              { pre-set a DIFFERENT member }
+        TProtoSerializer.Deserialize(GBytes, GMODst);
+        GOk := (GMODst.a <> nil) and (GMODst.a.id = 11) and (GMODst.b = nil);
+      finally
+        GMODst.Free;
+      end;
+    except
+      on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+    end;
+    Check('decoding a member CLEARS a previously-set sibling, freeing it',
+          GOk, GErr);
+  end;
 
   WriteLn;
   WriteLn(Format('[ProtogenOptional] %d passed, %d failed', [GPass, GFail]));
