@@ -360,7 +360,7 @@ echo "    99%  2026-09-07  after OPTMSG-1 + ENUMCOLLIDE-1 revised"
 echo "                     (7266/7301, 35 refusals, 1 of them emit-side)"
 echo
 echo "  The one remaining emit refusal is bigquery/v2/job.proto: an enum"
-echo "  declaring both `minimal` and `MINIMAL`. Legal proto3 - identifiers are"
+echo '  declaring both minimal and MINIMAL. Legal proto3 - identifiers are'
 echo "  case-sensitive there - and impossible in Pascal, where they are not."
 echo "  Not renameable: both sit in one enum, so any prefix lands on both."
 echo
