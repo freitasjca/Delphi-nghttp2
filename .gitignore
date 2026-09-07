@@ -98,3 +98,6 @@ tests/interop/Nghttp2InteropCodec
 # binary with no extension (so *.exe does not cover it).
 tools/protogen/.corpus/
 tools/protogen/.corpus-out/
+
+# compile-check.sh output: thousands of generated units per --all run
+tools/protogen/.compile-out/

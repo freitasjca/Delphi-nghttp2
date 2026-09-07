@@ -45,9 +45,11 @@ type
     FProtoFile:  string;
     FOut:        TStrings;
     FNeedsWKT:   Boolean;
+    FNeedsSysUtils: Boolean;   // TBYTES-1 — a `bytes` field needs TBytes
 
     procedure W(const ALine: string = '');
     procedure ScanForWKT;
+    procedure ScanForBytes;
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitTypeSection;
@@ -67,6 +69,11 @@ type
     procedure EmitImplementationBodies;
     // ONEOF-1 — proto3 `oneof`
     function  OneofGroups(AMsg: TProtoMessageNode): TArray<string>;
+    { ONEOFNAME-1 — the deduped case-enum values for one group, index 0 being
+      the None sentinel. ONE source, because the enum declaration and the case
+      getter both need these names and computing them twice let them desync. }
+    function  OneofCaseNames(AMsg: TProtoMessageNode;
+      const AGroup: string): TArray<string>;
     procedure EmitOneofCaseEnums(AMsg: TProtoMessageNode);
     procedure EmitOneofBodies(AMsg: TProtoMessageNode);
     // PROTOGEN-DTOR — ownership of allocated submessages
@@ -131,6 +138,50 @@ implementation
 // The wire tag is the contract, not the identifier, so renaming is safe.
 // The emitter documents each rename with a // comment above the property.
 
+{ ENUMWORD-1. Identifiers a generated ENUM VALUE must not take.
+
+  Two distinct hazards, and only the first is a reserved word:
+
+    RESERVED    `END`, `STRING`, `AND`, `INHERITED` - the compiler stops at
+                the token. Loud, and found immediately.
+    INTRINSIC   `HIGH`, `LOW` and friends are NOT reserved; they are shadowable
+                identifiers. Declaring `HIGH` as an enum value makes the
+                generated destructor's own `High(FSomeArray)` stop resolving,
+                and the error lands in the DESTRUCTOR - "DO expected but (
+                found" - naming a line that is perfectly correct. That is
+                the nastier of the two.
+
+  Only the intrinsics the emitter itself EMITS matter, so this list is short
+  and closed rather than a copy of the RTL: High and Low (destructors, map
+  accessors), Length and SetLength (map accessors), Result and Exit (every
+  generated function), Free and Create (ownership), Copy/Pos/Default. }
+function IsGeneratedCodeIntrinsic(const AName: string): Boolean;
+var
+  LName: string;
+begin
+  LName := LowerCase(AName);
+  Result :=
+    { routines the generated code calls }
+    (LName = 'high')   or (LName = 'low')       or (LName = 'length')   or
+    (LName = 'setlength') or (LName = 'result')  or (LName = 'exit')     or
+    (LName = 'free')   or (LName = 'create')    or (LName = 'default')  or
+    (LName = 'copy')   or (LName = 'pos')       or (LName = 'ord')      or
+    (LName = 'assigned') or (LName = 'inc')     or (LName = 'dec')      or
+    (LName = 'true')   or (LName = 'false')     or (LName = 'nil')      or
+    (LName = 'self')   or
+    { TYPE names the generated code emits. Missed on the first pass, which
+      covered routines only - and an enum value shadowing a type fails in a
+      stranger place: `BOOL`, `DOUBLE` and `INT64` in one googleapis enum made
+      `TArray<Double>` on a LATER line report "Type mismatch". }
+    (LName = 'integer') or (LName = 'int64')    or (LName = 'boolean')  or
+    (LName = 'double')  or (LName = 'single')   or (LName = 'cardinal') or
+    (LName = 'uint32')  or (LName = 'uint64')   or (LName = 'tbytes')   or
+    (LName = 'tarray')  or (LName = 'byte')     or (LName = 'word')     or
+    (LName = 'longint') or (LName = 'smallint') or (LName = 'shortint') or
+    (LName = 'extended') or (LName = 'currency') or (LName = 'pointer') or
+    (LName = 'tobject') or (LName = 'tclass');
+end;
+
 function IsDelphiReservedWord(const AName: string): Boolean;
 begin
   Result :=
@@ -188,6 +239,22 @@ begin
   end;
 end;
 
+{ TBYTES-1. Does any field emit TBytes? Only `bytes` does - repeated or not,
+  since TArray<TBytes> needs the element type just the same. }
+procedure TMessagesEmitter.ScanForBytes;
+var
+  I, J: Integer;
+begin
+  FNeedsSysUtils := False;
+  for I := 0 to FFile.Messages.Count - 1 do
+    for J := 0 to FFile.Messages[I].Fields.Count - 1 do
+      if FFile.Messages[I].Fields[J].Scalar = psBytes then
+      begin
+        FNeedsSysUtils := True;
+        Exit;
+      end;
+end;
+
 procedure TMessagesEmitter.EmitBoilerplate;
 begin
   W('unit ' + FUnitPrefix + '.Messages;');
@@ -204,9 +271,33 @@ begin
   W;
 end;
 
+// TBYTES-1. A proto3 `bytes` field emits TBytes, which lives in SysUtils - and
+// SysUtils was never named in a generated uses clause. So a generated unit for
+// ANY schema with a bytes field did not compile: "Identifier not found TBytes".
+// Ordinary proto3, broken since C2.
+//
+// It survived because the emitter had only ever been compiled against four
+// schemas - echo, greeter, optional.proto and the runner fixture - and not one
+// of them declares a bytes field. compile-check.sh found it in four of the
+// first 302 real schemas it tried.
+//
+// CONDITIONAL, on the same reasoning as FNeedsWKT above it. Emitting SysUtils
+// unconditionally is simpler to write and worse to live with: it changes every
+// generated unit, which breaks the C2 gate's byte-for-byte comparison against
+// the hand-written samples and would mean editing a sample in ANOTHER repo to
+// accommodate it. A gate weakened to fit a change is worth more than the line
+// of code it saved.
 procedure TMessagesEmitter.EmitUsesClause;
 begin
   W('uses');
+  if FNeedsSysUtils then
+  begin
+    W('{$IF DEFINED(FPC)}');
+    W('  SysUtils,');
+    W('{$ELSE}');
+    W('  System.SysUtils,');
+    W('{$IFEND}');
+  end;
   if FNeedsWKT then
   begin
     W('  Nghttp2.Protobuf,');
@@ -365,17 +456,66 @@ begin
   end;
 end;
 
-{ The Pascal identifier for one enum value: its own name, unless another enum
-  in this file declares the same name, in which case it is prefixed from the
-  qualified name. Consulted everywhere a value is emitted, so the declaration
-  and any reference to it cannot disagree. }
+{ The Pascal identifier for one enum value. Four things can force a change, and
+  each was found by compiling real schemas rather than by reasoning:
+
+    1  RESERVED WORD      `END`, `STRING`, `AND`, `INHERITED`. Fields have been
+                          renamed since C2; enum values never were.
+    2  SHADOWED INTRINSIC  `HIGH`/`LOW`. Not reserved - which is why this is
+                          worse: declaring one makes the generated destructor's
+                          own High(...) stop resolving, and the compiler blames
+                          a line in the destructor that is perfectly correct.
+    3  CROSS-ENUM COLLISION  Pascal enum values share UNIT scope; proto scopes
+                          them to the enclosing message.
+    4  TOO LONG           FPC truncates identifiers at 127 characters, so two
+                          googleads values differing only after char 128 become
+                          the same identifier.
+
+  1, 2 and 4 are checked BEFORE 3, because each can create a collision that 3
+  then has to resolve - a truncated name is far more likely to clash than the
+  original was. }
 function TMessagesEmitter.EnumValueName(AEnum: TProtoEnumNode;
   AIndex: Integer): string;
+const
+  { FPC truncates identifiers at 126 characters. MEASURED, not assumed - a
+    minimal unit declaring two enum values differing only in their last
+    character compiles at 90, 110 and 126, and at 127 fails with
+
+        Error: Duplicate identifier "$XXXX..."   (126 X's)
+
+    because both names truncate to the same 126. Delphi's limit is higher, but
+    generating something that compiles on only one of the two supported
+    compilers is not an option.
+
+    120, not 126, so nothing generated here ever sits ON the boundary. That
+    matters: at exactly 127 FPC misbehaves in two different ways - the toy case
+    above reports a duplicate, while four real googleads schemas produced
+    `Fatal: Internal error 2015071505`, a compiler crash rather than a
+    diagnostic. A margin is cheaper than understanding why. }
+  MAX_IDENT = 120;
 var
   J, V: Integer;
   LOther: TProtoEnumNode;
+  LHash: Cardinal;
+  K: Integer;
 begin
   Result := AEnum.Values[AIndex].Name;
+
+  if IsDelphiReservedWord(LowerCase(Result)) or IsGeneratedCodeIntrinsic(Result) then
+    Result := Result + '_';
+
+  { Truncate with a hash of the FULL name, so two values sharing a long prefix
+    stay distinct. Ugly, and the alternative was refusing a schema protoc
+    accepts because one identifier is 150 characters long. }
+  if Length(Result) > MAX_IDENT then
+  begin
+    LHash := 2166136261;                                   // FNV-1a
+    for K := 1 to Length(AEnum.Values[AIndex].Name) do
+      LHash := (LHash xor Ord(AEnum.Values[AIndex].Name[K])) * 16777619;
+    Result := Copy(Result, 1, MAX_IDENT - 9) + '_' + IntToHex(LHash, 8);
+  end;
+
+  { Cross-enum collision, LAST, so it sees the name the other rules produced. }
   for J := 0 to FFile.Enums.Count - 1 do
   begin
     LOther := FFile.Enums[J];
@@ -384,11 +524,12 @@ begin
       if SameText(LOther.Values[V].Name, Result) then
       begin
         Result := UpperCase(StringReplace(AEnum.QualifiedName, '.', '_',
-                    [rfReplaceAll])) + '_' + AEnum.Values[AIndex].Name;
+                    [rfReplaceAll])) + '_' + Result;
         Exit;
       end;
   end;
 end;
+
 
 procedure TMessagesEmitter.EmitTypeSection;
 var
@@ -473,6 +614,17 @@ begin
 
   if FFile.FindEnum(AField.TypeName) <> nil then
     Exit(True);                                    // enum: varint, needs a bit
+
+  { WKTENUM-1. A BUNDLED well-known enum - google.protobuf.NullValue - is an
+    enum too, but FindEnum cannot see it: it is not declared in this .proto.
+    Without this it fell through to the message branch and got no has-bit,
+    while the group Clear and the case getter both emitted references to one.
+    Result: "Identifier not found FHasnull_value", in three googleapis schemas.
+
+    WellKnownIsEnum is the same predicate IsMessageField uses to keep NullValue
+    out of the destructor. It was applied there and not here. }
+  if WellKnownIsEnum(AField.TypeName) then
+    Exit(True);
 
   { A MESSAGE. Neither case takes a has-bit - nil already carries presence -
     and neither is a reason to refuse the schema. }
@@ -642,6 +794,49 @@ end;
 { ONEOF-1. One discriminator enum per oneof group, emitted immediately before
   the class that uses it. `None` is first so it is the zero value, which makes
   a freshly-constructed message report "nothing set" without any constructor. }
+// ONEOFNAME-1. A oneof member named `none` produces CapFirst('none') = 'None',
+// which is exactly the sentinel this enum already declares - so the generated
+// enum had ConsolidationStrategyStrategyCaseNone twice and did not compile.
+// Real: google/apps/drive/activity/v2 declares a oneof whose members include
+// one literally named `none`.
+//
+// Any duplicate gets '_' appended until unique, and the comparison is
+// case-INSENSITIVE because Pascal is - two members `none` and `None` are one
+// identifier here even though proto keeps them apart.
+//
+// The sentinel is index 0 and never renamed: it is ours, the members are the
+// user's, and moving ours would change the generated API for every schema to
+// accommodate one.
+function TMessagesEmitter.OneofCaseNames(AMsg: TProtoMessageNode;
+  const AGroup: string): TArray<string>;
+var
+  I, J: Integer;
+  LClass, LRenamed, LName: string;
+  LDup: Boolean;
+begin
+  LClass := PascalTypeName(AMsg.QualifiedName);
+  SetLength(Result, 1);
+  Result[0] := CaseValueName(LClass, AGroup, '');
+  for I := 0 to AMsg.Fields.Count - 1 do
+    if SameText(AMsg.Fields[I].OneofName, AGroup) then
+    begin
+      LName := CaseValueName(LClass, AGroup,
+                 PascalFieldName(AMsg.Fields[I].Name, LRenamed));
+      repeat
+        LDup := False;
+        for J := 0 to High(Result) do
+          if SameText(Result[J], LName) then
+          begin
+            LName := LName + '_';
+            LDup  := True;
+            Break;
+          end;
+      until not LDup;
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := LName;
+    end;
+end;
+
 procedure TMessagesEmitter.EmitOneofCaseEnums(AMsg: TProtoMessageNode);
 var
   LGroups: TArray<string>;
@@ -657,15 +852,7 @@ begin
   begin
     { Names collected first so the comma placement is decided once, against a
       known count, rather than guessed inside the emit loop. }
-    SetLength(LNames, 1);
-    LNames[0] := CaseValueName(LClass, LGroups[G], '');
-    for I := 0 to AMsg.Fields.Count - 1 do
-      if SameText(AMsg.Fields[I].OneofName, LGroups[G]) then
-      begin
-        SetLength(LNames, Length(LNames) + 1);
-        LNames[High(LNames)] := CaseValueName(LClass, LGroups[G],
-          PascalFieldName(AMsg.Fields[I].Name, LRenamed));
-      end;
+    LNames := OneofCaseNames(AMsg, LGroups[G]);
 
     W('  { which member of oneof ' + LGroups[G] + ' is set, if any }');
     W('  ' + CaseEnumName(LClass, LGroups[G]) + ' = (');
@@ -1181,6 +1368,8 @@ var
   LGroups: TArray<string>;
   G, I: Integer;
   LClass, LProp, LRenamed, LType, LEnum, LTest: string;
+  LCaseNames: TArray<string>;
+  LMemberIdx: Integer;
   LFirst: Boolean;
 begin
   LGroups := OneofGroups(AMsg);
@@ -1217,10 +1406,16 @@ begin
     W('function ' + LClass + '.Get' + CapFirst(LGroups[G]) + 'Case: ' +
       LEnum + ';');
     W('begin');
+    { ONEOFNAME-1. The SAME deduped list the enum declaration used - computing
+      these names twice is how the two could disagree, and a case getter naming
+      a value the enum does not declare is a compile error at best. }
+    LCaseNames := OneofCaseNames(AMsg, LGroups[G]);
+    LMemberIdx := 0;
     LFirst := True;
     for I := 0 to AMsg.Fields.Count - 1 do
     begin
       if not SameText(AMsg.Fields[I].OneofName, LGroups[G]) then Continue;
+      Inc(LMemberIdx);
       LProp := PascalFieldName(AMsg.Fields[I].Name, LRenamed);
       { ONEOF-2. A message member has no has-bit - nil IS the answer. }
       if IsOneofMessageMember(AMsg.Fields[I]) then
@@ -1231,11 +1426,11 @@ begin
         W('  if ' + LTest + ' then')
       else
         W('  else if ' + LTest + ' then');
-      W('    Result := ' + CaseValueName(LClass, LGroups[G], LProp));
+      W('    Result := ' + LCaseNames[LMemberIdx]);
       LFirst := False;
     end;
     W('  else');
-    W('    Result := ' + CaseValueName(LClass, LGroups[G], '') + ';');
+    W('    Result := ' + LCaseNames[0] + ';');
     W('end;');
     W;
   end;
@@ -1252,6 +1447,7 @@ begin
   FOut        := ALines;
   ALines.Clear;
   ScanForWKT;
+  ScanForBytes;
   EmitBoilerplate;
   EmitUsesClause;
   EmitTypeSection;

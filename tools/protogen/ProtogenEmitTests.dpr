@@ -732,6 +732,60 @@ begin
     Has(LSrc, 'if Fa = AValue then Exit'));
 end;
 
+
+// ── TBYTES-1 / ENUMWORD-1: what the compiler found that no text check did ───
+procedure TestCompilerFoundDefects;
+const
+  { A `bytes` field emits TBytes, which lives in SysUtils. Generated units did
+    not name it, so ANY schema with a bytes field failed to compile - ordinary
+    proto3, broken since C2, invisible because not one of the four compiled
+    fixtures declared one. }
+  CBytes =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message M { bytes blob = 1; }';
+  CNoBytes =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message M { int32 n = 1; }';
+  { END is reserved; HIGH is not, which is why it is worse - it shadows the
+    High() the generated destructor calls, and the compiler blames the
+    destructor. }
+  CWords =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message Inner { int32 id = 1; }'#10 +
+    'message M {'#10 +
+    '  enum E { UNSET = 0; END = 1; STRING = 2; HIGH = 3; PLAIN = 4; }'#10 +
+    '  E e = 1;'#10 +
+    '  repeated Inner many = 2;'#10 +
+    '}';
+var
+  LSrc: string;
+begin
+  WriteLn;
+  WriteLn('-- TBYTES-1 / ENUMWORD-1: defects the compiler found');
+
+  LSrc := EmitSource(CBytes);
+  Check('a bytes field brings SysUtils into the uses clause',
+    Has(LSrc, 'SysUtils'));
+  Check('  guarded for both compilers',
+    Has(LSrc, 'System.SysUtils'));
+  { Conditional on purpose: unconditional would change every generated unit and
+    break the C2 sample comparison, which is a gate worth more than the line. }
+  LSrc := EmitSource(CNoBytes);
+  Check('a schema with NO bytes field does not gain SysUtils',
+    not Has(LSrc, 'SysUtils'));
+
+  LSrc := EmitSource(CWords);
+  Check('a reserved-word enum value is renamed', Has(LSrc, 'END_ ='));
+  Check('  and so is another one', Has(LSrc, 'STRING_ ='));
+  { The one that is NOT a reserved word. Emitting it breaks the destructor,
+    not the enum - and the error names the destructor. }
+  Check('an intrinsic-shadowing value is renamed too', Has(LSrc, 'HIGH_ ='));
+  Check('a safe value is left alone',
+    Has(LSrc, 'PLAIN = 4') and (not Has(LSrc, 'PLAIN_')));
+  { The destructor must still be able to call High(). }
+  Check('the destructor still uses High()', Has(LSrc, 'High(Fmany)'));
+end;
+
 procedure TestEmitForwardDecls;
 const
   { The shape that produced non-compiling Pascal until FORWARD-1. Ordinary
@@ -907,6 +961,7 @@ begin
   TestEmitForwardDecls;
   TestEnumValueCollision;
   TestEmitOneofMessageMember;
+  TestCompilerFoundDefects;
   TestEmitEcho;
   TestEmitGreeter;
   WriteLn;
