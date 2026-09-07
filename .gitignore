@@ -57,6 +57,10 @@ desktop.ini
 # FPC build output
 .fpc-out/
 tests/interlocked_check
+# Same class, missed until 2026-09-07: it was COMMITTED, and a Windows build
+# then deleted it, which is how it surfaced. A compiled binary with no
+# extension slips past *.exe every time.
+tests/Nghttp2ProtobufTests
 
 # Test-runner output (run-tests.bat writes one per stage)
 *.buildlog
