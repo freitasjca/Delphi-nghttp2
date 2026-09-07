@@ -46,7 +46,7 @@ uses
   Nghttp2.Protobuf.Rtti,
   Nghttp2.Protobuf.WellKnown,   // STRUCT-1 - the bundled Struct family
   Nghttp2.Protobuf.Any,         // ANY-1 - the registry + Pack/Unpack
-  Sample.Opt.Messages;      // <- generated. The point of the exercise.
+  Sample.Optional.Messages; // <- generated. The point of the exercise.
 
 var
   GPass: Integer = 0;

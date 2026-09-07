@@ -29,6 +29,7 @@
 #    4  samples/grpc-server             compile only  (gates)
 #    5  samples/grpc-server, old define compile only  (gates back-compat)
 #    6  protogen parser tests (C1)      build + run   (gates)
+#    6b protogen file set (IMPORT-1)    build + run   (gates)
 #    7  protoc oracle (C1b)             run           (gates if protoc is
 #                                                      present; skips if not)
 #    8  protogen emitter tests (C2)     build + run   (gates)
@@ -626,6 +627,45 @@ else
   echo "  SKIP  tools/protogen not present"
 fi
 
+# ── 6b · protogen file set (IMPORT-1) ───────────────────────────────────────
+# TProtoFileSet: include-root resolution, the transitive import closure, unit
+# naming, visibility and cross-file type resolution.
+#
+# Gates for the same reason stage 6 does, and one more: three of its assertions
+# are NEGATIVE — a missing import must raise, a cycle must raise, and a file
+# imported non-publicly must not be visible. The defect IMPORT-1 fixes was a
+# silent fall-through, so a resolver that quietly returns nothing would rebuild
+# that defect one layer up and every positive test would still pass.
+echo
+echo "── protogen file set tests (IMPORT-1) ────────────────────────────────"
+if [[ -f "$PROTOGEN/ProtogenFileSetTests.dpr" ]]; then
+  PFOUT="$OUT/protogen-fileset"
+  mkdir -p "$PFOUT"
+  rm -f "$PFOUT"/*.ppu "$PFOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PFOUT" -FE"$PFOUT" \
+       -Fu"$PROTOGEN" \
+       $TRUNK_UNIT_PATHS \
+       "$PROTOGEN/ProtogenFileSetTests.dpr" > "$PFOUT/build.log" 2>&1 \
+     && [[ -x "$PFOUT/ProtogenFileSetTests" ]]; then
+    "$PFOUT/ProtogenFileSetTests" < /dev/null | sed 's/^/  /'
+    PF_RC=${PIPESTATUS[0]}
+    if [[ "$PF_RC" -eq 0 ]]; then
+      echo "  file set tests: PASSED"
+    else
+      echo "  FAIL  protogen file set tests"
+      [[ $RC -eq 0 ]] && RC=1
+    fi
+  else
+    echo "  FAIL  ProtogenFileSetTests.dpr did not compile"
+    grep -E "Error|Fatal" "$PFOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PFOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  ProtogenFileSetTests.dpr not present"
+fi
+
 # ── 7 · protoc oracle (C1b) ─────────────────────────────────────────────────
 # Differential test against the reference implementation. Kept OPTIONAL on the
 # protoc side and gating on ours: protoc is an extra install (pip install
@@ -834,8 +874,12 @@ else
   rm -rf "$GENOUT" "$GCOUT"
   mkdir -p "$GENOUT" "$GCOUT"
 
+  # IMPORT-1: the per-file part of a unit name now comes from the .proto's own
+  # path, so greeter.proto under --unit-prefix Sample yields exactly the
+  # Sample.Greeter.* units this stage has always compiled. The prefix lost a
+  # segment; the generated unit names did not change.
   if ! "$PBOUT/Protogen" -i "$GENPROTO" -o "$GENOUT" \
-         --unit-prefix Sample.Greeter > "$GCOUT/generate.log" 2>&1; then
+         --unit-prefix Sample > "$GCOUT/generate.log" 2>&1; then
     echo "  FAIL  Protogen could not generate into $GENOUT"
     sed 's/^/    /' "$GCOUT/generate.log" | head -12
     [[ $RC -eq 0 ]] && RC=2
@@ -899,8 +943,11 @@ else
   rm -rf "$OPTGEN" "$OPTOUT"
   mkdir -p "$OPTGEN" "$OPTOUT"
 
+  # IMPORT-1: optional.proto under --unit-prefix Sample yields
+  # Sample.Optional.* (it was Sample.Opt.*), which is what
+  # ProtogenOptionalCompileCheck.dpr now names in its uses clause.
   if ! "$PBOUT/Protogen" -i "$OPTPROTO" -o "$OPTGEN" \
-         --unit-prefix Sample.Opt > "$OPTOUT/generate.log" 2>&1; then
+         --unit-prefix Sample > "$OPTOUT/generate.log" 2>&1; then
     echo "  FAIL  Protogen could not generate from optional.proto"
     sed 's/^/    /' "$OPTOUT/generate.log" | head -12
     [[ $RC -eq 0 ]] && RC=2

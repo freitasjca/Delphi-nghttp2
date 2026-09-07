@@ -4,9 +4,10 @@
 generator: a proto3 parser, a single-file verdict CLI, and a differential test
 against `protoc`.
 
-> **It generates code.** `Protogen -i x.proto -o src/ --unit-prefix My.Svc`
-> writes four units: messages, service interfaces, an implementation skeleton
-> and a registration unit. **How to use it is
+> **It generates code.** `Protogen -i x.proto -o src/ --unit-prefix My`
+> writes four units per schema: messages, service interfaces, an
+> implementation skeleton and a registration unit — and since IMPORT-1 it
+> follows `import`, emitting one unit group per `.proto` in the closure. **How to use it is
 > [`codegen-guide.md`](codegen-guide.md)** — start there.
 >
 > This file is the *contract*: which proto3 constructs are supported, which are
@@ -31,6 +32,8 @@ Everything here builds on both compilers and needs nothing beyond the RTL.
 | `Protogen.Ast.pas` | The parsed shape of a file. Deliberately dumb — records what was written, no name resolution and no Pascal mapping. |
 | `Protogen.Lexer.pas` | Tokeniser. Every token carries line and column. |
 | `Protogen.Parser.pas` | Recursive descent, and where every refusal lives. |
+| `Protogen.FileSet.pas` | Resolves `import` against include roots, loads the transitive closure, names one unit per file, and answers what a type reference means across files. |
+| `ProtogenFileSetTests.dpr` | The IMPORT-1 gate — 43 checks, three of them negative. |
 | `ProtogenParserTests.dpr` | The gate — 98 checks. |
 | `ProtogenCheck.dpr` | Parses one file, prints a verdict, sets an exit code. |
 | `protoc-oracle.sh` | Asks `protoc` and this parser the same question and diffs the answers. |
@@ -176,6 +179,8 @@ silently deleted, so a reader working from an older copy sees that the answer
 | `Struct`, `Value`, `ListValue`, `NullValue`, `Any` | STRUCT-1, ANY-1 | Bundled as hand-written classes in `Nghttp2.Protobuf.WellKnown`. `Any` also needs `Nghttp2.Protobuf.Any` for `TProtoAnyRegistry` and Pack/Unpack. |
 | a **message member** inside a `oneof` | ONEOF-2 | It takes no has-bit — `AttachHasBits` refuses one on a submessage, because nil already carries presence. The group `Clear` frees it, the case getter tests nil, and the setter clears its siblings. |
 | `optional` on a **message** field | OPTMSG-1 | A no-op label: in proto3 a message field always has explicit presence, so `optional Foo x` and `Foo x` are the same thing and protoc treats them identically. |
+| `import` of another `.proto` | IMPORT-1 | Imports are resolved against `-I` roots, the closure is loaded, and one unit is emitted per file. A cross-file type is named **fully qualified** (`My.Google.Rpc.Status.Messages.TStatus`) because short names collide constantly across packages and a bare name binds to whichever unit is last in the uses clause. |
+| a well-known type as an **rpc parameter** | SVCWKT-1 | The service emitters called `PascalTypeName` directly, so `rpc F(google.protobuf.Empty)` emitted `TGoogleProtobufEmpty` — a type nothing declares. All four emitters now share one resolver. |
 | two enums sharing a **value name** | ENUMCOLLIDE-1 | Pascal enum values share unit scope and proto's do not, so a colliding value is prefixed from its qualified name (`A.E.X` → `A_E_X`). Only the colliding ones; unique values keep their spelling. |
 
 **How the last three were found, because it says something about the numbers

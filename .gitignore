@@ -101,3 +101,10 @@ tools/protogen/.corpus-out/
 
 # compile-check.sh output: thousands of generated units per --all run
 tools/protogen/.compile-out/
+
+# The qualified-reference probe's build output. FOURTH time an extensionless
+# compiled binary has been staged in this repo -- the three comments above say
+# the same thing about three other directories. The probe is built by hand
+# (see the header of ProtoQualRefProbe.dpr), so its output lands wherever -FE
+# points; keep the whole directory out.
+tests/qualref/out/

@@ -41,6 +41,7 @@ uses
   System.SysUtils, System.Classes,
 {$IFEND}
   Protogen.Ast,
+  Protogen.FileSet,
   Protogen.Emitter,
   Protogen.ServiceEmitter;
 
@@ -67,7 +68,24 @@ type
       const AOutputDir, AUnitPrefix: string;
       ADryRun: Boolean; out AResult: TProtogenResult;
       ALog: TStrings = nil;
-      const AProtoFileName: string = ''): Integer;
+      const AProtoFileName: string = '';
+      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil): Integer;
+
+    { IMPORT-1. Generate a root .proto AND everything it imports.
+
+      One unit per file in the closure, each named from the file's own path so
+      that a given .proto has ONE unit name however it is reached — which is
+      what stops the same messages being declared twice, in two units, when a
+      file is generated once as a root and once as an import.
+
+      AIncludeRoots follows protoc's -I: import paths resolve against these in
+      order and never relative to the importing file. Pass none and the input
+      file's own directory is used, which is what keeps a bare
+      `protogen -i foo.proto` working. }
+    class function RunClosure(const AInputFile, AOutputDir, AUnitPrefix: string;
+      AIncludeRoots: TStrings; ADryRun: Boolean;
+      out AResults: TArray<TProtogenResult>;
+      ALog: TStrings = nil): Integer;
 
     class function Run(const AInputFile, AOutputDir, AUnitPrefix: string;
       ADryRun: Boolean; out AResult: TProtogenResult;
@@ -110,7 +128,8 @@ end;
 class function TProtogenRunner.WriteUnits(AFile: TProtoFileNode;
   const AOutputDir, AUnitPrefix: string; ADryRun: Boolean;
   out AResult: TProtogenResult; ALog: TStrings;
-  const AProtoFileName: string): Integer;
+  const AProtoFileName: string;
+  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry): Integer;
 var
   LLines:      TStringList;
   LEmitMsg:    TMessagesEmitter;
@@ -119,12 +138,26 @@ var
   LEmitReg:    TRegistrationEmitter;
   LServicePas: string;
   LServiceNew: string;
+  LWantSvc:    Boolean;
 begin
   Result := 0;
   AResult := Default(TProtogenResult);
+
+  { A file in an import closure usually declares no service — it exists to
+    supply message types. Emitting Interfaces / Service / Registration for it
+    would produce three near-empty units per imported file, so in closure mode
+    the service trio follows the services.
+
+    Single-file mode keeps emitting all four unconditionally: that is its
+    documented contract (doc/codegen-guide.md) and the C4 gate asserts on it. }
+  LWantSvc := (AFileSet = nil) or (AFile.Services.Count > 0);
+
   AResult.MessagesPath   := MakePath(AOutputDir, AUnitPrefix, 'Messages');
-  AResult.InterfacesPath := MakePath(AOutputDir, AUnitPrefix, 'Interfaces');
-  AResult.RegistrationPath := MakePath(AOutputDir, AUnitPrefix, 'Registration');
+  if LWantSvc then
+  begin
+    AResult.InterfacesPath   := MakePath(AOutputDir, AUnitPrefix, 'Interfaces');
+    AResult.RegistrationPath := MakePath(AOutputDir, AUnitPrefix, 'Registration');
+  end;
   LServicePas := MakePath(AOutputDir, AUnitPrefix, 'Service');
   LServiceNew := IncludeTrailingPathDelimiter(AOutputDir)
     + AUnitPrefix + '.Service.new.pas';
@@ -137,17 +170,20 @@ begin
     // Messages — always regenerated
     LEmitMsg := TMessagesEmitter.Create;
     try
-      LEmitMsg.Emit(AFile, AUnitPrefix, AProtoFileName, LLines);
+      LEmitMsg.Emit(AFile, AUnitPrefix, AProtoFileName, LLines, AFileSet, AEntry);
       Flush(LLines, AResult.MessagesPath, ADryRun, ALog);
     finally
       LEmitMsg.Free;
     end;
 
+    if not LWantSvc then
+      Exit;
+
     // Interfaces — always regenerated
     LLines.Clear;
     LEmitIface := TInterfacesEmitter.Create;
     try
-      LEmitIface.Emit(AFile, AUnitPrefix, LLines);
+      LEmitIface.Emit(AFile, AUnitPrefix, LLines, AFileSet, AEntry);
       Flush(LLines, AResult.InterfacesPath, ADryRun, ALog);
     finally
       LEmitIface.Free;
@@ -157,7 +193,7 @@ begin
     LLines.Clear;
     LEmitSkel := TServiceSkeletonEmitter.Create;
     try
-      LEmitSkel.Emit(AFile, AUnitPrefix, LLines);
+      LEmitSkel.Emit(AFile, AUnitPrefix, LLines, AFileSet, AEntry);
       // Check FileExists in both modes: in dry-run the dir may not exist yet
       // (so Service.pas can't exist either) but the check is still correct —
       // a prior real run would have created it, and dry-run should report what
@@ -190,13 +226,85 @@ begin
     LLines.Clear;
     LEmitReg := TRegistrationEmitter.Create;
     try
-      LEmitReg.Emit(AFile, AUnitPrefix, LLines);
+      LEmitReg.Emit(AFile, AUnitPrefix, LLines, AFileSet, AEntry);
       Flush(LLines, AResult.RegistrationPath, ADryRun, ALog);
     finally
       LEmitReg.Free;
     end;
   finally
     LLines.Free;
+  end;
+end;
+
+// ── TProtogenRunner.RunClosure ───────────────────────────────────────────────
+
+class function TProtogenRunner.RunClosure(const AInputFile, AOutputDir,
+  AUnitPrefix: string; AIncludeRoots: TStrings; ADryRun: Boolean;
+  out AResults: TArray<TProtogenResult>; ALog: TStrings): Integer;
+var
+  LFS:  TProtoFileSet;
+  I:    Integer;
+  LRc:  Integer;
+  LRes: TProtogenResult;
+begin
+  SetLength(AResults, 0);
+
+  if AInputFile = '' then
+  begin
+    if ALog <> nil then ALog.Add('error: -i / --input is required');
+    Exit(1);
+  end;
+  if AOutputDir = '' then
+  begin
+    if ALog <> nil then ALog.Add('error: -o / --output is required');
+    Exit(1);
+  end;
+  if AUnitPrefix = '' then
+  begin
+    if ALog <> nil then ALog.Add('error: --unit-prefix is required');
+    Exit(1);
+  end;
+
+  Result := 0;
+  LFS := TProtoFileSet.Create(AUnitPrefix);
+  try
+    if AIncludeRoots <> nil then
+      for I := 0 to AIncludeRoots.Count - 1 do
+        LFS.AddRoot(AIncludeRoots[I]);
+
+    try
+      LFS.LoadRoot(AInputFile);
+    except
+      on E: Exception do
+      begin
+        if ALog <> nil then ALog.Add('error: ' + E.Message);
+        Exit(1);
+      end;
+    end;
+
+    SetLength(AResults, LFS.Files.Count);
+    for I := 0 to LFS.Files.Count - 1 do
+    begin
+      try
+        LRc := WriteUnits(LFS.Files[I].Node, AOutputDir,
+          LFS.Files[I].UnitPrefix, ADryRun, LRes, ALog,
+          LFS.Files[I].ImportPath, LFS, LFS.Files[I]);
+      except
+        on E: Exception do
+        begin
+          // Name the file. With a closure of twenty, "EEmitError: cannot emit
+          // sint32" without one is a hunt rather than a diagnostic.
+          if ALog <> nil then
+            ALog.Add('error: ' + LFS.Files[I].ImportPath + ': ' + E.Message);
+          Exit(1);
+        end;
+      end;
+      AResults[I] := LRes;
+      if LRc <> 0 then
+        Result := LRc;
+    end;
+  finally
+    LFS.Free;
   end;
 end;
 

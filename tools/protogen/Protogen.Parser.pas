@@ -84,6 +84,7 @@ type
     procedure ParsePackage;
     procedure ParseImport;
     procedure SkipOptionStatement;
+    procedure SkipExtendBlock;
     procedure SkipFieldOptions;
     procedure SkipReserved;
     procedure ParseTopLevel;
@@ -344,17 +345,85 @@ begin
 end;
 
 procedure TProtoParser.ParseImport;
+var
+  LPublic: Boolean;
 begin
   ExpectIdentValue('import');
-  // `import public` / `import weak` — accepted and ignored, the path is what
-  // matters. C2 does not follow imports yet; it is recorded for later.
-  if IsIdent('public') or IsIdent('weak') then
+  // IMPORT-1. `public` is recorded, `weak` is not: a public import is
+  // RE-EXPORTED, so a file importing this one may name its types, and
+  // Protogen.FileSet needs that to compute visibility. `weak` only affects
+  // whether a missing file is fatal at runtime in C++, which has no bearing
+  // on what we emit.
+  LPublic := False;
+  if IsIdent('public') then
+  begin
+    LPublic := True;
+    NextTok;
+  end
+  else if IsIdent('weak') then
     NextTok;
   if Tok.Kind <> ptString then
     Fail('expected a quoted path after import');
   FFile.Imports.Add(Tok.Value);
+  if LPublic then
+    FFile.PublicImports.Add(Tok.Value);
   NextTok;
   ExpectSymbol(';');
+end;
+
+// A proto3 `extend` block declares a CUSTOM OPTION, and generates nothing.
+//
+// proto3 removed extensions, with one exception it kept: you may still extend
+// the descriptor.proto option messages, which is how every annotation in
+// googleapis is declared -- an `extend google.protobuf.MethodOptions` block
+// containing, say, `HttpRule http = 72295728;`.
+//
+// Those fields annotate .proto declarations; they carry no user data and
+// belong to no generated class, so skipping the block is correct rather than a
+// concession. Extending anything ELSE is invalid proto3 and protoc rejects it
+// too, so that stays refused.
+//
+// This was a blanket refusal until IMPORT-1, and it never fired: the files
+// containing these blocks -- google/api/annotations.proto and its siblings --
+// are reached only by following an import, which nothing did. The first corpus
+// run that followed imports refused 162 of 305 schemas on it: one cause for
+// 53% of the sample.
+//
+// (Written with // deliberately: the example above once carried a real brace
+// and closed this comment early. See tests/brace-scan.py.)
+procedure TProtoParser.SkipExtendBlock;
+var
+  LTarget: string;
+  LDepth: Integer;
+begin
+  ExpectIdentValue('extend');
+
+  LTarget := '';
+  while (Tok.Kind = ptIdent) or IsSymbol('.') do
+  begin
+    LTarget := LTarget + Tok.Value;
+    NextTok;
+  end;
+
+  // Leading-dot spelling means the same type.
+  if (Length(LTarget) > 0) and (LTarget[1] = '.') then
+    Delete(LTarget, 1, 1);
+
+  if Copy(LTarget, 1, 16) <> 'google.protobuf.' then
+    { BLOCKED-BY: invalid-proto3 }
+    Refuse('extend',
+      Format('proto3 allows `extend` only on the google.protobuf option ' +
+             'messages, to declare a custom option. This extends %s, which ' +
+             'protoc rejects in proto3 as well.', [QuotedStr(LTarget)]));
+
+  ExpectSymbol('{');
+  LDepth := 1;
+  while (Tok.Kind <> ptEof) and (LDepth > 0) do
+  begin
+    if IsSymbol('{') then Inc(LDepth)
+    else if IsSymbol('}') then Dec(LDepth);
+    NextTok;
+  end;
 end;
 
 procedure TProtoParser.SkipOptionStatement;
@@ -483,10 +552,17 @@ begin
         'Groups are a deprecated proto2 construct with no proto3 equivalent. ' +
         'Use a nested message reference.');
 
-    if IsIdent('extend') or IsIdent('extensions') then
+    if IsIdent('extend') then
+    begin
+      SkipExtendBlock;
+      Continue;
+    end;
+
+    if IsIdent('extensions') then
       { BLOCKED-BY: out-of-scope-proto2 }
       Refuse(Tok.Value,
-        'Extensions are proto2. proto3 has no extension ranges.');
+        'Extension RANGES are proto2 — proto3 has none. (An `extend` block ' +
+        'declaring a custom option is a different construct and is accepted.)');
 
     { ── Nested declarations: HOISTED, not refused ──────────────────────────
       Supported since the C1c corpus run, where nesting was 52% of 7300
@@ -1039,9 +1115,13 @@ begin
     if IsIdent('syntax') then
       Fail('a second syntax statement — it must appear once, first');
 
-    if IsIdent('extend') or IsIdent('extensions') then
+    if IsIdent('extend') then begin SkipExtendBlock; Continue; end;
+
+    if IsIdent('extensions') then
       { BLOCKED-BY: out-of-scope-proto2 }
-      Refuse(Tok.Value, 'Extensions are proto2. proto3 has no extension ranges.');
+      Refuse(Tok.Value,
+        'Extension RANGES are proto2 — proto3 has none. (An `extend` block ' +
+        'declaring a custom option is a different construct and is accepted.)');
 
     Fail(Format('unexpected %s at file scope — expected package, import, ' +
                 'option, message, enum or service', [QuotedStr(Tok.Value)]));

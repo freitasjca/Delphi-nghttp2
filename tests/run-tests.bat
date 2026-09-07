@@ -241,7 +241,7 @@ echo.
 set "GENOUT=%TEMP%\protogen-gencheck"
 if exist "%GENOUT%" rmdir /s /q "%GENOUT%"
 pushd "..\tools\protogen"
-Protogen.exe -i "..\..\..\horse-provider-nghttp2\samples\grpc\greeter.proto" -o "%GENOUT%" --unit-prefix Sample.Greeter > nul
+Protogen.exe -i "..\..\..\horse-provider-nghttp2\samples\grpc\greeter.proto" -o "%GENOUT%" --unit-prefix Sample > nul
 if errorlevel 1 (
   echo -- ProtogenGeneratedCompileCheck ^(C6a^) ------------------------------------------------
   echo    FAIL  Protogen.exe could not generate into %GENOUT%
@@ -296,7 +296,7 @@ echo.
 set "OPTOUT=%TEMP%\protogen-optcheck"
 if exist "%OPTOUT%" rmdir /s /q "%OPTOUT%"
 pushd "..\tools\protogen"
-Protogen.exe -i "optional.proto" -o "%OPTOUT%" --unit-prefix Sample.Opt > nul
+Protogen.exe -i "optional.proto" -o "%OPTOUT%" --unit-prefix Sample > nul
 if errorlevel 1 (
   echo -- ProtogenOptionalCompileCheck ^(C6b^) ------------------------------------------------
   echo    FAIL  Protogen.exe could not generate from optional.proto

@@ -162,6 +162,7 @@ type
     FEnums:    TObjectList<TProtoEnumNode>;
     FServices: TObjectList<TProtoServiceNode>;
     FImports:  TStringList;
+    FPublicImports: TStringList;
   public
     Syntax:      string;   // always 'proto3' — the parser rejects anything else
     PackageName: string;
@@ -171,6 +172,11 @@ type
     property Enums:    TObjectList<TProtoEnumNode>    read FEnums;
     property Services: TObjectList<TProtoServiceNode> read FServices;
     property Imports:  TStringList                    read FImports;
+    // IMPORT-1. The subset of Imports declared `import public`, which a file
+    // RE-EXPORTS: anyone importing this file may name their types too. Kept
+    // separate rather than flagged in-place so Imports stays the plain list
+    // every existing caller reads.
+    property PublicImports: TStringList               read FPublicImports;
     function FindMessage(const AName: string): TProtoMessageNode;
     function FindEnum(const AName: string): TProtoEnumNode;
   end;
@@ -197,6 +203,14 @@ function ScalarName(AScalar: TProtoScalar): string;
   machinery. All stay refused until presence exists. }
 function WellKnownPascalClass(const AProtoName: string): string;
 function WellKnownIsEnum(const AProtoName: string): Boolean;
+
+{ Is AName (lowercased by the caller) a Pascal reserved word?
+
+  Lives here rather than in the emitter because it has two consumers that must
+  not drift: the emitter renames an enum VALUE that collides with one, and
+  Protogen.FileSet renames a unit-name SEGMENT that does — 'type.proto' is a
+  real file, and `Demo.Type` is not a legal unit name. }
+function IsDelphiReservedWord(const AName: string): Boolean;
 
 implementation
 
@@ -273,10 +287,12 @@ begin
   FEnums    := TObjectList<TProtoEnumNode>.Create(True);
   FServices := TObjectList<TProtoServiceNode>.Create(True);
   FImports  := TStringList.Create;
+  FPublicImports := TStringList.Create;
 end;
 
 destructor TProtoFileNode.Destroy;
 begin
+  FPublicImports.Free;
   FImports.Free;
   FServices.Free;
   FEnums.Free;
@@ -295,6 +311,18 @@ begin
   for I := 0 to FMessages.Count - 1 do
     if SameText(FMessages[I].QualifiedName, AName) then
       Exit(FMessages[I]);
+  { A PARTIAL path, which proto scoping resolves by walking outward:
+    `ResourceInfo.ResourceType` written inside a message whose sibling declares
+    ResourceInfo means `Outer.ResourceInfo.ResourceType`. Matched on a dot
+    boundary so 'Info.Type' cannot match 'XInfo.Type'.
+
+    Third in order, after both exact tests, so an exact name always wins. }
+  for I := 0 to FMessages.Count - 1 do
+    if (Pos('.', AName) > 0)
+      and SameText(Copy(FMessages[I].QualifiedName,
+                        Length(FMessages[I].QualifiedName) - Length(AName), MaxInt),
+                   '.' + AName) then
+      Exit(FMessages[I]);
   for I := 0 to FMessages.Count - 1 do
     if SameText(FMessages[I].Name, AName) then
       Exit(FMessages[I]);
@@ -307,6 +335,18 @@ var
 begin
   for I := 0 to FEnums.Count - 1 do
     if SameText(FEnums[I].QualifiedName, AName) then
+      Exit(FEnums[I]);
+  { A PARTIAL path, which proto scoping resolves by walking outward:
+    `ResourceInfo.ResourceType` written inside a message whose sibling declares
+    ResourceInfo means `Outer.ResourceInfo.ResourceType`. Matched on a dot
+    boundary so 'Info.Type' cannot match 'XInfo.Type'.
+
+    Third in order, after both exact tests, so an exact name always wins. }
+  for I := 0 to FEnums.Count - 1 do
+    if (Pos('.', AName) > 0)
+      and SameText(Copy(FEnums[I].QualifiedName,
+                        Length(FEnums[I].QualifiedName) - Length(AName), MaxInt),
+                   '.' + AName) then
       Exit(FEnums[I]);
   for I := 0 to FEnums.Count - 1 do
     if SameText(FEnums[I].Name, AName) then
@@ -414,6 +454,34 @@ begin
   else
     Result := '<not a scalar>';
   end;
+end;
+
+function IsDelphiReservedWord(const AName: string): Boolean;
+begin
+  Result :=
+    (AName = 'and')          or (AName = 'array')        or (AName = 'as')          or
+    (AName = 'asm')          or (AName = 'begin')         or (AName = 'case')        or
+    (AName = 'class')        or (AName = 'const')         or (AName = 'constructor') or
+    (AName = 'destructor')   or (AName = 'dispinterface') or (AName = 'div')         or
+    (AName = 'do')           or (AName = 'downto')        or (AName = 'else')        or
+    (AName = 'end')          or (AName = 'except')        or (AName = 'exports')     or
+    (AName = 'file')         or (AName = 'finalization')  or (AName = 'finally')     or
+    (AName = 'for')          or (AName = 'function')      or (AName = 'goto')        or
+    (AName = 'if')           or (AName = 'implementation')or (AName = 'in')          or
+    (AName = 'inherited')    or (AName = 'initialization') or (AName = 'inline')     or
+    (AName = 'interface')    or (AName = 'is')            or (AName = 'label')       or
+    (AName = 'library')      or (AName = 'message')       or (AName = 'mod')         or
+    (AName = 'nil')          or (AName = 'not')           or (AName = 'object')      or
+    (AName = 'of')           or (AName = 'on')            or (AName = 'or')          or
+    (AName = 'out')          or (AName = 'packed')        or (AName = 'procedure')   or
+    (AName = 'program')      or (AName = 'property')      or (AName = 'raise')       or
+    (AName = 'record')       or (AName = 'repeat')        or (AName = 'resourcestring') or
+    (AName = 'set')          or (AName = 'shl')           or (AName = 'shr')         or
+    (AName = 'string')       or (AName = 'then')          or (AName = 'threadvar')   or
+    (AName = 'to')           or (AName = 'try')           or (AName = 'type')        or
+    (AName = 'unit')         or (AName = 'until')         or (AName = 'uses')        or
+    (AName = 'var')          or (AName = 'while')         or (AName = 'with')        or
+    (AName = 'xor');
 end;
 
 end.

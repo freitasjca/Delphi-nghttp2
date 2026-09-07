@@ -28,7 +28,7 @@ unit Protogen.ServiceEmitter;
 //      RegisterClientStream / RegisterBidiStream per streaming rpc
 //    - ALWAYS regenerated — it holds no user code and must track the .proto
 //
-//  Dependency: Protogen.Emitter is used for TMessagesEmitter.PascalTypeName
+//  Dependency: Protogen.Emitter is used for TMessagesEmitter.QualifiedTypeName
 //  only — that is the one function shared between the two emitter families.
 //  Both emitters stay in the same tools/protogen package and neither references
 //  any Nghttp2 unit.
@@ -47,7 +47,8 @@ uses
   System.SysUtils, System.Classes,
 {$IFEND}
   Protogen.Ast,
-  Protogen.Emitter;   // for TMessagesEmitter.PascalTypeName
+  Protogen.FileSet,
+  Protogen.Emitter;   // for TMessagesEmitter.QualifiedTypeName
 
 type
 
@@ -60,14 +61,26 @@ type
     FFile:       TProtoFileNode;
     FUnitPrefix: string;
     FOut:        TStrings;
+    // IMPORT-1 / SVCWKT-1 — cross-file and well-known rpc types.
+    // Both nil for a single-file generation, in which case TypeRef reduces to
+    // the pre-IMPORT-1 behaviour plus the WKT fix.
+    FFileSet:     TProtoFileSet;
+    FEntry:       TProtoFileEntry;
+    FExternUnits: TStringList;
+    FNeedsWKT:    Boolean;
     procedure W(const ALine: string = '');
+    function  TypeRef(const ATypeName: string): string;
+    procedure ScanForExterns;
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitTypeSection;
     procedure EmitService(ASvc: TProtoServiceNode);
   public
     procedure Emit(AFile: TProtoFileNode;
-      const AUnitPrefix: string; ALines: TStrings);
+      const AUnitPrefix: string; ALines: TStrings;
+      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil);
+    constructor Create;
+    destructor Destroy; override;
     class function GuidFromServiceName(const AFullName: string): string;
     class function InterfaceName(const AServiceName: string): string;
     class function ImplClassName(const AServiceName: string): string;
@@ -95,8 +108,17 @@ type
     FFile:       TProtoFileNode;
     FUnitPrefix: string;
     FOut:        TStrings;
+    // IMPORT-1 / SVCWKT-1 — cross-file and well-known rpc types.
+    // Both nil for a single-file generation, in which case TypeRef reduces to
+    // the pre-IMPORT-1 behaviour plus the WKT fix.
+    FFileSet:     TProtoFileSet;
+    FEntry:       TProtoFileEntry;
+    FExternUnits: TStringList;
+    FNeedsWKT:    Boolean;
     FHasStream:  Boolean;
     procedure W(const ALine: string = '');
+    function  TypeRef(const ATypeName: string): string;
+    procedure ScanForExterns;
     procedure ScanForStreaming;
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
@@ -106,13 +128,17 @@ type
     procedure EmitServiceImpl(ASvc: TProtoServiceNode);
   public
     procedure Emit(AFile: TProtoFileNode;
-      const AUnitPrefix: string; ALines: TStrings);
+      const AUnitPrefix: string; ALines: TStrings;
+      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil);
+    constructor Create;
+    destructor Destroy; override;
     // The method signature for one RPC, without the trailing semicolon.
     // AQualifier is '' for a class declaration or '<ImplClass>.' for the
     // implementing body — emitting both from one function is what stops the
     // two drifting apart, which would compile as an unimplemented method.
     class function MethodSignature(ARpc: TProtoRpcNode;
-      const AQualifier: string): string;
+      const AQualifier: string; AFileSet: TProtoFileSet = nil;
+      AEntry: TProtoFileEntry = nil): string;
   end;
 
   // --------------------------------------------------------------------------
@@ -135,7 +161,16 @@ type
     FFile:       TProtoFileNode;
     FUnitPrefix: string;
     FOut:        TStrings;
+    // IMPORT-1 / SVCWKT-1 — cross-file and well-known rpc types.
+    // Both nil for a single-file generation, in which case TypeRef reduces to
+    // the pre-IMPORT-1 behaviour plus the WKT fix.
+    FFileSet:     TProtoFileSet;
+    FEntry:       TProtoFileEntry;
+    FExternUnits: TStringList;
+    FNeedsWKT:    Boolean;
     procedure W(const ALine: string = '');
+    function  TypeRef(const ATypeName: string): string;
+    procedure ScanForExterns;
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitInterfaceSection;
@@ -143,7 +178,10 @@ type
     procedure EmitServiceRegistration(ASvc: TProtoServiceNode);
   public
     procedure Emit(AFile: TProtoFileNode;
-      const AUnitPrefix: string; ALines: TStrings);
+      const AUnitPrefix: string; ALines: TStrings;
+      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil);
+    constructor Create;
+    destructor Destroy; override;
     // 'RegisterGreeter'
     class function RegisterProcName(const AServiceName: string): string;
   end;
@@ -238,12 +276,126 @@ begin
   W('{$ENDIF}');
 end;
 
+constructor TInterfacesEmitter.Create;
+begin
+  inherited Create;
+  FExternUnits := TStringList.Create;
+  FExternUnits.Duplicates := dupIgnore;
+  FExternUnits.Sorted     := True;   // deterministic uses clause
+end;
+
+destructor TInterfacesEmitter.Destroy;
+begin
+  FExternUnits.Free;
+  inherited Destroy;
+end;
+
+{ IMPORT-1 / SVCWKT-1. Name one proto type, and record what naming it costs.
+
+  With no file set this is PascalTypeName plus the well-known-type mapping —
+  which is itself a fix: an rpc taking google.protobuf.Empty used to emit
+  `TGoogleProtobufEmpty`, a type nothing declares. }
+function TInterfacesEmitter.TypeRef(const ATypeName: string): string;
+var
+  LExtern: string;
+begin
+  Result := TMessagesEmitter.QualifiedTypeName(FFileSet, FEntry, ATypeName,
+    LExtern);
+  // Unresolved: fall back to the plain mangled name, which is what this
+  // emitter always used and is correct for the top-level rpc types that
+  // dominate in practice.
+  if Result = '' then
+    Result := TMessagesEmitter.PascalTypeName(ATypeName);
+  if (LExtern <> '') and (LExtern <> FUnitPrefix + '.Messages') then
+    FExternUnits.Add(LExtern);
+  if WellKnownPascalClass(ATypeName) <> '' then
+    FNeedsWKT := True;
+end;
+
+{ Walk every rpc for its request and response types, purely for TypeRef's
+  bookkeeping. Same reasoning as the messages emitter's ScanForExternUnits:
+  reusing the naming function rather than re-deriving the rule is what makes
+  the uses clause and the emitted names unable to disagree. }
+procedure TInterfacesEmitter.ScanForExterns;
+var
+  I, J: Integer;
+  LSvc: TProtoServiceNode;
+begin
+  FExternUnits.Clear;
+  FNeedsWKT := False;
+  for I := 0 to FFile.Services.Count - 1 do
+  begin
+    LSvc := FFile.Services[I];
+    for J := 0 to LSvc.Rpcs.Count - 1 do
+    begin
+      TypeRef(LSvc.Rpcs[J].RequestType);
+      TypeRef(LSvc.Rpcs[J].ResponseType);
+    end;
+  end;
+end;
+
+{ IMPORT-1. The trailing entries of a generated uses clause: the bundled
+  well-known types when the schema names one, then every generated unit whose
+  types this one references. The caller has already written the entries it
+  always needs, ending each with a comma; whichever entry lands last here
+  carries the semicolon.
+
+  One routine for all four emitters, because a uses clause that is right in
+  three of them and wrong in the fourth is exactly the kind of asymmetry that
+  survives review. }
+procedure WriteUsesTail(AOut: TStrings; ANeedsWKT: Boolean;
+  AExtern: TStringList);
+var
+  I: Integer;
+  LItems: TStringList;
+begin
+  LItems := TStringList.Create;
+  try
+    if ANeedsWKT then
+    begin
+      LItems.Add('Nghttp2.Protobuf');
+      LItems.Add('Nghttp2.Protobuf.WellKnown');
+    end;
+    for I := 0 to AExtern.Count - 1 do
+      LItems.Add(AExtern[I]);
+    for I := 0 to LItems.Count - 1 do
+      if I = LItems.Count - 1 then
+        AOut.Add('  ' + LItems[I] + ';')
+      else
+        AOut.Add('  ' + LItems[I] + ',');
+  finally
+    LItems.Free;
+  end;
+end;
+
+function HasUsesTail(ANeedsWKT: Boolean; AExtern: TStringList): Boolean;
+begin
+  Result := ANeedsWKT or (AExtern.Count > 0);
+end;
+
 procedure TInterfacesEmitter.EmitUsesClause;
 begin
   W;
   W('uses');
   W('  Nghttp2.Grpc.Attributes,');
-  W('  ' + FUnitPrefix + '.Messages;');
+  if HasUsesTail(FNeedsWKT, FExternUnits) then
+    W('  ' + FUnitPrefix + '.Messages,')
+  else
+    W('  ' + FUnitPrefix + '.Messages;');
+  WriteUsesTail(FOut, FNeedsWKT, FExternUnits);
+end;
+
+{ QualifiedTypeName with the unresolved case filled in — shared by the class
+  function MethodSignature, which has no instance TypeRef to call. }
+function RpcTypeName(AFileSet: TProtoFileSet; AEntry: TProtoFileEntry;
+  const ATypeName: string): string;
+var
+  LExtern: string;
+begin
+  Result := TMessagesEmitter.QualifiedTypeName(AFileSet, AEntry, ATypeName,
+    LExtern);
+  if Result = '' then
+    Result := TMessagesEmitter.PascalTypeName(ATypeName);
 end;
 
 function RpcShapeOf(ARpc: TProtoRpcNode): TRpcShape;
@@ -291,8 +443,8 @@ begin
     if LRPC.RequestStream or LRPC.ResponseStream then
       Continue; // streaming RPCs handled in C5
     W('    function ' + LRPC.Name +
-      '(const ARequest: ' + TMessagesEmitter.PascalTypeName(LRPC.RequestType) +
-      '): ' + TMessagesEmitter.PascalTypeName(LRPC.ResponseType) + ';');
+      '(const ARequest: ' + TypeRef(LRPC.RequestType) +
+      '): ' + TypeRef(LRPC.ResponseType) + ';');
   end;
   W('  end;');
 end;
@@ -308,11 +460,17 @@ begin
 end;
 
 procedure TInterfacesEmitter.Emit(AFile: TProtoFileNode;
-  const AUnitPrefix: string; ALines: TStrings);
+  const AUnitPrefix: string; ALines: TStrings;
+  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry);
 begin
   FFile       := AFile;
   FUnitPrefix := AUnitPrefix;
   FOut        := ALines;
+  FFileSet    := AFileSet;
+  FEntry      := AEntry;
+  // Must precede EmitUsesClause: the clause names the units, so the
+  // set of referenced units has to be known before it is written.
+  ScanForExterns;
   EmitBoilerplate;
   EmitUsesClause;
   EmitTypeSection;
@@ -354,6 +512,64 @@ begin
       end;
 end;
 
+constructor TServiceSkeletonEmitter.Create;
+begin
+  inherited Create;
+  FExternUnits := TStringList.Create;
+  FExternUnits.Duplicates := dupIgnore;
+  FExternUnits.Sorted     := True;   // deterministic uses clause
+end;
+
+destructor TServiceSkeletonEmitter.Destroy;
+begin
+  FExternUnits.Free;
+  inherited Destroy;
+end;
+
+{ IMPORT-1 / SVCWKT-1. Name one proto type, and record what naming it costs.
+
+  With no file set this is PascalTypeName plus the well-known-type mapping —
+  which is itself a fix: an rpc taking google.protobuf.Empty used to emit
+  `TGoogleProtobufEmpty`, a type nothing declares. }
+function TServiceSkeletonEmitter.TypeRef(const ATypeName: string): string;
+var
+  LExtern: string;
+begin
+  Result := TMessagesEmitter.QualifiedTypeName(FFileSet, FEntry, ATypeName,
+    LExtern);
+  // Unresolved: fall back to the plain mangled name, which is what this
+  // emitter always used and is correct for the top-level rpc types that
+  // dominate in practice.
+  if Result = '' then
+    Result := TMessagesEmitter.PascalTypeName(ATypeName);
+  if (LExtern <> '') and (LExtern <> FUnitPrefix + '.Messages') then
+    FExternUnits.Add(LExtern);
+  if WellKnownPascalClass(ATypeName) <> '' then
+    FNeedsWKT := True;
+end;
+
+{ Walk every rpc for its request and response types, purely for TypeRef's
+  bookkeeping. Same reasoning as the messages emitter's ScanForExternUnits:
+  reusing the naming function rather than re-deriving the rule is what makes
+  the uses clause and the emitted names unable to disagree. }
+procedure TServiceSkeletonEmitter.ScanForExterns;
+var
+  I, J: Integer;
+  LSvc: TProtoServiceNode;
+begin
+  FExternUnits.Clear;
+  FNeedsWKT := False;
+  for I := 0 to FFile.Services.Count - 1 do
+  begin
+    LSvc := FFile.Services[I];
+    for J := 0 to LSvc.Rpcs.Count - 1 do
+    begin
+      TypeRef(LSvc.Rpcs[J].RequestType);
+      TypeRef(LSvc.Rpcs[J].ResponseType);
+    end;
+  end;
+end;
+
 procedure TServiceSkeletonEmitter.EmitUsesClause;
 begin
   W;
@@ -369,10 +585,16 @@ begin
     W('  ' + FUnitPrefix + '.Messages,');
     // IGrpcStreamReader / IGrpcStreamWriter. Only pulled in when the schema
     // actually streams, so a unary-only service keeps its previous uses list.
-    W('  Nghttp2.Grpc.Registry;');
+    if HasUsesTail(FNeedsWKT, FExternUnits) then
+      W('  Nghttp2.Grpc.Registry,')
+    else
+      W('  Nghttp2.Grpc.Registry;');
   end
+  else if HasUsesTail(FNeedsWKT, FExternUnits) then
+    W('  ' + FUnitPrefix + '.Messages,')
   else
     W('  ' + FUnitPrefix + '.Messages;');
+  WriteUsesTail(FOut, FNeedsWKT, FExternUnits);
 end;
 
 { The streaming handler signatures are fixed by the registry's handler types
@@ -383,7 +605,8 @@ end;
   dispatcher casts internally. The hand-written Sample.Greeter.Service.pas does
   the same. }
 class function TServiceSkeletonEmitter.MethodSignature(ARpc: TProtoRpcNode;
-  const AQualifier: string): string;
+  const AQualifier: string; AFileSet: TProtoFileSet;
+  AEntry: TProtoFileEntry): string;
 begin
   case RpcShapeOf(ARpc) of
     rsServerStream:
@@ -397,8 +620,8 @@ begin
         '(const AReader: IGrpcStreamReader; const AWriter: IGrpcStreamWriter)';
   else
     Result := 'function ' + AQualifier + ARpc.Name +
-      '(const ARequest: ' + TMessagesEmitter.PascalTypeName(ARpc.RequestType) +
-      '): ' + TMessagesEmitter.PascalTypeName(ARpc.ResponseType);
+      '(const ARequest: ' + RpcTypeName(AFileSet, AEntry, ARpc.RequestType) +
+      '): ' + RpcTypeName(AFileSet, AEntry, ARpc.ResponseType);
   end;
 end;
 
@@ -413,7 +636,7 @@ begin
   W('  ' + LImplClass + ' = class(TInterfacedObject, ' + LIfaceName + ')');
   W('  public');
   for I := 0 to ASvc.Rpcs.Count - 1 do
-    W('    ' + MethodSignature(ASvc.Rpcs[I], '') + ';');
+    W('    ' + MethodSignature(ASvc.Rpcs[I], '', FFileSet, FEntry) + ';');
   W('  end;');
 end;
 
@@ -438,7 +661,7 @@ begin
   begin
     LRPC := ASvc.Rpcs[I];
     W;
-    W(MethodSignature(LRPC, LImplClass + '.') + ';');
+    W(MethodSignature(LRPC, LImplClass + '.', FFileSet, FEntry) + ';');
     W('begin');
     W('  raise ENotImplemented.Create(''' + LImplClass + '.' + LRPC.Name + ''');');
     W('end;');
@@ -458,12 +681,18 @@ begin
 end;
 
 procedure TServiceSkeletonEmitter.Emit(AFile: TProtoFileNode;
-  const AUnitPrefix: string; ALines: TStrings);
+  const AUnitPrefix: string; ALines: TStrings;
+  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry);
 begin
   FFile       := AFile;
   FUnitPrefix := AUnitPrefix;
   FOut        := ALines;
+  FFileSet    := AFileSet;
+  FEntry      := AEntry;
   ScanForStreaming;
+  // Must precede EmitUsesClause: the clause names the units, so the
+  // set of referenced units has to be known before it is written.
+  ScanForExterns;
   EmitBoilerplate;
   EmitUsesClause;
   EmitTypeSection;
@@ -494,6 +723,64 @@ begin
   W('interface');
 end;
 
+constructor TRegistrationEmitter.Create;
+begin
+  inherited Create;
+  FExternUnits := TStringList.Create;
+  FExternUnits.Duplicates := dupIgnore;
+  FExternUnits.Sorted     := True;   // deterministic uses clause
+end;
+
+destructor TRegistrationEmitter.Destroy;
+begin
+  FExternUnits.Free;
+  inherited Destroy;
+end;
+
+{ IMPORT-1 / SVCWKT-1. Name one proto type, and record what naming it costs.
+
+  With no file set this is PascalTypeName plus the well-known-type mapping —
+  which is itself a fix: an rpc taking google.protobuf.Empty used to emit
+  `TGoogleProtobufEmpty`, a type nothing declares. }
+function TRegistrationEmitter.TypeRef(const ATypeName: string): string;
+var
+  LExtern: string;
+begin
+  Result := TMessagesEmitter.QualifiedTypeName(FFileSet, FEntry, ATypeName,
+    LExtern);
+  // Unresolved: fall back to the plain mangled name, which is what this
+  // emitter always used and is correct for the top-level rpc types that
+  // dominate in practice.
+  if Result = '' then
+    Result := TMessagesEmitter.PascalTypeName(ATypeName);
+  if (LExtern <> '') and (LExtern <> FUnitPrefix + '.Messages') then
+    FExternUnits.Add(LExtern);
+  if WellKnownPascalClass(ATypeName) <> '' then
+    FNeedsWKT := True;
+end;
+
+{ Walk every rpc for its request and response types, purely for TypeRef's
+  bookkeeping. Same reasoning as the messages emitter's ScanForExternUnits:
+  reusing the naming function rather than re-deriving the rule is what makes
+  the uses clause and the emitted names unable to disagree. }
+procedure TRegistrationEmitter.ScanForExterns;
+var
+  I, J: Integer;
+  LSvc: TProtoServiceNode;
+begin
+  FExternUnits.Clear;
+  FNeedsWKT := False;
+  for I := 0 to FFile.Services.Count - 1 do
+  begin
+    LSvc := FFile.Services[I];
+    for J := 0 to LSvc.Rpcs.Count - 1 do
+    begin
+      TypeRef(LSvc.Rpcs[J].RequestType);
+      TypeRef(LSvc.Rpcs[J].ResponseType);
+    end;
+  end;
+end;
+
 procedure TRegistrationEmitter.EmitUsesClause;
 begin
   W;
@@ -501,7 +788,11 @@ begin
   W('  ' + FUnitPrefix + '.Interfaces,');
   W('  ' + FUnitPrefix + '.Messages,');
   W('  ' + FUnitPrefix + '.Service,');
-  W('  Nghttp2.Grpc.Registry;');
+  if HasUsesTail(FNeedsWKT, FExternUnits) then
+    W('  Nghttp2.Grpc.Registry,')
+  else
+    W('  Nghttp2.Grpc.Registry;');
+  WriteUsesTail(FOut, FNeedsWKT, FExternUnits);
 end;
 
 procedure TRegistrationEmitter.EmitInterfaceSection;
@@ -561,8 +852,8 @@ begin
     else
       LCall := 'RegisterBidiStream';
     end;
-    LReq  := TMessagesEmitter.PascalTypeName(LRPC.RequestType);
-    LResp := TMessagesEmitter.PascalTypeName(LRPC.ResponseType);
+    LReq  := TypeRef(LRPC.RequestType);
+    LResp := TypeRef(LRPC.ResponseType);
     W;
     W('  TGrpcRegistry.' + LCall + '(''' +
       TInterfacesEmitter.RpcPath(FFile, ASvc, LRPC) + ''',');
@@ -585,12 +876,18 @@ begin
 end;
 
 procedure TRegistrationEmitter.Emit(AFile: TProtoFileNode;
-  const AUnitPrefix: string; ALines: TStrings);
+  const AUnitPrefix: string; ALines: TStrings;
+  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry);
 begin
   FFile       := AFile;
   FUnitPrefix := AUnitPrefix;
   FOut        := ALines;
+  FFileSet    := AFileSet;
+  FEntry      := AEntry;
   ALines.Clear;
+  // Must precede EmitUsesClause: the clause names the units, so the
+  // set of referenced units has to be known before it is written.
+  ScanForExterns;
   EmitBoilerplate;
   EmitUsesClause;
   EmitInterfaceSection;

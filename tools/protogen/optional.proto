@@ -256,3 +256,48 @@ message OptMsgFields {
   OptColourA        colour_a = 3;
   OptColourB        colour_b = 4;
 }
+
+// IMPORT-1 regression. A type NESTED in a message, referenced by its bare
+// name from a field of that same message — which is how proto scoping works
+// (innermost outward) and how nearly every real schema declares a per-message
+// State or Severity enum.
+//
+// This is here because IMPORT-1's first corpus run generated `TState` for
+// every one of them: the new resolver matched fully-qualified names only, so
+// `State` never matched `Nested.State` and it fell through to a mangled
+// guess. Nothing in this fixture had a nested type, so no gate saw it — the
+// defect surfaced only against real schemas.
+message NestedRef {
+  enum State {
+    STATE_UNSET = 0;
+    RUNNING     = 1;
+  }
+
+  message Inner {
+    string label = 1;
+  }
+
+  State  state    = 1;   // bare name, resolved via the enclosing message
+  Inner  inner    = 2;   // same, for a nested MESSAGE
+  repeated Inner history = 3;
+}
+
+// FIELDWORD-1 regression. A field whose name collides with something the
+// GENERATED CODE calls. `default` is not a Pascal reserved word, so it used to
+// pass through untouched — and a property named `default` is in scope inside
+// its own class's methods, so `Fx := Default(Double)` in the generated Clear
+// body bound to the property instead of the intrinsic.
+//
+// google.api's OpenAPI Schema declares this exact field. Nothing in this
+// fixture did, so no gate saw it.
+// `default` ONLY. Two wider rules were tried and reverted -- see the comment
+// on PascalFieldName. The other fields here are the CONTROLS: they must come
+// out unrenamed, because their class never calls the routine they are named
+// after. If `high` or `copy` ever appears as `high_` or `copy_`, the rule has
+// widened again and is churning working property names.
+message IntrinsicNames {
+  optional double minimum = 1;   // its Clear body calls Default()
+  string default = 2;            // -> default_
+  string high    = 3;            // -> high   (control)
+  string copy    = 4;            // -> copy   (control)
+}

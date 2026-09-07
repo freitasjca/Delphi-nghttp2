@@ -30,7 +30,8 @@ uses
 {$ELSE}
   System.SysUtils, System.Classes,
 {$IFEND}
-  Protogen.Ast;
+  Protogen.Ast,
+  Protogen.FileSet;
 
 type
   EEmitError = class(Exception);
@@ -46,15 +47,29 @@ type
     FOut:        TStrings;
     FNeedsWKT:   Boolean;
     FNeedsSysUtils: Boolean;   // TBYTES-1 — a `bytes` field needs TBytes
+    // IMPORT-1. Both nil for a single-file generation, and every cross-file
+    // branch below is guarded on that: with no file set the emitter must
+    // produce byte-identical output to what it produced before IMPORT-1,
+    // which is what lets the C2 gate keep comparing against the hand-written
+    // samples.
+    FFileSet:     TProtoFileSet;
+    FEntry:       TProtoFileEntry;
+    FExternUnits: TStringList;   // generated units this one must `uses`
 
     procedure W(const ALine: string = '');
+    // IMPORT-1 — the instance-level counterpart of the class function
+    // PascalFieldType, which cannot see the file set.
+    function  FieldType(AField: TProtoFieldNode): string;
+    procedure NoteExternUnit(const AUnitName: string);
     procedure ScanForWKT;
     procedure ScanForBytes;
+    procedure ScanForExternUnits;   // IMPORT-1
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitTypeSection;
     // ENUMCOLLIDE-1 — Pascal enum values share unit scope; proto's do not
     procedure CheckEnumValueCollisions;
+    function  BaseEnumValueName(AEnum: TProtoEnumNode; AIndex: Integer): string;
     function  EnumValueName(AEnum: TProtoEnumNode; AIndex: Integer): string;
     // FORWARD-1 — class forwards for messages referenced before they are declared
     function  MessageIndex(AMsg: TProtoMessageNode): Integer;
@@ -76,6 +91,16 @@ type
       const AGroup: string): TArray<string>;
     procedure EmitOneofCaseEnums(AMsg: TProtoMessageNode);
     procedure EmitOneofBodies(AMsg: TProtoMessageNode);
+    { Is this field's type an ENUM? Three call sites used to answer this
+      separately and each missed a different case: FFile.Enums cannot see a
+      bundled well-known enum (WKTENUM-1), cannot see an enum declared in an
+      IMPORTED file, and cannot even see a same-file enum named through its
+      package. Getting it wrong puts an enum in the destructor and emits
+      `.Free` on it, or drops the has-bit a oneof member's own Clear then
+      references. One predicate, so there is no fourth variant. }
+    function  IsEnumField(AField: TProtoFieldNode): Boolean;
+    // FORWARD-1 — the same-file message a field names, or nil
+    function  LocalMessageTarget(AField: TProtoFieldNode): TProtoMessageNode;
     // PROTOGEN-DTOR — ownership of allocated submessages
     function  IsMessageField(AField: TProtoFieldNode): Boolean;
     function  OwnsMessages(AMsg: TProtoMessageNode): Boolean;
@@ -98,12 +123,49 @@ type
     class function CaseValueName(const AClassName, AOneof,
       AMemberProp: string): string;
 
+    constructor Create;
+    destructor Destroy; override;
+
+    { IMPORT-1 / SVCWKT-1. The Pascal type name for a proto type reference,
+      resolved through a file set.
+
+      ONE rule, four emitters. Messages, Interfaces, Service skeletons and
+      Registration all name proto types, and before IMPORT-1 the three service
+      emitters called PascalTypeName directly — which mangles rather than
+      resolves. That produced `TGoogleProtobufEmpty` for an rpc taking
+      google.protobuf.Empty, a type nothing declares, and it would produce an
+      undeclared name for any rpc whose request or response lives in an
+      imported file.
+
+      AExternUnit is the generated unit that must appear in the caller's uses
+      clause, or '' when none is needed (a scalar, a same-file type, or a
+      bundled well-known type). Callers collect it; this function does not
+      know where their uses clause lives.
+
+      Returns '' — NOT a guess — when the file set cannot resolve the name, so
+      callers fall back to their own same-file rule. That rule handles one case
+      this one does not: proto scoping is innermost-outward, so a field inside
+      `message M` may name a type nested in M by its bare name. Resolving that
+      here would need the enclosing scope threaded through; the AST's
+      FindMessage/FindEnum already do it by simple-name lookup, which is
+      unambiguous within a single file.
+
+      Found by measurement, not by review: this returned a mangled `TState` for
+      every `enum State` nested in its own message, and the corpus is full of
+      them. }
+    class function QualifiedTypeName(AFileSet: TProtoFileSet;
+      AEntry: TProtoFileEntry; const ATypeName: string;
+      out AExternUnit: string): string;
+
     // Emit a complete .Messages.pas into ALines. ALines is cleared first.
     // AUnitPrefix: dotted name prefix, e.g. 'Sample.Greeter' -- the unit
     // name becomes '<AUnitPrefix>.Messages'.
     // AProtoFileName: used only in the generated file-level comment.
+    // AFileSet/AEntry supply cross-file resolution. Omit both (the default)
+    // and the emitter behaves exactly as it did before IMPORT-1.
     procedure Emit(AFile: TProtoFileNode;
-      const AUnitPrefix, AProtoFileName: string; ALines: TStrings);
+      const AUnitPrefix, AProtoFileName: string; ALines: TStrings;
+      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil);
 
     // Maps a proto field name to a safe Delphi identifier.
     // Sets ARenamedFrom to the original proto name when a reserved-word
@@ -155,24 +217,48 @@ implementation
   and closed rather than a copy of the RTL: High and Low (destructors, map
   accessors), Length and SetLength (map accessors), Result and Exit (every
   generated function), Free and Create (ownership), Copy/Pos/Default. }
-function IsGeneratedCodeIntrinsic(const AName: string): Boolean;
+{ The leading segment of a dotted name — 'Demo.Google.Rpc' -> 'Demo'.
+  The only part of a unit name that is resolved as a bare identifier, and so
+  the only part an enum value can shadow. }
+function FirstNameSegment(const ADotted: string): string;
+var
+  P: Integer;
+begin
+  P := Pos('.', ADotted);
+  if P > 0 then
+    Result := Copy(ADotted, 1, P - 1)
+  else
+    Result := ADotted;
+end;
+
+{ Routines the generated code CALLS. An identifier here is dangerous wherever
+  it is in scope as an expression — including a property name, because a
+  property is in scope inside its own class's method bodies. }
+function IsGeneratedCodeRoutine(const AName: string): Boolean;
 var
   LName: string;
 begin
   LName := LowerCase(AName);
   Result :=
-    { routines the generated code calls }
     (LName = 'high')   or (LName = 'low')       or (LName = 'length')   or
     (LName = 'setlength') or (LName = 'result')  or (LName = 'exit')     or
     (LName = 'free')   or (LName = 'create')    or (LName = 'default')  or
     (LName = 'copy')   or (LName = 'pos')       or (LName = 'ord')      or
     (LName = 'assigned') or (LName = 'inc')     or (LName = 'dec')      or
     (LName = 'true')   or (LName = 'false')     or (LName = 'nil')      or
-    (LName = 'self')   or
-    { TYPE names the generated code emits. Missed on the first pass, which
-      covered routines only - and an enum value shadowing a type fails in a
-      stranger place: `BOOL`, `DOUBLE` and `INT64` in one googleapis enum made
-      `TArray<Double>` on a LATER line report "Type mismatch". }
+    (LName = 'self');
+end;
+
+{ TYPE names the generated code emits. Missed on the first pass, which covered
+  routines only - and an enum value shadowing a type fails in a stranger place:
+  `BOOL`, `DOUBLE` and `INT64` in one googleapis enum made `TArray<Double>` on
+  a LATER line report "Type mismatch". }
+function IsGeneratedCodeTypeName(const AName: string): Boolean;
+var
+  LName: string;
+begin
+  LName := LowerCase(AName);
+  Result :=
     (LName = 'integer') or (LName = 'int64')    or (LName = 'boolean')  or
     (LName = 'double')  or (LName = 'single')   or (LName = 'cardinal') or
     (LName = 'uint32')  or (LName = 'uint64')   or (LName = 'tbytes')   or
@@ -182,34 +268,19 @@ begin
     (LName = 'tobject') or (LName = 'tclass');
 end;
 
-function IsDelphiReservedWord(const AName: string): Boolean;
-begin
-  Result :=
-    (AName = 'and')          or (AName = 'array')        or (AName = 'as')          or
-    (AName = 'asm')          or (AName = 'begin')         or (AName = 'case')        or
-    (AName = 'class')        or (AName = 'const')         or (AName = 'constructor') or
-    (AName = 'destructor')   or (AName = 'dispinterface') or (AName = 'div')         or
-    (AName = 'do')           or (AName = 'downto')        or (AName = 'else')        or
-    (AName = 'end')          or (AName = 'except')        or (AName = 'exports')     or
-    (AName = 'file')         or (AName = 'finalization')  or (AName = 'finally')     or
-    (AName = 'for')          or (AName = 'function')      or (AName = 'goto')        or
-    (AName = 'if')           or (AName = 'implementation')or (AName = 'in')          or
-    (AName = 'inherited')    or (AName = 'initialization') or (AName = 'inline')     or
-    (AName = 'interface')    or (AName = 'is')            or (AName = 'label')       or
-    (AName = 'library')      or (AName = 'message')       or (AName = 'mod')         or
-    (AName = 'nil')          or (AName = 'not')           or (AName = 'object')      or
-    (AName = 'of')           or (AName = 'on')            or (AName = 'or')          or
-    (AName = 'out')          or (AName = 'packed')        or (AName = 'procedure')   or
-    (AName = 'program')      or (AName = 'property')      or (AName = 'raise')       or
-    (AName = 'record')       or (AName = 'repeat')        or (AName = 'resourcestring') or
-    (AName = 'set')          or (AName = 'shl')           or (AName = 'shr')         or
-    (AName = 'string')       or (AName = 'then')          or (AName = 'threadvar')   or
-    (AName = 'to')           or (AName = 'try')           or (AName = 'type')        or
-    (AName = 'unit')         or (AName = 'until')         or (AName = 'uses')        or
-    (AName = 'var')          or (AName = 'while')         or (AName = 'with')        or
-    (AName = 'xor');
-end;
+{ Both, for ENUM VALUES — they are declared into a type section, so a type name
+  collides there just as a routine name does.
 
+  FIELD names deliberately use the ROUTINE half alone. Renaming on the type
+  half too was tried and reverted: it renamed ordinary proto fields called
+  `single` and `double` that had always compiled, which broke the C2 sample
+  comparison and every consumer spelling the old property name — churn with no
+  safety bought, since a property shadows a type name only in the narrow case
+  where its own class also declares a member of that type. }
+function IsGeneratedCodeIntrinsic(const AName: string): Boolean;
+begin
+  Result := IsGeneratedCodeRoutine(AName) or IsGeneratedCodeTypeName(AName);
+end;
 // ── TMessagesEmitter -- private ──────────────────────────────────────────────
 
 procedure TMessagesEmitter.W(const ALine: string = '');
@@ -255,6 +326,78 @@ begin
       end;
 end;
 
+{ IMPORT-1. Which OTHER generated units does this one reference?
+
+  Deliberately implemented by calling FieldType and discarding the result,
+  rather than by re-deriving the resolution rules here. The two must agree
+  exactly: a scan that missed a type would leave its unit out of the uses
+  clause, and a scan that found one the emitter does not emit would add a unit
+  nobody references. Sharing the one function makes disagreement impossible
+  rather than merely unlikely.
+
+  Map fields need the extra pass because their key and value types come from
+  the synthesised entry message, which the field walk never visits directly. }
+procedure TMessagesEmitter.ScanForExternUnits;
+var
+  I, J: Integer;
+  LMsg: TProtoMessageNode;
+  LField: TProtoFieldNode;
+begin
+  FExternUnits.Clear;
+  if (FFileSet = nil) or (FEntry = nil) then
+    Exit;
+  for I := 0 to FFile.Messages.Count - 1 do
+  begin
+    LMsg := FFile.Messages[I];
+    for J := 0 to LMsg.Fields.Count - 1 do
+    begin
+      LField := LMsg.Fields[J];
+      FieldType(LField);
+      if LField.IsMap then
+      begin
+        MapKeyType(LField);
+        MapValueType(LField);
+      end;
+    end;
+  end;
+end;
+
+procedure TMessagesEmitter.NoteExternUnit(const AUnitName: string);
+begin
+  if (AUnitName <> '') and (AUnitName <> FUnitPrefix + '.Messages') then
+    FExternUnits.Add(AUnitName);
+end;
+
+{ IMPORT-1. The Pascal type for a field, resolved across files.
+
+  A cross-file reference is emitted FULLY QUALIFIED — Demo.Google.Rpc.Status.
+  Messages.TStatus — because short names collide constantly in real schemas
+  (Status, Error, Metadata, Operation all recur across googleapis packages)
+  and a bare name binds to whichever unit comes last in the uses clause,
+  silently and possibly wrongly. tests/qualref/ProtoQualRefProbe.dpr pins both
+  halves of that: the qualified form resolves to the right unit, and the bare
+  form really does bind to the last one. }
+function TMessagesEmitter.FieldType(AField: TProtoFieldNode): string;
+var
+  LBase:  string;
+  LExtern: string;
+begin
+  // No file set, or a scalar: the single-file path decides, unchanged.
+  if (FFileSet = nil) or (FEntry = nil) or (AField.Scalar <> psNone) then
+    Exit(PascalFieldType(AField, FFile));
+
+  LBase := QualifiedTypeName(FFileSet, FEntry, AField.TypeName, LExtern);
+  // Unresolved by the file set: the single-file path knows about nested types.
+  if LBase = '' then
+    Exit(PascalFieldType(AField, FFile));
+  NoteExternUnit(LExtern);
+
+  if AField.IsRepeated then
+    Result := 'TArray<' + LBase + '>'
+  else
+    Result := LBase;
+end;
+
 procedure TMessagesEmitter.EmitBoilerplate;
 begin
   W('unit ' + FUnitPrefix + '.Messages;');
@@ -288,6 +431,8 @@ end;
 // accommodate it. A gate weakened to fit a change is worth more than the line
 // of code it saved.
 procedure TMessagesEmitter.EmitUsesClause;
+var
+  I: Integer;
 begin
   W('uses');
   if FNeedsSysUtils then
@@ -298,13 +443,26 @@ begin
     W('  System.SysUtils,');
     W('{$IFEND}');
   end;
-  if FNeedsWKT then
-  begin
-    W('  Nghttp2.Protobuf,');
-    W('  Nghttp2.Protobuf.WellKnown;');
-  end
+  // IMPORT-1. Whichever entry ends up last carries the semicolon. With no
+  // extern units this reproduces the pre-IMPORT-1 clause exactly, character
+  // for character — the C2 gate compares generated output against
+  // hand-written samples, so a stray comma here fails it.
+  if FNeedsWKT or (FExternUnits.Count > 0) then
+    W('  Nghttp2.Protobuf,')
   else
     W('  Nghttp2.Protobuf;');
+  if FNeedsWKT then
+  begin
+    if FExternUnits.Count > 0 then
+      W('  Nghttp2.Protobuf.WellKnown,')
+    else
+      W('  Nghttp2.Protobuf.WellKnown;');
+  end;
+  for I := 0 to FExternUnits.Count - 1 do
+    if I = FExternUnits.Count - 1 then
+      W('  ' + FExternUnits[I] + ';')
+    else
+      W('  ' + FExternUnits[I] + ',');
   W;
 end;
 
@@ -370,7 +528,7 @@ begin
       LField := LMsg.Fields[J];
       if not IsMessageField(LField) then Continue;
       if WellKnownPascalClass(LField.TypeName) <> '' then Continue;
-      LTarget := FFile.FindMessage(LField.TypeName);
+      LTarget := LocalMessageTarget(LField);
       if LTarget = nil then Continue;
       K := MessageIndex(LTarget);
       { Strictly LATER only. K = I is a self-reference and needs nothing. }
@@ -474,7 +632,17 @@ end;
   1, 2 and 4 are checked BEFORE 3, because each can create a collision that 3
   then has to resolve - a truncated name is far more likely to clash than the
   original was. }
-function TMessagesEmitter.EnumValueName(AEnum: TProtoEnumNode;
+{ The escaped spelling of one enum value, WITHOUT the cross-enum collision
+  step. Split out because the collision check must compare like with like:
+  it used to test the other enum's RAW name against this one's ESCAPED name,
+  so `LOW` and `LOW` in two enums — both escaped to `LOW_` because `low` is an
+  intrinsic the generated code calls — compared as 'LOW' vs 'LOW_' and were
+  declared not to collide.
+
+  ENUMWORD-1 introduced that escaping and in doing so disabled ENUMCOLLIDE-1
+  for exactly the values that need both. Neither gate saw it; backstory/udm.proto
+  did. }
+function TMessagesEmitter.BaseEnumValueName(AEnum: TProtoEnumNode;
   AIndex: Integer): string;
 const
   { FPC truncates identifiers at 126 characters. MEASURED, not assumed - a
@@ -494,14 +662,25 @@ const
     diagnostic. A margin is cheaper than understanding why. }
   MAX_IDENT = 120;
 var
-  J, V: Integer;
-  LOther: TProtoEnumNode;
   LHash: Cardinal;
   K: Integer;
 begin
   Result := AEnum.Values[AIndex].Name;
 
   if IsDelphiReservedWord(LowerCase(Result)) or IsGeneratedCodeIntrinsic(Result) then
+    Result := Result + '_';
+
+  { SHADOW-1. A Pascal enum VALUE lives at unit scope and is matched
+    case-insensitively, so a value spelled like the first segment of this
+    unit's own name hides that namespace — and every cross-file reference is
+    written through it. In google/cloud/discoveryengine, `CORPUS = 1` made
+    every `Corpus.S234....TInterval` in the unit fail with "Identifier idents
+    no member S234".
+
+    Not an artefact of the corpus harness's prefix: with --unit-prefix Sample,
+    an enum value SAMPLE breaks a generated unit exactly the same way. Only the
+    FIRST segment matters — the rest are resolved as members of it. }
+  if SameText(Result, FirstNameSegment(FUnitPrefix)) then
     Result := Result + '_';
 
   { Truncate with a hash of the FULL name, so two values sharing a long prefix
@@ -514,14 +693,25 @@ begin
       LHash := (LHash xor Ord(AEnum.Values[AIndex].Name[K])) * 16777619;
     Result := Copy(Result, 1, MAX_IDENT - 9) + '_' + IntToHex(LHash, 8);
   end;
+end;
 
-  { Cross-enum collision, LAST, so it sees the name the other rules produced. }
+function TMessagesEmitter.EnumValueName(AEnum: TProtoEnumNode;
+  AIndex: Integer): string;
+var
+  J, V: Integer;
+  LOther: TProtoEnumNode;
+begin
+  Result := BaseEnumValueName(AEnum, AIndex);
+
+  { Cross-enum collision, LAST, so it sees the name the other rules produced —
+    on BOTH sides. Comparing against the other enum's escaped name is the whole
+    point: raw-vs-escaped is what let LOW_ be declared twice. }
   for J := 0 to FFile.Enums.Count - 1 do
   begin
     LOther := FFile.Enums[J];
     if LOther = AEnum then Continue;
     for V := 0 to LOther.Values.Count - 1 do
-      if SameText(LOther.Values[V].Name, Result) then
+      if SameText(BaseEnumValueName(LOther, V), Result) then
       begin
         Result := UpperCase(StringReplace(AEnum.QualifiedName, '.', '_',
                     [rfReplaceAll])) + '_' + Result;
@@ -612,7 +802,7 @@ begin
 
   if AField.Scalar <> psNone then Exit(True);      // a built-in scalar
 
-  if FFile.FindEnum(AField.TypeName) <> nil then
+  if IsEnumField(AField) then
     Exit(True);                                    // enum: varint, needs a bit
 
   { WKTENUM-1. A BUNDLED well-known enum - google.protobuf.NullValue - is an
@@ -621,10 +811,9 @@ begin
     while the group Clear and the case getter both emitted references to one.
     Result: "Identifier not found FHasnull_value", in three googleapis schemas.
 
-    WellKnownIsEnum is the same predicate IsMessageField uses to keep NullValue
-    out of the destructor. It was applied there and not here. }
-  if WellKnownIsEnum(AField.TypeName) then
-    Exit(True);
+    IMPORT-1 then found the SAME defect twice more, for an enum in an imported
+    file and for one named through its own package, which is why all three
+    checks now live in IsEnumField above rather than being repeated here. }
 
   { A MESSAGE. Neither case takes a has-bit - nil already carries presence -
     and neither is a reason to refuse the schema. }
@@ -668,16 +857,69 @@ end;
 
   Deliberately non-raising, unlike NeedsHasBit, because it is asked about
   every field of every message rather than only about ones the author marked. }
+function TMessagesEmitter.IsEnumField(AField: TProtoFieldNode): Boolean;
+var
+  LRef: TProtoTypeRef;
+begin
+  if AField.Scalar <> psNone then
+    Exit(False);
+
+  // Bundled: google.protobuf.NullValue is an enum and appears in no .proto
+  // this generator ever parses.
+  if WellKnownIsEnum(AField.TypeName) then
+    Exit(True);
+
+  { The file set matches fully-qualified names and package-relative ones, so
+    where it answers, it is exact. Ask it FIRST.
+
+    FindEnum below falls back to a SIMPLE-NAME match, and that cannot tell a
+    nested `enum Role` from a top-level `message Role`. backstory/udm.proto
+    declares both: the field type resolved to the message and this predicate
+    to the enum, so FORWARD-1 skipped the forward declaration and the unit
+    named a class nothing had declared. }
+  if (FFileSet <> nil) and (FEntry <> nil) then
+  begin
+    LRef := FFileSet.ResolveType(FEntry, AField.TypeName);
+    if LRef.Found then
+      Exit(LRef.Enum <> nil);
+  end;
+
+  { Unresolved by the file set — a type nested in the ENCLOSING message,
+    named bare. Proto scoping is innermost-outward and the file set does not
+    walk scopes; the simple-name lookup does, and within one file it is
+    unambiguous enough for that case. }
+  Result := FFile.FindEnum(AField.TypeName) <> nil;
+end;
+
+function TMessagesEmitter.LocalMessageTarget(AField: TProtoFieldNode): TProtoMessageNode;
+var
+  LRef: TProtoTypeRef;
+begin
+  { Exact resolution first, for the reason IsEnumField gives: a same-file
+    message named through its own package (`grafeas.v1.Foo` inside package
+    grafeas.v1) matches neither FindMessage key, and a simple-name match can
+    land on the wrong declaration entirely. }
+  if (FFileSet <> nil) and (FEntry <> nil) then
+  begin
+    LRef := FFileSet.ResolveType(FEntry, AField.TypeName);
+    if LRef.Found then
+    begin
+      // Resolved elsewhere, or to an enum: no forward declaration belongs here.
+      if LRef.Entry = FEntry then
+        Result := LRef.Msg
+      else
+        Result := nil;
+      Exit;
+    end;
+  end;
+  // Nested in the enclosing message, named bare — the scope walk the file set
+  // does not do.
+  Result := FFile.FindMessage(AField.TypeName);
+end;
+
 function TMessagesEmitter.IsMessageField(AField: TProtoFieldNode): Boolean;
 begin
-  { STRUCT-1. A bundled well-known ENUM is not in FFile.Enums - it is not
-    declared in the .proto at all - so the FindEnum test alone calls
-    google.protobuf.NullValue a message, puts it in the generated destructor,
-    and emits `.Free` on an enum value. WellKnownIsEnum is the only thing that
-    can tell them apart. }
-  Result := (AField.Scalar = psNone)
-            and (FFile.FindEnum(AField.TypeName) = nil)
-            and not WellKnownIsEnum(AField.TypeName);
+  Result := (AField.Scalar = psNone) and not IsEnumField(AField);
 end;
 
 function TMessagesEmitter.OwnsMessages(AMsg: TProtoMessageNode): Boolean;
@@ -707,7 +949,7 @@ begin
       'Map field %s names entry message %s, which is missing or malformed. '
       + 'The parser synthesises it with key=1 and value=2; this should be '
       + 'unreachable.', [QuotedStr(AField.Name), QuotedStr(AField.TypeName)]);
-  Result := PascalFieldType(LEntry.Fields[0], FFile);
+  Result := FieldType(LEntry.Fields[0]);
 end;
 
 function TMessagesEmitter.MapValueType(AField: TProtoFieldNode): string;
@@ -720,7 +962,7 @@ begin
     raise EEmitError.CreateFmt(
       'Map field %s names entry message %s, which is missing or malformed.',
       [QuotedStr(AField.Name), QuotedStr(AField.TypeName)]);
-  Result := PascalFieldType(LEntry.Fields[1], FFile);
+  Result := FieldType(LEntry.Fields[1]);
 end;
 
 { Upper-cases the first character only. proto names are conventionally
@@ -956,7 +1198,7 @@ begin
     LField     := AMsg.Fields[I];
     LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
     LBackField := 'F' + LPropName;
-    LFieldType := PascalFieldType(LField, FFile);
+    LFieldType := FieldType(LField);
     W('    ' + LBackField + ': ' + LFieldType + ';');
     if NeedsHasBit(LField) then
     begin
@@ -986,7 +1228,7 @@ begin
     LField := AMsg.Fields[I];
     if not NeedsSetter(LField) then Continue;
     LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
-    LFieldType := PascalFieldType(LField, FFile);
+    LFieldType := FieldType(LField);
     W('    procedure Set' + LPropName + '(const AValue: ' + LFieldType + ');');
   end;
 
@@ -1049,7 +1291,7 @@ begin
     LField     := AMsg.Fields[I];
     LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
     LBackField := 'F' + LPropName;
-    LFieldType := PascalFieldType(LField, FFile);
+    LFieldType := FieldType(LField);
     if LRenamedFrom <> '' then
       W('    // proto3: ' + LField.TypeName + ' ' + LRenamedFrom + ' = ' +
         IntToStr(LField.Number) + '; renamed to ''' + LPropName +
@@ -1106,7 +1348,7 @@ begin
       LField := LMsg.Fields[I];
       if not NeedsSetter(LField) then Continue;
       LPropName  := PascalFieldName(LField.Name, LRenamedFrom);
-      LFieldType := PascalFieldType(LField, FFile);
+      LFieldType := FieldType(LField);
 
       { ONEOF-2. A message member owns its instance, so its setter and Clear
         are about FREEING rather than about a bit. Same shape as MAP-1's
@@ -1386,7 +1628,7 @@ begin
     begin
       if not SameText(AMsg.Fields[I].OneofName, LGroups[G]) then Continue;
       LProp := PascalFieldName(AMsg.Fields[I].Name, LRenamed);
-      LType := PascalFieldType(AMsg.Fields[I], FFile);
+      LType := FieldType(AMsg.Fields[I]);
       { ONEOF-2. A message member is FREED, not nilled - the class owns it, the
         same contract PROTOGEN-DTOR pinned for every other message field. }
       if IsOneofMessageMember(AMsg.Fields[I]) then
@@ -1438,16 +1680,38 @@ end;
 
 // ── TMessagesEmitter -- public ───────────────────────────────────────────────
 
+constructor TMessagesEmitter.Create;
+begin
+  inherited Create;
+  FExternUnits := TStringList.Create;
+  FExternUnits.Duplicates := dupIgnore;
+  FExternUnits.Sorted     := True;   // deterministic uses clause
+end;
+
+destructor TMessagesEmitter.Destroy;
+begin
+  FExternUnits.Free;
+  inherited Destroy;
+end;
+
 procedure TMessagesEmitter.Emit(AFile: TProtoFileNode;
-  const AUnitPrefix, AProtoFileName: string; ALines: TStrings);
+  const AUnitPrefix, AProtoFileName: string; ALines: TStrings;
+  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry);
 begin
   FFile       := AFile;
   FUnitPrefix := AUnitPrefix;
   FProtoFile  := AProtoFileName;
   FOut        := ALines;
+  FFileSet    := AFileSet;
+  FEntry      := AEntry;
+  FExternUnits.Clear;
   ALines.Clear;
   ScanForWKT;
   ScanForBytes;
+  // Must precede EmitUsesClause: the clause names the units, so they have to
+  // be known before it is written rather than discovered while emitting the
+  // types below it.
+  ScanForExternUnits;
   EmitBoilerplate;
   EmitUsesClause;
   EmitTypeSection;
@@ -1475,13 +1739,47 @@ begin
     Result := 'str';
     Exit;
   end;
-  // Generic rename for any other reserved word.
-  if IsDelphiReservedWord(AProtoName) then
+  { Generic rename for a reserved word, or for `default`.
+
+    FIELDWORD-1. A property is in scope inside its own class's method bodies,
+    so a field named `default` leaves the generated Clear body unable to call
+    Default():
+
+        Fminimum := Default(Double);
+        //          ^ binds to the property, not the intrinsic
+        //   Incompatible types: got "TProtobufValue" expected "Double"
+        //   Syntax error, ";" expected but "(" found
+
+    google.api's OpenAPI Schema declares exactly that field.
+
+    WHY ONLY `default`, and not the whole intrinsic list. Two wider rules were
+    tried against the gates and reverted, in this order:
+
+      - all intrinsics, routines AND type names: renamed ordinary fields
+        called `single` and `double` that had always compiled. Enum values do
+        need the type half — they are declared into a type section — but a
+        property is not, so this bought nothing and broke every consumer
+        spelling the old name.
+      - all called routines: renamed `length` in echo.proto, whose class has no
+        repeated or bytes field and so never calls Length() at all.
+
+    Both failures are the same shape: whether a property shadows anything
+    depends on what its OWN class's body calls, which this class function
+    cannot see. `Default(` is the one call emitted for every has-bit field, so
+    it is the one name worth renaming unconditionally.
+
+    KNOWN GAP, unchanged by this fix: a message that has BOTH a repeated field
+    and a field named `length`, `high` or `setlength` still collides. Not
+    present in 305 googleapis schemas. Closing it properly means deciding the
+    rename per message, from the routines that message's body will actually
+    emit. }
+  if IsDelphiReservedWord(AProtoName) or SameText(AProtoName, 'default') then
   begin
     ARenamedFrom := AProtoName;
     Result := AProtoName + '_';
     Exit;
   end;
+
   Result := AProtoName;
 end;
 
@@ -1526,6 +1824,43 @@ begin
     if LName[I] <> '.' then
       LResult := LResult + LName[I];
   Result := 'T' + LResult;
+end;
+
+class function TMessagesEmitter.QualifiedTypeName(AFileSet: TProtoFileSet;
+  AEntry: TProtoFileEntry; const ATypeName: string;
+  out AExternUnit: string): string;
+var
+  LRef: TProtoTypeRef;
+  LWkt: string;
+begin
+  AExternUnit := '';
+
+  // A bundled well-known type is satisfied by Nghttp2.Protobuf.WellKnown and
+  // needs no generated unit — but it must NOT be mangled by PascalTypeName,
+  // which is what the service emitters used to do to it.
+  LWkt := WellKnownPascalClass(ATypeName);
+  if LWkt <> '' then
+    Exit(LWkt);
+
+  // No file set: say so, and let the caller apply its own rule.
+  Result := '';
+  if (AFileSet = nil) or (AEntry = nil) then
+    Exit;
+
+  LRef := AFileSet.ResolveType(AEntry, ATypeName);
+  if not LRef.Found then
+    Exit;   // '' — the caller's same-file rule handles nested-type scoping
+
+  if LRef.Msg <> nil then
+    Result := PascalTypeName(LRef.Msg.QualifiedName)
+  else if LRef.Enum <> nil then
+    Result := PascalTypeName(LRef.Enum.QualifiedName);
+
+  if (LRef.Entry = nil) or (LRef.Entry = AEntry) then
+    Exit;   // same file — the short name is correct and unambiguous
+
+  AExternUnit := LRef.Entry.UnitPrefix + '.Messages';
+  Result := AExternUnit + '.' + Result;
 end;
 
 class function TMessagesEmitter.PascalFieldType(AField: TProtoFieldNode;

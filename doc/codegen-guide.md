@@ -67,7 +67,7 @@ which reads as a missing unit but is really a wrong-compiler unit.
 Generate:
 
 ```bash
-Protogen -i greeter.proto -o src/ --unit-prefix Sample.Greeter
+Protogen -i greeter.proto -o src/ --unit-prefix Sample
 ```
 
 ```
@@ -75,15 +75,62 @@ Protogen -i greeter.proto -o src/ --unit-prefix Sample.Greeter
 [write] Sample.Greeter.Interfaces.pas
 [write] Sample.Greeter.Service.pas
 [write] Sample.Greeter.Registration.pas
+generated 1 proto file
+root-unit-file: Sample.Greeter.Messages.pas
 ```
 
 | flag | meaning |
 |---|---|
 | `-i`, `--input` | the `.proto` file |
 | `-o`, `--output` | directory to write into (created if absent) |
-| `--unit-prefix` | dotted prefix; unit names become `<prefix>.Messages` etc. |
+| `-I`, `--proto-path` | directory to resolve imports against; repeatable, searched in order. Defaults to the input's own directory. |
+| `--unit-prefix` | dotted prefix; see **Unit names** below |
 | `--dry-run` | report what would be written, touch nothing |
 | `-h` | usage |
+
+### Unit names
+
+A unit's name is `<prefix>` plus **the .proto's own path**, so
+`greeter.proto` under `--unit-prefix Sample` becomes `Sample.Greeter.*` and
+`google/rpc/status.proto` becomes `Sample.Google.Rpc.Status.*`.
+
+The prefix is a namespace for the whole generation, not a name for one file.
+That is why the example above passes `Sample` rather than `Sample.Greeter` —
+the `Greeter` part now comes from the filename, and passing both would give
+you `Sample.Greeter.Greeter.Messages`.
+
+The rule exists so that a given `.proto` has **one** unit name however it is
+reached. Generate `status.proto` as your input today and as somebody's import
+tomorrow, and both produce `Sample.Google.Rpc.Status.Messages` — one set of
+classes. Naming the root differently from an import would give you two
+`TStatus` types that cannot be passed to each other.
+
+Path segments are PascalCased (`field_behavior` → `FieldBehavior`), and two
+cases are escaped: a leading digit, and a Pascal reserved word —
+`google/protobuf/type.proto` becomes `...Protobuf.Type_`, because `Type` is
+not a legal unit-name segment.
+
+### Imports
+
+Imports are followed, and one unit group is emitted per `.proto` in the
+closure. Import paths resolve against the `-I` roots in order and are never
+relative to the importing file, which is what protoc does.
+
+```bash
+Protogen -i google/rpc/status.proto -I . -o src/ --unit-prefix Api
+```
+
+`google/protobuf` well-known types are supplied by the library
+(`Nghttp2.Protobuf.WellKnown`), so they are never looked up on an include path
+and generate no unit. A schema importing only those needs no `-I` at all.
+
+A file in the closure that declares no service gets only its `.Messages.pas` —
+a twenty-file closure would otherwise produce sixty near-empty units. A
+single-file generation still writes all four.
+
+A missing import is an error, not a warning: generating anyway would produce a
+unit naming types that no unit declares, and the failure would surface in your
+compiler instead of in the generator.
 
 Exit codes: **0** success · **1** bad arguments, or the schema was refused ·
 **2** an I/O error.

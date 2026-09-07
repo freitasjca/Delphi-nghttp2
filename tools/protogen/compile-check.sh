@@ -22,20 +22,23 @@
 #  authority on whether generated Pascal is valid, and until now it had seen
 #  exactly four schemas - echo, greeter, optional.proto and the runner fixture.
 #
-#  ── Why only some schemas ──
+#  ── Every schema, since IMPORT-1 ──
 #
-#  A generated unit references types from every .proto its schema imports, and
-#  those units are not generated here. Compiling one would fail on unresolved
-#  identifiers that say nothing about the emitter. So the candidate set is:
+#  This script used to compile only self-contained schemas - no imports, or
+#  imports of bundled well-known types alone - because a generated unit
+#  referencing another .proto's types named identifiers that no generated unit
+#  declared. That was 3019 of 7301 googleapis files, 41%, and the excluded 59%
+#  was not a sampling choice: it was the shape of a defect.
 #
-#    - schemas with NO imports, or
-#    - schemas importing ONLY well-known types this library BUNDLES, which
-#      resolve to Nghttp2.Protobuf.WellKnown rather than to generated code
+#  IMPORT-1 resolves imports and generates one unit per file in the closure, so
+#  the whole corpus is now a candidate. The include root is the corpus root,
+#  which is how googleapis paths ('google/rpc/status.proto') are meant to
+#  resolve.
 #
-#  On googleapis that is 3019 of 7301 files, 41%. Chasing the other 59% means
-#  resolving an import graph and generating whole closures - a different and
-#  much larger tool, and the 41% is a large enough sample to find a systematic
-#  emitter defect.
+#  What is still excluded, and why it is a GAP rather than a defect:
+#  a schema importing a file the corpus does not contain. protogen reports
+#  that as a missing import - correctly - and it is counted separately from a
+#  compile failure, because the tool never claimed to generate it.
 #
 #  ── Sampling ──
 #
@@ -120,30 +123,11 @@ if ! "$TRUNK" -MDelphi -O1 -Fu"$HERE" -FU"$OUT/units" -FE"$OUT" \
 fi
 
 # ── Candidate selection ──────────────────────────────────────────────────────
-# Self-contained, or importing only well-known types we bundle. Anything else
-# would fail on identifiers from units nobody generated - noise, not a finding.
-echo "selecting self-contained schemas..."
-python3 - "$CORPUS" > "$OUT/candidates.txt" <<'PY'
-import sys, os, re
-root = sys.argv[1]
-BUNDLED = {'timestamp.proto', 'duration.proto', 'empty.proto', 'field_mask.proto',
-           'wrappers.proto', 'struct.proto', 'any.proto'}
-imp = re.compile(r'^\s*import\s+(?:public\s+)?"([^"]+)"', re.M)
-out = []
-for dp, _, fn in os.walk(root):
-    for f in sorted(fn):
-        if not f.endswith('.proto'):
-            continue
-        p = os.path.join(dp, f)
-        s = re.sub(r'//[^\n]*', '', open(p, encoding='utf-8', errors='replace').read())
-        imps = imp.findall(s)
-        if imps and not all(i.startswith('google/protobuf/')
-                            and os.path.basename(i) in BUNDLED for i in imps):
-            continue
-        out.append(p)
-for p in sorted(out):
-    print(p)
-PY
+# Every .proto in the corpus. Before IMPORT-1 this list was filtered down to
+# schemas with no cross-file references; that filter is gone, and the count it
+# used to print (3019) is worth remembering as the size of the blind spot.
+echo "collecting schemas..."
+find "$CORPUS" -name '*.proto' | sort > "$OUT/candidates.txt"
 
 TOTAL=$(wc -l < "$OUT/candidates.txt")
 if [[ "$SAMPLE" -gt 0 && "$TOTAL" -gt "$SAMPLE" ]]; then
@@ -157,7 +141,7 @@ else
 fi
 PICKED=$(wc -l < "$OUT/selected.txt")
 
-echo "candidates: $TOTAL self-contained of $(find "$CORPUS" -name '*.proto' | wc -l)"
+echo "candidates: $TOTAL schemas (every .proto in the corpus)"
 echo "compiling:  $PICKED"
 echo
 
@@ -171,17 +155,23 @@ while IFS= read -r proto; do
   mkdir -p "$D"
   PREFIX="Corpus.S$N"
 
-  if ! "$OUT/Protogen" -i "$proto" -o "$D" --unit-prefix "$PREFIX" \
-        > "$D/gen.log" 2>&1; then
-    # A refusal here is corpus-check's business, not ours - it means we never
-    # claimed to generate this one. Counted separately so it cannot be mistaken
-    # for a compile failure.
+  # -I the corpus root: googleapis import paths are corpus-relative
+  # ('google/rpc/status.proto'), which is exactly what protoc expects too.
+  if ! "$OUT/Protogen" -i "$proto" -I "$CORPUS" -o "$D" \
+        --unit-prefix "$PREFIX" > "$D/gen.log" 2>&1; then
+    # A refusal or an unresolvable import is corpus-check's business, not ours
+    # - either way we never claimed to generate this one. Counted separately so
+    # it cannot be mistaken for a compile failure.
     GENFAIL=$(( GENFAIL + 1 ))
     continue
   fi
 
-  UNIT="$D/$PREFIX.Messages.pas"
-  [[ -f "$UNIT" ]] || { GENFAIL=$(( GENFAIL + 1 )); continue; }
+  # Ask the tool which unit is the root rather than re-deriving the
+  # path-to-unit-name rule here. A second implementation of that rule in shell
+  # would agree with the Pascal one right up until it did not.
+  ROOTUNIT=$(sed -n 's/^root-unit-file: //p' "$D/gen.log" | head -1)
+  UNIT="$D/$ROOTUNIT"
+  [[ -n "$ROOTUNIT" && -f "$UNIT" ]] || { GENFAIL=$(( GENFAIL + 1 )); continue; }
 
   if "$TRUNK" -MDelphi -O1 -FU"$D" -Fu"$SRC" \
        -Fu"$TU/rtl" -Fu"$TU/rtl-objpas" -Fu"$TU/rtl-console" \
@@ -201,9 +191,25 @@ done < "$OUT/selected.txt"
 echo "==========================================================="
 printf "  attempted        %5d\n" "$PICKED"
 printf "  COMPILED         %5d\n" "$OK"
-printf "  refused by gen   %5d   (corpus-check's business, not a defect)\n" "$GENFAIL"
+printf "  refused / unresolved imports %5d   (not an emitter defect)\n" "$GENFAIL"
 printf "  DID NOT COMPILE  %5d   <- emitter defects\n" "$COMPFAIL"
 echo "==========================================================="
+
+# WHY the refused ones were refused. This bucket is where a systematic problem
+# hides while the headline number reads clean: the first corpus run after
+# IMPORT-1 reported "DID NOT COMPILE 0" over 305 schemas, of which 163 never
+# reached a compiler at all - 162 of them refused for ONE cause. A count with
+# no breakdown invites reading it as background noise.
+if [[ $GENFAIL -gt 0 ]]; then
+  echo
+  echo "-- why generation stopped, by cause ----------------------"
+  echo "   A large single cause here is a finding, not background."
+  cat "$OUT"/g/*/gen.log 2>/dev/null \
+    | grep -h "^error:" \
+    | sed 's/[0-9][0-9]*/N/g; s/"[^"]*"/"X"/g' \
+    | cut -c1-100 \
+    | sort | uniq -c | sort -rn | head -8 | sed 's/^/  /'
+fi
 
 if [[ $COMPFAIL -gt 0 ]]; then
   echo
