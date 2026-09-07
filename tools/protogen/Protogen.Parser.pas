@@ -176,6 +176,7 @@ end;
 
 procedure TProtoParser.Refuse(const AConstruct, AReason: string);
 begin
+  { BLOCKED-BY: invalid-proto3 }
   RefuseAt(Tok.Line, Tok.Column, AConstruct, AReason);
 end;
 
@@ -255,6 +256,7 @@ procedure TProtoParser.CheckScalarSupported(AScalar: TProtoScalar;
 begin
   case AScalar of
     psSInt32, psSInt64:
+      { BLOCKED-BY: no-wire-form-selector }
       RefuseAt(ALine, ACol, ScalarName(AScalar),
         Format('Field %s uses zigzag encoding, which cannot be requested: ' +
                'TProtoMemberAttribute carries only a tag, so a property has ' +
@@ -264,6 +266,7 @@ begin
                [QuotedStr(AFieldName)]));
 
     psFixed32, psFixed64, psSFixed32, psSFixed64:
+      { BLOCKED-BY: no-wire-form-selector }
       RefuseAt(ALine, ACol, ScalarName(AScalar),
         Format('Field %s uses a fixed-width wire type, which cannot be ' +
                'requested: TProtoMemberAttribute carries only a tag. The ' +
@@ -297,6 +300,7 @@ begin
     if WellKnownPascalClass(ATypeName) <> '' then
       Exit;   // bundled — nothing to refuse
 
+    { BLOCKED-BY: wkt-not-bundled }
     RefuseAt(ALine, ACol, ATypeName,
       Format('Field %s refers to a well-known type that is not bundled. Api, ' +
              'Type and DescriptorProto are protobuf''s own reflection ' +
@@ -326,6 +330,7 @@ begin
   ExpectSymbol(';');
 
   if FFile.Syntax <> 'proto3' then
+    { BLOCKED-BY: out-of-scope-proto2 }
     RefuseAt(LLine, LCol, Format('syntax = "%s"', [FFile.Syntax]),
       'Only proto3 is supported. proto2 adds required/optional presence, ' +
       'groups and extensions, none of which the RTTI serializer models.');
@@ -467,16 +472,19 @@ begin
       message field is redundant. }
 
     if IsIdent('required') then
+      { BLOCKED-BY: out-of-scope-proto2 }
       Refuse('required',
         'That is proto2. proto3 removed it; every field is optional with ' +
         'implicit presence.');
 
     if IsIdent('group') then
+      { BLOCKED-BY: out-of-scope-proto2 }
       Refuse('group',
         'Groups are a deprecated proto2 construct with no proto3 equivalent. ' +
         'Use a nested message reference.');
 
     if IsIdent('extend') or IsIdent('extensions') then
+      { BLOCKED-BY: out-of-scope-proto2 }
       Refuse(Tok.Value,
         'Extensions are proto2. proto3 has no extension ranges.');
 
@@ -510,6 +518,7 @@ begin
         per field. Caught here rather than in ParseField because only this
         point still knows both keywords were written, and in that order. }
       if IsIdent('repeated') then
+        { BLOCKED-BY: invalid-proto3 }
         Refuse('optional repeated',
           'proto3 allows one label per field. A repeated field already has ' +
           'no presence to express: empty and absent are the same on the ' +
@@ -584,6 +593,7 @@ begin
     comparison that either fails to compile or compares the wrong thing. }
   if not (LKeyScalar in [psInt32, psInt64, psUInt32, psUInt64, psBool,
                          psString]) then
+    { BLOCKED-BY: invalid-proto3 }
     RefuseAt(LLine, LCol, 'map key ' + LKeyType,
       Format('Map %s has key type %s. proto3 allows only integral and string '
              + 'map keys - not floating-point, bytes, enum or message types.',
@@ -597,16 +607,19 @@ begin
     CheckTypeNameSupported(LValType, LName + ' (map value)', LLine, LCol);
 
   if LNumber <= 0 then
+    { BLOCKED-BY: invalid-proto3 }
     RefuseAt(LLine, LCol, IntToStr(LNumber),
       Format('Map %s has number %d. Proto field numbers start at 1.',
         [QuotedStr(LName), LNumber]));
   if (LNumber >= 19000) and (LNumber <= 19999) then
+    { BLOCKED-BY: invalid-proto3 }
     RefuseAt(LLine, LCol, IntToStr(LNumber),
       Format('Map %s uses number %d, inside the 19000-19999 range reserved '
              + 'by protobuf itself.', [QuotedStr(LName), LNumber]));
 
   LExisting := AMsg.FindByNumber(LNumber);
   if LExisting <> nil then
+    { BLOCKED-BY: invalid-proto3 }
     RefuseAt(LLine, LCol, IntToStr(LNumber),
       Format('Map %s reuses number %d, already taken by %s on line %d.',
         [QuotedStr(LName), LNumber, QuotedStr(LExisting.Name),
@@ -692,6 +705,7 @@ begin
       refusing keeps us aligned with it rather than accepting a schema it
       would not compile - the one oracle cell that counts as a defect. }
     if IsIdent('repeated') then
+      { BLOCKED-BY: invalid-proto3 }
       Refuse('repeated inside oneof',
         Format('Field in oneof %s is `repeated`. A oneof member cannot be ' +
                'repeated: a repeated field has no presence, and "which one ' +
@@ -699,18 +713,21 @@ begin
                'the oneof.', [QuotedStr(LName)]));
 
     if IsIdent('optional') then
+      { BLOCKED-BY: invalid-proto3 }
       Refuse('optional inside oneof',
         Format('Field in oneof %s is `optional`. A oneof member already has ' +
                'explicit presence - that is what a oneof IS - so the label ' +
                'is not permitted. Drop it.', [QuotedStr(LName)]));
 
     if IsIdent('map') then
+      { BLOCKED-BY: invalid-proto3 }
       Refuse('map inside oneof',
         Format('Field in oneof %s is a map. proto3 does not allow map fields '
                + 'inside a oneof. Wrap it in a message and use that instead.',
           [QuotedStr(LName)]));
 
     if IsIdent('oneof') then
+      { BLOCKED-BY: invalid-proto3 }
       Refuse('nested oneof',
         Format('oneof %s contains another oneof. proto3 does not allow that.',
           [QuotedStr(LName)]));
@@ -726,6 +743,7 @@ begin
     oracle cell that counts as a defect, since it means emitting Pascal from
     a schema that will not compile anywhere else. }
   if LCount = 0 then
+    { BLOCKED-BY: invalid-proto3 }
     RefuseAt(LLine, LCol, 'oneof ' + LName,
       Format('oneof %s is empty. A oneof must declare at least one member.',
         [QuotedStr(LName)]));
@@ -751,6 +769,7 @@ begin
     `map` to ParseMapField. Both are illegal proto3: a map is already
     repeated, and it has no presence to add. }
   if IsIdent('map') then
+    { BLOCKED-BY: invalid-proto3 }
     Refuse('labelled map',
       'A map field cannot carry `repeated` or `optional`. A map is already a '
       + 'repeated entry list, and has no presence to express. Drop the label.');
@@ -796,6 +815,7 @@ begin
     LField.Number := ExpectNumber;
 
     if LField.Number <= 0 then
+      { BLOCKED-BY: invalid-proto3 }
       RefuseAt(LTypeLine, LTypeCol, IntToStr(LField.Number),
         Format('Field %s has number %d. Proto field numbers start at 1.',
           [QuotedStr(LField.Name), LField.Number]));
@@ -803,6 +823,7 @@ begin
     { 19000-19999 is reserved for the protobuf implementation itself.
       Accepting one would produce a schema protoc refuses. }
     if (LField.Number >= 19000) and (LField.Number <= 19999) then
+      { BLOCKED-BY: invalid-proto3 }
       RefuseAt(LTypeLine, LTypeCol, IntToStr(LField.Number),
         Format('Field %s uses number %d, inside the 19000-19999 range ' +
                'reserved by protobuf itself.',
@@ -810,6 +831,7 @@ begin
 
     LExisting := AMsg.FindByNumber(LField.Number);
     if LExisting <> nil then
+      { BLOCKED-BY: invalid-proto3 }
       RefuseAt(LTypeLine, LTypeCol, IntToStr(LField.Number),
         Format('Field %s reuses number %d, already taken by %s on line %d. ' +
                'Duplicate numbers would emit two properties with the same ' +
@@ -877,6 +899,7 @@ begin
       first member was not the proto zero would silently shift every ordinal,
       because the serializer maps enums by ORDINAL. }
     if (LEnum.Values.Count > 0) and (LEnum.Values[0].Number <> 0) then
+      { BLOCKED-BY: invalid-proto3 }
       RefuseAt(LEnum.Values[0].Line, 1, LEnum.Name,
         Format('proto3 requires the first value of enum %s to be 0, but %s ' +
                'is %d. The serializer maps enums by ordinal, so a non-zero ' +
@@ -1017,6 +1040,7 @@ begin
       Fail('a second syntax statement — it must appear once, first');
 
     if IsIdent('extend') or IsIdent('extensions') then
+      { BLOCKED-BY: out-of-scope-proto2 }
       Refuse(Tok.Value, 'Extensions are proto2. proto3 has no extension ranges.');
 
     Fail(Format('unexpected %s at file scope — expected package, import, ' +

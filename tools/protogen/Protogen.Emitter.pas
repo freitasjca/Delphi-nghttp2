@@ -342,11 +342,13 @@ begin
           { Two DIFFERENT reasons, and saying the wrong one sends the reader to
             the wrong place. Only the first is invalid proto3. }
           if LA.Values[VI].Name = LA.Values[VJ].Name then
+            { BLOCKED-BY: invalid-proto3 }
             raise EEmitError.CreateFmt(
               'Enum %s declares the value %s twice. proto3 forbids that too, '
               + 'so the schema is invalid rather than merely unrepresentable.',
               [QuotedStr(LA.Name), QuotedStr(LA.Values[VI].Name)])
           else
+            { BLOCKED-BY: pascal-language }
             raise EEmitError.CreateFmt(
               'Enum %s declares %s and %s, which differ ONLY IN CASE. That is '
               + 'legal proto3 - identifiers there are case-sensitive, and with '
@@ -548,6 +550,7 @@ var
 begin
   LEntry := FFile.FindMessage(AField.TypeName);
   if (LEntry = nil) or (LEntry.Fields.Count < 2) then
+    { BLOCKED-BY: internal-invariant }
     raise EEmitError.CreateFmt(
       'Map field %s names entry message %s, which is missing or malformed. '
       + 'The parser synthesises it with key=1 and value=2; this should be '
@@ -561,6 +564,7 @@ var
 begin
   LEntry := FFile.FindMessage(AField.TypeName);
   if (LEntry = nil) or (LEntry.Fields.Count < 2) then
+    { BLOCKED-BY: internal-invariant }
     raise EEmitError.CreateFmt(
       'Map field %s names entry message %s, which is missing or malformed.',
       [QuotedStr(AField.Name), QuotedStr(AField.TypeName)]);
@@ -698,6 +702,7 @@ begin
       LOther     := AMsg.Fields[J];
       LOtherName := PascalFieldName(LOther.Name, LOtherRenamed);
       if SameText(LOtherName, HasBitName(LPropName)) then
+        { BLOCKED-BY: user-must-choose }
         raise EEmitError.CreateFmt(
           'Field %s is `optional`, so the generator emits a has-bit named ' +
           '%s - but field %s already takes that name. Pascal is ' +
@@ -726,6 +731,7 @@ begin
         or SameText(LOtherName, 'Get'   + LPropName)
         or SameText(LOtherName, 'Set'   + LPropName)
         or SameText(LOtherName, 'Clear' + LPropName) then
+        { BLOCKED-BY: user-must-choose }
         raise EEmitError.CreateFmt(
           'Field %s is a map, so the generator emits %sCount, Has%s, Get%s, ' +
           'Set%s and Clear%s - but field %s already takes one of those names. '
@@ -1298,6 +1304,7 @@ begin
   else
     // Group B (plan 6.1): wire layer has these, but TProtoMemberAttribute
     // carries only a tag, so no property can select an alternate wire form.
+    { BLOCKED-BY: no-wire-form-selector }
     raise EEmitError.CreateFmt(
       'Cannot emit %s: no wire-form selector in TProtoMemberAttribute. ' +
       'Structural gap -- see plans/horse-grpc-codegen.md section 6.1.',

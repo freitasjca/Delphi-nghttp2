@@ -7,6 +7,9 @@
 #
 #  Stages:
 #    0  brace-scan.py                   lint          (advisory)
+#    0b refusal-tags.py                 lint          (advisory; every
+#                                                      refusal names what
+#                                                      it depends on)
 #    1  Nghttp2ProtobufTests            build + run   (gates)
 #    2  Nghttp2ProtobufNegativeTests    build + run   (gates)
 #    2b Nghttp2GrpcFramingTests         build + run   (gates; gRPC length-prefix
@@ -157,6 +160,28 @@ if command -v python3 > /dev/null 2>&1 && [[ -f "$HERE/brace-scan.py" ]]; then
       echo "  (advisory - the compile below is the gate)"
       echo
     fi
+  fi
+fi
+
+# ── 0b · refusal inventory (advisory) ───────────────────────────────────────
+# Every refusal names the precondition it depends on, so that removing a
+# limitation surfaces the refusals that cited it. Exists because four refusals
+# were found on 2026-09-07 whose stated reasoning was correct while their
+# verdict no longer followed - the worst had outlived its cause by four
+# releases and cost 19% of the corpus.
+#
+# Advisory: an untagged refusal is a documentation gap, not a broken build.
+# The value is the printed LIVE list, which is what a reader is meant to check
+# after adding a capability.
+if command -v python3 > /dev/null 2>&1 && [[ -f "$HERE/refusal-tags.py" ]]; then
+  RT_OUT=$(python3 "$HERE/refusal-tags.py" \
+             "$HERE/../tools/protogen/Protogen.Emitter.pas" \
+             "$HERE/../tools/protogen/Protogen.Parser.pas" 2>&1)
+  if [[ "$RT_OUT" == *"!!"* ]]; then
+    echo "── refusal inventory ──────────────────────────────────────────────"
+    echo "$RT_OUT" | sed 's/^/  /'
+    echo "  (advisory)"
+    echo
   fi
 fi
 
