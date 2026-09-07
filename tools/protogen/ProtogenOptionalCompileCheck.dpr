@@ -97,6 +97,8 @@ var
   GOwn, GOwnDst: TOwnerMsg;      // PROTOGEN-DTOR
   GMap, GMapDst: TMapMsg;        // MAP-1
   GWkt, GWktDst: TWktMsg;        // STRUCT-1
+  GFwd, GFwdDst: TUsesLater;     // FORWARD-1
+  GSelf: TSelfRef;
   GAnyOk: Boolean;               // ANY-1
   GAnyErr: string;
   GPay: TPayload;
@@ -727,6 +729,67 @@ begin
           GAnyOk, GAnyErr);
     TProtoAnyRegistry.Clear;
   end;
+
+  // ── FORWARD-1 · a message referring to one declared LATER ────────────────
+  //  That this unit COMPILED is most of the result. Before FORWARD-1 the
+  //  generated Pascal named TDeclaredLater before it was declared, and no
+  //  amount of text comparison notices that - only a compiler does. The checks
+  //  below confirm the forward resolves to the same class rather than merely
+  //  parsing.
+  WriteLn;
+  WriteLn('-- FORWARD-1: forward-declared message references');
+
+  GOk  := False;
+  GErr := '';
+  try
+    GFwd    := TUsesLater.Create;
+    GFwdDst := TUsesLater.Create;
+    try
+      GFwd.tag   := 3;
+      GFwd.later := TDeclaredLater.Create;
+      GFwd.later.note := 'declared after the message that uses it';
+      GFwd.many  := [TDeclaredLater.Create, TDeclaredLater.Create];
+      GFwd.many[0].note := 'first';
+      GFwd.many[1].note := 'second';
+
+      GBytes := TProtoSerializer.Serialize(GFwd);
+      TProtoSerializer.Deserialize(GBytes, GFwdDst);
+
+      GOk := (GFwdDst.later <> nil)
+             and (GFwdDst.later.note = 'declared after the message that uses it')
+             and (Length(GFwdDst.many) = 2)
+             and (GFwdDst.many[1].note = 'second')
+             and (GFwdDst.tag = 3);
+    finally
+      GFwd.Free;      { the generated destructor frees both shapes }
+      GFwdDst.Free;
+    end;
+  except
+    on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+  end;
+  Check('a forward-declared reference round-trips, singular and repeated',
+        GOk, GErr);
+
+  { A self-reference gets no forward - the class is in scope inside its own
+    declaration. Emitting one anyway would be a duplicate declaration and would
+    not have compiled, so reaching here is the check; this confirms the field
+    actually works. }
+  GOk  := False;
+  GErr := '';
+  try
+    GSelf := TSelfRef.Create;
+    try
+      GSelf.id   := 1;
+      GSelf.next := TSelfRef.Create;
+      GSelf.next.id := 2;
+      GOk := (GSelf.next <> nil) and (GSelf.next.id = 2);
+    finally
+      GSelf.Free;   { frees the nested instance too }
+    end;
+  except
+    on E: Exception do GErr := E.ClassName + ': ' + E.Message;
+  end;
+  Check('a self-referencing message compiles and nests', GOk, GErr);
 
   WriteLn;
   WriteLn(Format('[ProtogenOptional] %d passed, %d failed', [GPass, GFail]));

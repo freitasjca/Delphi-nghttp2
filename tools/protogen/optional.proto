@@ -166,3 +166,34 @@ message WktMsg {
   google.protobuf.Timestamp t   = 4;
   google.protobuf.Any       a   = 5;
 }
+
+// FORWARD-1. The shape that generated non-compiling Pascal until 2026-09-07:
+// a message referring to one declared LATER in the file. Ordinary proto3 -
+// declaration order carries no meaning and protoc accepts it - but classes are
+// emitted in list order, so TUsesLater named TDeclaredLater before it existed.
+//
+// Here rather than in an emitter test because the emitter tests compare TEXT.
+// A forward declaration that is present but misplaced, or present without a
+// completing declaration, passes a substring check and fails a compiler. This
+// fixture is generated and COMPILED, which is the only check that can tell.
+//
+// ZERO of 7301 googleapis schemas hit this. That is a fact about googleapis -
+// one organisation declaring in dependency order by house style - not about
+// proto3, and it is why the corpus never surfaced it.
+message UsesLater {
+  int32         tag   = 1;
+  DeclaredLater later = 2;
+  repeated DeclaredLater many = 3;
+}
+
+message DeclaredLater {
+  string note = 1;
+}
+
+// A self-reference needs NO forward: the class name is already in scope inside
+// its own declaration. Present so that emitting one anyway would be caught -
+// a duplicate declaration does not compile either.
+message SelfRef {
+  int32   id   = 1;
+  SelfRef next = 2;
+}

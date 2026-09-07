@@ -51,6 +51,9 @@ type
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitTypeSection;
+    // FORWARD-1 — class forwards for messages referenced before they are declared
+    function  MessageIndex(AMsg: TProtoMessageNode): Integer;
+    procedure EmitForwardDecls;
     procedure EmitEnum(AEnum: TProtoEnumNode);
     procedure EmitMessage(AMsg: TProtoMessageNode);
     // PRESENCE-1 — proto3 `optional`
@@ -208,6 +211,90 @@ begin
   W;
 end;
 
+{ FORWARD-1. Index of a message in the file's list, or -1.
+
+  A linear scan rather than a dictionary: the list is small, and this runs once
+  per message-typed field at generation time, never at run time. }
+function TMessagesEmitter.MessageIndex(AMsg: TProtoMessageNode): Integer;
+var
+  I: Integer;
+begin
+  for I := 0 to FFile.Messages.Count - 1 do
+    if FFile.Messages[I] = AMsg then Exit(I);
+  Result := -1;
+end;
+
+// FORWARD-1. Emits `TFoo = class;` for every message REFERENCED BEFORE IT IS
+// DECLARED.
+//
+// Declaration order in a .proto carries no meaning - protoc does not care, and
+// a schema is free to write
+//
+//     message A { B b = 1; }
+//     message B { }
+//
+// Pascal does care: classes are emitted in list order, so TA would name TB
+// before TB exists. Until FORWARD-1 that generated a unit the compiler rejects,
+// from a schema protoc accepts.
+//
+// ZERO of the 7301 googleapis schemas in corpus-check.sh hit this, which is why
+// it went unnoticed - and that fact is worth distrusting rather than trusting.
+// googleapis is one organisation with a house style that happens to declare in
+// dependency order. A user writing their own .proto has no such discipline, so
+// the corpus is systematically blind here: it measures what Google writes, not
+// what a first-time user writes.
+//
+// Only what is NEEDED is emitted, for two reasons. A forward nobody needs is
+// noise in generated code someone has to read. And the C2 gate compares emitted
+// output byte-for-byte against the hand-written samples: those are all scalars,
+// so they emit no forwards and the comparison keeps meaning what it meant.
+//
+// Two cases deliberately produce nothing:
+//   - a SELF-reference, `message Node { Node next = 1; }`. The class name is
+//     already in scope inside its own declaration.
+//   - a bundled well-known type. TProtobufTimestamp is declared in another
+//     unit entirely; a forward here would be a second, conflicting declaration.
+procedure TMessagesEmitter.EmitForwardDecls;
+var
+  I, J, K: Integer;
+  LMsg, LTarget: TProtoMessageNode;
+  LField: TProtoFieldNode;
+  LNeed: TArray<Boolean>;
+  LAny: Boolean;
+begin
+  if FFile.Messages.Count = 0 then Exit;
+  SetLength(LNeed, FFile.Messages.Count);
+
+  for I := 0 to FFile.Messages.Count - 1 do
+  begin
+    LMsg := FFile.Messages[I];
+    for J := 0 to LMsg.Fields.Count - 1 do
+    begin
+      LField := LMsg.Fields[J];
+      if not IsMessageField(LField) then Continue;
+      if WellKnownPascalClass(LField.TypeName) <> '' then Continue;
+      LTarget := FFile.FindMessage(LField.TypeName);
+      if LTarget = nil then Continue;
+      K := MessageIndex(LTarget);
+      { Strictly LATER only. K = I is a self-reference and needs nothing. }
+      if K > I then LNeed[K] := True;
+    end;
+  end;
+
+  LAny := False;
+  for I := 0 to High(LNeed) do
+    if LNeed[I] then LAny := True;
+  if not LAny then Exit;
+
+  W('  // Forward declarations - these messages are referenced by a message');
+  W('  // declared earlier in the file. Order in a .proto is not significant;');
+  W('  // in Pascal it is.');
+  for I := 0 to High(LNeed) do
+    if LNeed[I] then
+      W('  ' + PascalTypeName(FFile.Messages[I].QualifiedName) + ' = class;');
+  W;
+end;
+
 procedure TMessagesEmitter.EmitTypeSection;
 var
   I: Integer;
@@ -215,6 +302,8 @@ begin
   if (FFile.Enums.Count = 0) and (FFile.Messages.Count = 0) then
     Exit;
   W('type');
+  { FORWARD-1 first, so a forward precedes every possible use. }
+  EmitForwardDecls;
   for I := 0 to FFile.Enums.Count - 1 do
     EmitEnum(FFile.Enums[I]);
   for I := 0 to FFile.Messages.Count - 1 do

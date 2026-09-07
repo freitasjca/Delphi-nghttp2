@@ -582,6 +582,93 @@ begin
   Result := Pos(LowerCase(ANeedle), LowerCase(AHaystack)) > 0;
 end;
 
+
+// ── FORWARD-1: class forwards for out-of-order message references ───────────
+procedure TestEmitForwardDecls;
+const
+  { The shape that produced non-compiling Pascal until FORWARD-1. Ordinary
+    proto3 - declaration order carries no meaning and protoc accepts it. }
+  CForward =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message A { B b = 1; }'#10 +
+    'message B { int32 id = 1; }';
+  { The control. Every existing sample looks like this, which is why the gap
+    survived: with no forward reference there is nothing to emit, and the
+    byte-for-byte sample comparison keeps meaning what it meant. }
+  CInOrder =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message B { int32 id = 1; }'#10 +
+    'message A { B b = 1; }';
+  { A class name is already in scope inside its own declaration. }
+  CSelf =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message Node { Node next = 1; int32 id = 2; }';
+  { A bundled WKT is declared in ANOTHER UNIT - a forward here would be a
+    second, conflicting declaration. }
+  CWkt =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'import "google/protobuf/timestamp.proto";'#10 +
+    'message M { google.protobuf.Timestamp t = 1; }';
+  { Repeated and map-valued references need one too - the reference is through
+    TArray<T>, but T still has to exist. }
+  CRepeated =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message A { repeated B many = 1; }'#10 +
+    'message B { int32 id = 1; }';
+var
+  LSrc, LTail: string;
+  LFwd, LDecl: Integer;
+begin
+  WriteLn;
+  WriteLn('-- FORWARD-1: forward declarations for out-of-order references');
+
+  LSrc := EmitSource(CForward);
+  Check('out-of-order reference emits a forward', Has(LSrc, 'TB = class;'));
+
+  { Position is the whole point. A forward emitted AFTER the class that needs
+    it compiles no better than none at all, and a substring test alone would
+    pass either way. }
+  LFwd  := Pos('tb = class;', LowerCase(LSrc));
+  LDecl := Pos('ta = class', LowerCase(LSrc));
+  Check('the forward precedes the class that needs it',
+    (LFwd > 0) and (LDecl > 0) and (LFwd < LDecl));
+
+  { And the full declaration must still be emitted - a forward with no body is
+    a link error rather than a compile error, which is worse.
+
+    Written as "search the text AFTER the forward" rather than comparing two
+    Pos results. The obvious version,
+
+      Pos('tb = class', S) <> Pos('tb = class;', S)
+
+    can NEVER pass: Pos returns the FIRST match and `tb = class` is a PREFIX of
+    `tb = class;`, so both land on the forward and the comparison is always
+    False. It failed on its first run against correct output - the emitter was
+    right and the assertion was impossible. }
+  LTail := Copy(LowerCase(LSrc), LFwd + Length('tb = class;'), MaxInt);
+  Check('TB is still fully declared after its forward',
+    Pos('tb = class', LTail) > 0);
+
+  LSrc := EmitSource(CInOrder);
+  Check('an IN-ORDER file emits no forward at all',
+    not Has(LSrc, 'TB = class;'));
+  Check('  and no forward-declaration comment block',
+    not Has(LSrc, 'Forward declarations'));
+
+  LSrc := EmitSource(CSelf);
+  Check('a SELF-reference emits no forward', not Has(LSrc, 'TNode = class;'));
+  Check('  but the class is still emitted', Has(LSrc, 'TNode = class'));
+
+  LSrc := EmitSource(CWkt);
+  Check('a bundled WKT gets no forward',
+    not Has(LSrc, 'TProtobufTimestamp = class;'));
+
+  LSrc := EmitSource(CRepeated);
+  Check('a REPEATED out-of-order reference emits one too',
+    Has(LSrc, 'TB = class;'));
+end;
+
+
 procedure TestEmitOptional;
 const
   CProto =
@@ -672,6 +759,7 @@ begin
   TestScalarType;
   TestTypeName;
   TestEmitOptional;
+  TestEmitForwardDecls;
   TestEmitEcho;
   TestEmitGreeter;
   WriteLn;
