@@ -146,8 +146,9 @@ echo "compiling:  $PICKED"
 echo
 
 # ── Generate + compile ───────────────────────────────────────────────────────
-OK=0; GENFAIL=0; COMPFAIL=0; N=0
+OK=0; GENFAIL=0; COMPFAIL=0; CRASH=0; N=0
 : > "$OUT/failures.txt"
+: > "$OUT/crashes.txt"
 
 while IFS= read -r proto; do
   N=$(( N + 1 ))
@@ -179,11 +180,26 @@ while IFS= read -r proto; do
        "$UNIT" > "$D/build.log" 2>&1; then
     OK=$(( OK + 1 ))
   else
-    COMPFAIL=$(( COMPFAIL + 1 ))
-    {
-      echo "=== $proto"
-      grep -E "Error|Fatal" "$D/build.log" | head -4 | sed 's/^/    /'
-    } >> "$OUT/failures.txt"
+    # A COMPILER CRASH is not a rejection of our output. FPC dies on some of
+    # what we generate - "Internal error 2015071505", "Compilation raised
+    # exception internally", "List index exceeds bounds" - and counting those
+    # as emitter defects overstated the number by 3.5x on the first full sweep
+    # (76 reported, 22 real). Long identifiers correlate with it; see MAX_IDENT
+    # in Protogen.Emitter.pas, which exists because of this same FPC behaviour.
+    if grep -qE "Internal error|raised exception internally|List index exceeds bounds" \
+         "$D/build.log"; then
+      CRASH=$(( CRASH + 1 ))
+      { echo "=== [compiler crash] $proto"
+        grep -E "Internal error|raised exception|List index" "$D/build.log" \
+          | head -2 | sed 's/^/    /'
+      } >> "$OUT/crashes.txt"
+    else
+      COMPFAIL=$(( COMPFAIL + 1 ))
+      {
+        echo "=== $proto"
+        grep -E "Error|Fatal" "$D/build.log" | head -4 | sed 's/^/    /'
+      } >> "$OUT/failures.txt"
+    fi
   fi
 done < "$OUT/selected.txt"
 
@@ -193,6 +209,7 @@ printf "  attempted        %5d\n" "$PICKED"
 printf "  COMPILED         %5d\n" "$OK"
 printf "  refused / unresolved imports %5d   (not an emitter defect)\n" "$GENFAIL"
 printf "  DID NOT COMPILE  %5d   <- emitter defects\n" "$COMPFAIL"
+printf "  compiler crashed %5d   (FPC fell over; not our output being rejected)\n" "$CRASH"
 echo "==========================================================="
 
 # WHY the refused ones were refused. This bucket is where a systematic problem
@@ -209,6 +226,17 @@ if [[ $GENFAIL -gt 0 ]]; then
     | sed 's/[0-9][0-9]*/N/g; s/"[^"]*"/"X"/g' \
     | cut -c1-100 \
     | sort | uniq -c | sort -rn | head -8 | sed 's/^/  /'
+fi
+
+if [[ $CRASH -gt 0 ]]; then
+  echo
+  echo "-- FPC crashed on these ----------------------------------"
+  echo "   Counted apart because the compiler DIED rather than"
+  echo "   reporting our output invalid. Still worth reading: long"
+  echo "   generated identifiers correlate with it, and IMPORT-1"
+  echo "   made both unit names and qualified references longer."
+  head -12 "$OUT/crashes.txt" | sed 's/^/  /'
+  echo "   full list: $OUT/crashes.txt"
 fi
 
 if [[ $COMPFAIL -gt 0 ]]; then
