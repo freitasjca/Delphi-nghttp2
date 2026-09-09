@@ -182,6 +182,24 @@ type
     // Dots are stripped: 'Outer.Inner' -> 'TOuterInner'.
     class function PascalTypeName(const AProtoQName: string): string;
 
+    { FLATTEN-1. The Pascal type name for a declaration IN A GIVEN FILE.
+
+      PascalTypeName strips dots, so a nested `Control.Family` and a top-level
+      `ControlFamily` both come out `TControlFamily` — a duplicate identifier,
+      and the largest real defect class in the first full corpus sweep
+      (11 schemas; `TTemperatureUnit` is another).
+
+      When a flattened name collides, the NESTED one restores the structure
+      the flattening removed (`TControl_Family`) and the top-level one keeps
+      its natural name. Only the ambiguous ones move, which is the same
+      principle ENUMCOLLIDE-1 follows for enum values.
+
+      Takes the file because the answer depends on what else that file
+      declares — and a cross-file reference must use the name as computed in
+      the DECLARING file, not the referring one. }
+    class function TypeNameIn(AFile: TProtoFileNode;
+      const AQualifiedName: string): string;
+
     // The complete Delphi type for a field, including TArray<> for repeated.
     // Resolves message/enum refs through AFile.
     class function PascalFieldType(AField: TProtoFieldNode;
@@ -546,7 +564,7 @@ begin
   W('  // in Pascal it is.');
   for I := 0 to High(LNeed) do
     if LNeed[I] then
-      W('  ' + PascalTypeName(FFile.Messages[I].QualifiedName) + ' = class;');
+      W('  ' + TypeNameIn(FFile, FFile.Messages[I].QualifiedName) + ' = class;');
   W;
 end;
 
@@ -744,7 +762,7 @@ var
   I: Integer;
   LLine: string;
 begin
-  W('  ' + PascalTypeName(AEnum.QualifiedName) + ' = (');
+  W('  ' + TypeNameIn(FFile, AEnum.QualifiedName) + ' = (');
   for I := 0 to AEnum.Values.Count - 1 do
   begin
     LLine := '    ' + EnumValueName(AEnum, I) + ' = ' +
@@ -1056,7 +1074,7 @@ var
   LClass, LRenamed, LName: string;
   LDup: Boolean;
 begin
-  LClass := PascalTypeName(AMsg.QualifiedName);
+  LClass := TypeNameIn(FFile, AMsg.QualifiedName);
   SetLength(Result, 1);
   Result[0] := CaseValueName(LClass, AGroup, '');
   for I := 0 to AMsg.Fields.Count - 1 do
@@ -1088,7 +1106,7 @@ var
 begin
   LGroups := OneofGroups(AMsg);
   if Length(LGroups) = 0 then Exit;
-  LClass := PascalTypeName(AMsg.QualifiedName);
+  LClass := TypeNameIn(FFile, AMsg.QualifiedName);
 
   for G := 0 to High(LGroups) do
   begin
@@ -1177,7 +1195,7 @@ begin
   EmitOneofCaseEnums(AMsg);
 
   W('  [TGrpcMessage]');
-  W('  ' + PascalTypeName(AMsg.QualifiedName) + ' = class');
+  W('  ' + TypeNameIn(FFile, AMsg.QualifiedName) + ' = class');
   W('  private');
 
   { TWO passes, and the split is a language requirement rather than a style
@@ -1236,7 +1254,7 @@ begin
   LGroups := OneofGroups(AMsg);
   for I := 0 to High(LGroups) do
     W('    function Get' + CapFirst(LGroups[I]) + 'Case: ' +
-      CaseEnumName(PascalTypeName(AMsg.QualifiedName), LGroups[I]) + ';');
+      CaseEnumName(TypeNameIn(FFile, AMsg.QualifiedName), LGroups[I]) + ';');
 
   { PROTOGEN-DTOR. The codec ALLOCATES submessage instances during decode
     (`ASubmessageClass.Create`) and its own comment states the contract: "the
@@ -1280,7 +1298,7 @@ begin
     begin
       W('    procedure Clear' + CapFirst(LGroups[I]) + ';');
       W('    property ' + CapFirst(LGroups[I]) + 'Case: ' +
-        CaseEnumName(PascalTypeName(AMsg.QualifiedName), LGroups[I]) +
+        CaseEnumName(TypeNameIn(FFile, AMsg.QualifiedName), LGroups[I]) +
         ' read Get' + CapFirst(LGroups[I]) + 'Case;');
     end;
   end;
@@ -1342,7 +1360,7 @@ begin
   for M := 0 to FFile.Messages.Count - 1 do
   begin
     LMsg   := FFile.Messages[M];
-    LClass := PascalTypeName(LMsg.QualifiedName);
+    LClass := TypeNameIn(FFile, LMsg.QualifiedName);
     for I := 0 to LMsg.Fields.Count - 1 do
     begin
       LField := LMsg.Fields[I];
@@ -1454,7 +1472,7 @@ var
   LClass, LProp, LName, LRenamed, LK, LV, LEntryCls: string;
   LOwnsValue: Boolean;
 begin
-  LClass := PascalTypeName(AMsg.QualifiedName);
+  LClass := TypeNameIn(FFile, AMsg.QualifiedName);
   for I := 0 to AMsg.Fields.Count - 1 do
   begin
     LField := AMsg.Fields[I];
@@ -1463,7 +1481,12 @@ begin
     LName     := CapFirst(LProp);   // must match EmitMapAccessorDecls exactly
     LK        := MapKeyType(LField);
     LV        := MapValueType(LField);
-    LEntryCls := PascalTypeName(LField.TypeName);
+    { Named from the entry message's own DECLARATION, not from the reference,
+      so it agrees with how that class was emitted — FLATTEN-1 can rename it,
+      and a reference computed independently would then name a class that does
+      not exist. The lookup cannot fail: the parser synthesises the entry. }
+    LEntryCls := TypeNameIn(FFile,
+      FFile.FindMessage(LField.TypeName).QualifiedName);
     { A message-VALUED map owns an instance per entry, so Set has to dispose of
       what it displaces. Read off the entry's own `value` field for the same
       reason MapValueType is: one place says what the value is. }
@@ -1561,7 +1584,7 @@ var
   LNeedsLoopVar: Boolean;
 begin
   if not OwnsMessages(AMsg) then Exit;
-  LClass := PascalTypeName(AMsg.QualifiedName);
+  LClass := TypeNameIn(FFile, AMsg.QualifiedName);
 
   LNeedsLoopVar := False;
   for I := 0 to AMsg.Fields.Count - 1 do
@@ -1616,7 +1639,7 @@ var
 begin
   LGroups := OneofGroups(AMsg);
   if Length(LGroups) = 0 then Exit;
-  LClass := PascalTypeName(AMsg.QualifiedName);
+  LClass := TypeNameIn(FFile, AMsg.QualifiedName);
 
   for G := 0 to High(LGroups) do
   begin
@@ -1806,6 +1829,59 @@ begin
   end;
 end;
 
+class function TMessagesEmitter.TypeNameIn(AFile: TProtoFileNode;
+  const AQualifiedName: string): string;
+var
+  LBase: string;
+  I: Integer;
+  LHash: Cardinal;
+  K: Integer;
+
+  // Does any OTHER declaration in this file flatten to ANAME?
+  function TakenByAnother(const AName: string): Boolean;
+  var
+    J: Integer;
+  begin
+    Result := True;
+    for J := 0 to AFile.Messages.Count - 1 do
+      if not SameText(AFile.Messages[J].QualifiedName, AQualifiedName)
+        and SameText(PascalTypeName(AFile.Messages[J].QualifiedName), AName) then
+        Exit;
+    for J := 0 to AFile.Enums.Count - 1 do
+      if not SameText(AFile.Enums[J].QualifiedName, AQualifiedName)
+        and SameText(PascalTypeName(AFile.Enums[J].QualifiedName), AName) then
+        Exit;
+    Result := False;
+  end;
+
+begin
+  LBase := PascalTypeName(AQualifiedName);
+  if AFile = nil then
+    Exit(LBase);
+
+  // A top-level name has nothing to restore, and is the one that keeps its
+  // spelling when a nested sibling collides with it.
+  if Pos('.', AQualifiedName) = 0 then
+    Exit(LBase);
+
+  if not TakenByAnother(LBase) then
+    Exit(LBase);
+
+  // Put the separators back: 'Control.Family' -> 'TControl_Family'.
+  Result := 'T' + StringReplace(AQualifiedName, '.', '_', [rfReplaceAll]);
+
+  { Last resort. A file could declare a type whose own name already contains
+    the underscores this produces, in which case restoring them collides
+    again. Hash the qualified name rather than loop. }
+  if TakenByAnother(Result) then
+  begin
+    LHash := 2166136261;                                   // FNV-1a
+    for K := 1 to Length(AQualifiedName) do
+      LHash := (LHash xor Ord(AQualifiedName[K])) * 16777619;
+    Result := Result + '_' + IntToHex(LHash, 8);
+  end;
+end;
+
 class function TMessagesEmitter.PascalTypeName(const AProtoQName: string): string;
 var
   LName: string;
@@ -1851,7 +1927,16 @@ begin
   if not LRef.Found then
     Exit;   // '' — the caller's same-file rule handles nested-type scoping
 
-  if LRef.Msg <> nil then
+  { The declaring file's naming, not the referring file's: FLATTEN-1
+    disambiguation depends on what the DECLARING file also declares. }
+  if LRef.Entry <> nil then
+  begin
+    if LRef.Msg <> nil then
+      Result := TypeNameIn(LRef.Entry.Node, LRef.Msg.QualifiedName)
+    else if LRef.Enum <> nil then
+      Result := TypeNameIn(LRef.Entry.Node, LRef.Enum.QualifiedName);
+  end
+  else if LRef.Msg <> nil then
     Result := PascalTypeName(LRef.Msg.QualifiedName)
   else if LRef.Enum <> nil then
     Result := PascalTypeName(LRef.Enum.QualifiedName);
@@ -1885,12 +1970,12 @@ begin
       // nested types use their full flattened form: 'Outer.Inner' -> 'TOuterInner'.
       LMsg := AFile.FindMessage(AField.TypeName);
       if LMsg <> nil then
-        LBase := PascalTypeName(LMsg.QualifiedName)
+        LBase := TypeNameIn(AFile, LMsg.QualifiedName)
       else
       begin
         LEnum := AFile.FindEnum(AField.TypeName);
         if LEnum <> nil then
-          LBase := PascalTypeName(LEnum.QualifiedName)
+          LBase := TypeNameIn(AFile, LEnum.QualifiedName)
         else
           LBase := PascalTypeName(AField.TypeName);  // best effort for forward refs
       end;

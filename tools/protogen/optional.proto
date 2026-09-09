@@ -301,3 +301,32 @@ message IntrinsicNames {
   string high    = 3;            // -> high   (control)
   string copy    = 4;            // -> copy   (control)
 }
+
+// FLATTEN-1 regression. PascalTypeName strips dots, so a type nested in a
+// message and a top-level type can collide after flattening:
+//
+//   Control.Family  -> TControlFamily
+//   ControlFamily   -> TControlFamily     <- duplicate identifier
+//
+// The NESTED one restores the separator (TControl_Family); the top-level one
+// keeps its natural name, so only the ambiguous side moves. Both must appear
+// in the generated unit and both must be usable as field types.
+//
+// The largest real defect class in the first full corpus sweep -- 11 schemas,
+// google/cloud/auditmanager and cloudsecuritycompliance among them.
+message Control {
+  enum Family {
+    FAMILY_UNSET = 0;
+    NETWORKING   = 1;
+  }
+  Family family = 1;
+}
+
+message ControlFamily {
+  string label = 1;
+}
+
+message UsesBoth {
+  Control.Family nested_one   = 1;   // -> TControl_Family
+  ControlFamily  top_level    = 2;   // -> TControlFamily
+}
