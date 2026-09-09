@@ -721,6 +721,7 @@ begin
   LKeyField.Number   := 1;
   LKeyField.Line     := LLine;
   LKeyField.Column   := LCol;
+  LKeyField.Owner := LEntry;
   LEntry.Fields.Add(LKeyField);
 
   LValField := TProtoFieldNode.Create;
@@ -730,6 +731,7 @@ begin
   LValField.Number   := 2;
   LValField.Line     := LLine;
   LValField.Column   := LCol;
+  LValField.Owner := LEntry;
   LEntry.Fields.Add(LValField);
 
   FFile.Messages.Add(LEntry);
@@ -744,6 +746,7 @@ begin
   LMapField.Line       := LLine;
   LMapField.Column     := LCol;
   LMapField.IsMap      := True;
+  LMapField.Owner := AMsg;
   AMsg.Fields.Add(LMapField);
 end;
 
@@ -923,6 +926,7 @@ begin
     LField.Free;
     raise;
   end;
+  LField.Owner := AMsg;
   AMsg.Fields.Add(LField);
 end;
 

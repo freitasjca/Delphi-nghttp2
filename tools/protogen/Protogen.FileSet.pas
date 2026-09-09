@@ -112,11 +112,22 @@ type
     // Raises EProtoImportError for a missing import or an import cycle.
     procedure LoadRoot(const AInputFile: string);
 
-    // Resolve a type reference as written in AFrom (bare, package-relative or
-    // fully qualified with a leading dot) against AFrom and everything it can
-    // see. Result.Found is False when nothing matches.
+    // Resolve a type reference as written in AFrom against AFrom and
+    // everything it can see. Result.Found is False when nothing matches.
+    //
+    // AScope is the QualifiedName of the message the reference sits INSIDE
+    // ('' at file scope). proto resolution is innermost-outward, and without
+    // the scope a bare name cannot be resolved correctly when two messages
+    // each nest a type of the same name. google/cloud/gkehub does exactly
+    // that: MembershipSpec nests an ENUM called ControlPlaneManagement and
+    // MembershipState nests a MESSAGE of the same name, and each refers to
+    // its own by the bare name. Picking by simple name alone silently binds
+    // one of them to the other's type.
+    //
+    // (Written with // deliberately -- the proto snippet this replaced put
+    // braces inside a brace comment. See tests/brace-scan.py.)
     function ResolveType(AFrom: TProtoFileEntry;
-      const ATypeName: string): TProtoTypeRef;
+      const ATypeName: string; const AScope: string = ''): TProtoTypeRef;
 
     // Files AFrom may reference: itself, its direct imports, and anything
     // reachable through a chain of `import public`.
@@ -490,7 +501,7 @@ begin
 end;
 
 function TProtoFileSet.ResolveType(AFrom: TProtoFileEntry;
-  const ATypeName: string): TProtoTypeRef;
+  const ATypeName: string; const AScope: string): TProtoTypeRef;
 var
   LVisible: TArray<TProtoFileEntry>;
   LName:    string;
@@ -501,6 +512,10 @@ var
   // and threading two out-params through each would say nothing extra.
   LResMsg:  TProtoMessageNode;
   LResEnum: TProtoEnumNode;
+  LPkg:     string;
+  LTrim:    string;
+  LDot:     Integer;
+  LFound:   Boolean;
 
   // Match AWanted — a FULLY QUALIFIED proto name — against one file.
   // Reports through out-params, not through the enclosing Result: inside a
@@ -590,13 +605,41 @@ begin
     Exit;
   end;
 
-  // proto scoping is innermost-outward. The two cases that occur in practice,
-  // in order: a name written fully qualified, then one relative to the
-  // referring file's own package.
-  if not Sweep(LName) then
-    if (AFrom.Node.PackageName = '')
-      or (not Sweep(AFrom.Node.PackageName + '.' + LName)) then
-      Exit;
+  { Innermost-outward, the way protoc resolves. For `N` written inside
+    `pkg.A.B`, the candidates are pkg.A.B.N, then pkg.A.N, then pkg.N, then N
+    as an already-qualified name — first hit wins, so a type nested in the
+    ENCLOSING message beats a same-named type nested in a sibling.
+
+    Trying the bare name first (what this did before) inverts that: the
+    outermost match wins and a nested reference silently binds to whichever
+    declaration the file happens to list first. }
+  LPkg   := AFrom.Node.PackageName;
+  LTrim  := AScope;
+  LFound := False;
+  while (not LFound) and (LTrim <> '') do
+  begin
+    if LPkg <> '' then
+      LFound := Sweep(LPkg + '.' + LTrim + '.' + LName)
+    else
+      LFound := Sweep(LTrim + '.' + LName);
+    if LFound then
+      Break;
+    LDot := LastDelimiter('.', LTrim);
+    if LDot > 0 then
+      LTrim := Copy(LTrim, 1, LDot - 1)
+    else
+      LTrim := '';
+  end;
+
+  if not LFound then
+    if LPkg <> '' then
+      LFound := Sweep(LPkg + '.' + LName);
+
+  if not LFound then
+    LFound := Sweep(LName);
+
+  if not LFound then
+    Exit;
 
   Result.Entry := LEntry;
   Result.Msg   := LResMsg;

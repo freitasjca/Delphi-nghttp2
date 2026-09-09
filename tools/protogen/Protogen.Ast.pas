@@ -41,6 +41,8 @@ type
 
   TProtoLabel = (plNone, plRepeated, plOptional);
 
+  TProtoMessageNode = class;   // forward — a field names its owner
+
   TProtoFieldNode = class
   public
     Name:       string;
@@ -74,6 +76,20 @@ type
       field 1 and field 2, and reading them from there means the two can never
       disagree. }
     IsMap:      Boolean;
+
+    { The message this field was DECLARED in.
+
+      Nested messages are hoisted to file scope during parsing, which is what
+      makes the emitter's job flat — but it erases the containment, and proto
+      resolves a bare type name innermost-outward, so the containment is
+      exactly what decides which type a name means. google/cloud/gkehub has
+      two messages each nesting a different ControlPlaneManagement and each
+      referring to its own by the bare name.
+
+      Structure, not name resolution: this records what was written, which is
+      all this unit is allowed to do. The resolving happens in
+      Protogen.FileSet. }
+    Owner: TProtoMessageNode;
 
     function IsRepeated: Boolean;
     function InOneof: Boolean;

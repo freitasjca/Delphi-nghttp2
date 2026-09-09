@@ -330,3 +330,32 @@ message UsesBoth {
   Control.Family nested_one   = 1;   // -> TControl_Family
   ControlFamily  top_level    = 2;   // -> TControlFamily
 }
+
+// SCOPE-1 regression. proto resolves a bare type name INNERMOST-OUTWARD, so
+// the same spelling means different types in different messages. Both of
+// these declare `Kind`, and each refers to its own:
+//
+// Resolving by simple name alone binds one of them to the other's type. In
+// google/cloud/gkehub that produced a field typed as a class declared later
+// in the unit with no forward -- "Identifier not found
+// TMembershipStateControlPlaneManagement" -- and the type was the wrong one
+// anyway. 6 schemas in the full corpus sweep.
+//
+// SpecScope.kind must come out an ENUM and StateScope.kind a CLASS. If the
+// resolver regresses, one of them takes the other's type: either an enum
+// lands in the destructor and the unit emits .Free on it, or a class is
+// assigned Default() and will not compile.
+message SpecScope {
+  enum Kind {
+    KIND_UNSET = 0;
+    FAST       = 1;
+  }
+  Kind kind = 1;
+}
+
+message StateScope {
+  message Kind {
+    string detail = 1;
+  }
+  Kind kind = 1;
+}

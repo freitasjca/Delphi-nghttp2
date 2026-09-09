@@ -155,7 +155,7 @@ type
       them. }
     class function QualifiedTypeName(AFileSet: TProtoFileSet;
       AEntry: TProtoFileEntry; const ATypeName: string;
-      out AExternUnit: string): string;
+      out AExternUnit: string; const AScope: string = ''): string;
 
     // Emit a complete .Messages.pas into ALines. ALines is cleared first.
     // AUnitPrefix: dotted name prefix, e.g. 'Sample.Greeter' -- the unit
@@ -386,6 +386,21 @@ begin
     FExternUnits.Add(AUnitName);
 end;
 
+{ The scope a field's type reference resolves against: the message it was
+  declared in, or file scope when there is none.
+
+  Read off the field rather than threaded through the twenty call sites of the
+  five predicates that resolve a type. That is what keeps IsEnumField,
+  LocalMessageTarget and FieldType from disagreeing about what a bare name
+  means — a disagreement that puts .Free on an enum value. }
+function ScopeOf(AField: TProtoFieldNode): string;
+begin
+  if (AField = nil) or (AField.Owner = nil) then
+    Result := ''
+  else
+    Result := AField.Owner.QualifiedName;
+end;
+
 { IMPORT-1. The Pascal type for a field, resolved across files.
 
   A cross-file reference is emitted FULLY QUALIFIED — Demo.Google.Rpc.Status.
@@ -404,7 +419,8 @@ begin
   if (FFileSet = nil) or (FEntry = nil) or (AField.Scalar <> psNone) then
     Exit(PascalFieldType(AField, FFile));
 
-  LBase := QualifiedTypeName(FFileSet, FEntry, AField.TypeName, LExtern);
+  LBase := QualifiedTypeName(FFileSet, FEntry, AField.TypeName, LExtern,
+    ScopeOf(AField));
   // Unresolved by the file set: the single-file path knows about nested types.
   if LBase = '' then
     Exit(PascalFieldType(AField, FFile));
@@ -897,7 +913,7 @@ begin
     named a class nothing had declared. }
   if (FFileSet <> nil) and (FEntry <> nil) then
   begin
-    LRef := FFileSet.ResolveType(FEntry, AField.TypeName);
+    LRef := FFileSet.ResolveType(FEntry, AField.TypeName, ScopeOf(AField));
     if LRef.Found then
       Exit(LRef.Enum <> nil);
   end;
@@ -919,7 +935,7 @@ begin
     land on the wrong declaration entirely. }
   if (FFileSet <> nil) and (FEntry <> nil) then
   begin
-    LRef := FFileSet.ResolveType(FEntry, AField.TypeName);
+    LRef := FFileSet.ResolveType(FEntry, AField.TypeName, ScopeOf(AField));
     if LRef.Found then
     begin
       // Resolved elsewhere, or to an enum: no forward declaration belongs here.
@@ -1904,7 +1920,7 @@ end;
 
 class function TMessagesEmitter.QualifiedTypeName(AFileSet: TProtoFileSet;
   AEntry: TProtoFileEntry; const ATypeName: string;
-  out AExternUnit: string): string;
+  out AExternUnit: string; const AScope: string): string;
 var
   LRef: TProtoTypeRef;
   LWkt: string;
@@ -1923,7 +1939,7 @@ begin
   if (AFileSet = nil) or (AEntry = nil) then
     Exit;
 
-  LRef := AFileSet.ResolveType(AEntry, ATypeName);
+  LRef := AFileSet.ResolveType(AEntry, ATypeName, AScope);
   if not LRef.Found then
     Exit;   // '' — the caller's same-file rule handles nested-type scoping
 
