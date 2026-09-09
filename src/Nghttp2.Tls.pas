@@ -444,7 +444,7 @@ begin
       'OpenSSL could not be loaded: %s' + sLineBreak +
       'Install libssl-3-x64.dll + libcrypto-3-x64.dll (or the 1.1.x equivalents) ' +
       'and ensure they are on the runtime DLL search path (next to the exe is easiest). ' +
-      'Also install the Microsoft Visual C++ Runtime Redistributable — the OpenSSL DLLs ' +
+      'Also install the Microsoft Visual C++ Runtime Redistributable - the OpenSSL DLLs ' +
       'depend on msvcp140.dll / vcruntime140.dll from that redist.',
       [NghttpsslLoadError]);
 
@@ -505,7 +505,7 @@ procedure TTlsServerContext.CheckKeyMatch;
 begin
   if SSL_CTX_check_private_key(FCtx) <> 1 then
     raise ENghttp2Tls.CreateFmt(
-      'SSL_CTX_check_private_key: cert and key don''t match — %s',
+      'SSL_CTX_check_private_key: cert and key don''t match - %s',
       [NghttpsslLastError]);
 end;
 
@@ -1010,7 +1010,7 @@ begin
 
   if SSL_CTX_check_private_key(FCtx) <> 1 then
     raise ENghttp2Tls.CreateFmt(
-      'SSL_CTX_check_private_key [client-side mTLS]: cert and key don''t match — %s',
+      'SSL_CTX_check_private_key [client-side mTLS]: cert and key don''t match - %s',
       [NghttpsslLastError]);
 end;
 

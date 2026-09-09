@@ -423,7 +423,7 @@ class procedure TGrpcRegistry.InsertLocked(const AInfo: TGrpcMethodInfo);
 begin
   if FRegistry.ContainsKey(AInfo.Path) then
     raise EGrpcRegistry.CreateFmt(
-      'RegisterMethod: %s already registered — duplicate registration', [AInfo.Path]);
+      'RegisterMethod: %s already registered - duplicate registration', [AInfo.Path]);
   FRegistry.Add(AInfo.Path, AInfo);
 end;
 
@@ -553,7 +553,7 @@ begin
   LMethods := LIntfType.GetDeclaredMethods;
   if Length(LMethods) = 0 then
     raise EGrpcRegistry.CreateFmt(
-      'RegisterService<T>: interface %s exposes no methods via RTTI — ' +
+      'RegisterService<T>: interface %s exposes no methods via RTTI - ' +
       'declare it in a unit with {$M+} (and, on FPC, {$RTTI EXPLICIT METHODS([vcPublic])})',
       [LIntfType.Name]);
 
@@ -563,7 +563,7 @@ begin
     LParams := LMethod.GetParameters;
     if Length(LParams) <> 1 then
       raise EGrpcRegistry.CreateFmt(
-        'RegisterService(%s.%s): expected 1 parameter, got %d — must be `function %s(const ARequest: TRequestClass): TResponseClass`',
+        'RegisterService(%s.%s): expected 1 parameter, got %d - must be `function %s(const ARequest: TRequestClass): TResponseClass`',
         [LIntfType.Name, LMethod.Name, Length(LParams), LMethod.Name]);
     if (LParams[0].ParamType = nil) or (LParams[0].ParamType.TypeKind <> tkClass) then
       raise EGrpcRegistry.CreateFmt(

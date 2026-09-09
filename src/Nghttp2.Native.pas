@@ -643,7 +643,7 @@ begin
   if GLib = HANDLE_ZERO then
   begin
     GLastLoadError := Format(
-      'libnghttp2 not found — tried [%s]. OS error: %s',
+      'libnghttp2 not found - tried [%s]. OS error: %s',
       [Attempted, LastOsLoadError]);
     Exit(False);
   end;

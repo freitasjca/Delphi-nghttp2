@@ -399,7 +399,7 @@ begin
           AKind := pkBytes
         else
           raise EProtoRttiError.CreateFmt(
-            'ProtoMember %s: nested dynamic array. proto3 has no "repeated repeated" — ' +
+            'ProtoMember %s: nested dynamic array. proto3 has no "repeated repeated" - ' +
             'wrap the inner array in a message class and use TArray<TWrapper>.',
             [ADesc]);
       end;
@@ -412,10 +412,10 @@ begin
       end;
   else
     raise EProtoRttiError.CreateFmt(
-      'ProtoMember %s has type kind %d — not supported. ' +
+      'ProtoMember %s has type kind %d - not supported. ' +
       'Covered: Int32/Int64/UInt32/UInt64/string/Boolean/Float/Double/Enum/' +
       'TBytes/submessage, and TArray<> of any of those. ' +
-      'SInt (zigzag) and Fixed variants remain deferred — they need a wire-form ' +
+      'SInt (zigzag) and Fixed variants remain deferred - they need a wire-form ' +
       'parameter on TProtoMember, which carries only a tag today.',
       [ADesc, Ord(ARttiType.TypeKind)]);
   end;
@@ -532,7 +532,7 @@ begin
       raise EProtoRttiError.CreateFmt(
         '%s.%s is marked [TProtoHas(%d)] but is writable. A has-bit must be '
         + 'read-only (declare it `read F%s` with no writer) and be raised by '
-        + 'the field''s own setter — otherwise a decoded field arrives with '
+        + 'the field''s own setter - otherwise a decoded field arrives with '
         + 'its value set and its presence still False.',
         [AClass.ClassName, LProp.Name, LHas.Tag, LProp.Name]);
 
@@ -556,14 +556,14 @@ begin
       if LField.IsRepeated then
         raise EProtoRttiError.CreateFmt(
           '%s.%s: [TProtoHas(%d)] refers to repeated field "%s". A repeated '
-          + 'field has no presence to express — proto3 cannot distinguish '
+          + 'field has no presence to express - proto3 cannot distinguish '
           + 'empty from absent, and both decode to length 0.',
           [AClass.ClassName, LProp.Name, LHas.Tag, LField.Name]);
 
       if LField.Kind = pkSubmessage then
         raise EProtoRttiError.CreateFmt(
           '%s.%s: [TProtoHas(%d)] refers to submessage field "%s", which '
-          + 'already has explicit presence — nil means absent and is skipped '
+          + 'already has explicit presence - nil means absent and is skipped '
           + 'on the wire. Remove the has-bit and leave the property nil.',
           [AClass.ClassName, LProp.Name, LHas.Tag, LField.Name]);
 
@@ -597,7 +597,7 @@ begin
 
   LType := FContext.GetType(AClass);
   if LType = nil then
-    raise EProtoRttiError.CreateFmt('No RTTI for class %s — is {$M+} enabled in its unit?', [AClass.ClassName]);
+    raise EProtoRttiError.CreateFmt('No RTTI for class %s - is {$M+} enabled in its unit?', [AClass.ClassName]);
 
   LList := TList<TProtoFieldInfo>.Create;
   try
@@ -913,7 +913,7 @@ begin
           end;
       else
         raise EProtoRttiError.CreateFmt(
-          'Serialize: field "%s" (tag %d) — unhandled ProtoKind %d.',
+          'Serialize: field "%s" (tag %d) - unhandled ProtoKind %d.',
           [LField.Name, LField.Tag, Ord(LField.Kind)]);
       end;
     end;
@@ -1151,7 +1151,7 @@ begin
               end;
           else
             raise EProtoRttiError.CreateFmt(
-              'Deserialize: field "%s" (tag %d) — unhandled ProtoKind %d.',
+              'Deserialize: field "%s" (tag %d) - unhandled ProtoKind %d.',
               [LField.Name, LField.Tag, Ord(LField.Kind)]);
           end;
           Break;

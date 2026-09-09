@@ -482,7 +482,7 @@ begin
   begin
     closesocket(LSock);
     raise ENghttp2Socket.CreateFmt(
-      'inet_addr(%s) failed — pass an IPv4 literal (DNS not implemented in v1)',
+      'inet_addr(%s) failed - pass an IPv4 literal (DNS not implemented in v1)',
       [AHost]);
   end;
 

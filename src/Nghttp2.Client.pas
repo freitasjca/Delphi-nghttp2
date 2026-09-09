@@ -283,7 +283,7 @@ begin
   LClient.FStreams[LIdx].Done := True;
   if error_code <> NGHTTP2_NO_ERROR then
     LClient.FStreams[LIdx].Error := Format(
-      'stream %d closed with nghttp2 error code %d — received status=%d, %d header(s), %d body byte(s) before close',
+      'stream %d closed with nghttp2 error code %d - received status=%d, %d header(s), %d body byte(s) before close',
       [stream_id, error_code,
        LClient.FStreams[LIdx].Response.Status,
        Length(LClient.FStreams[LIdx].Response.Headers),
@@ -357,7 +357,7 @@ begin
   // True on repeat.
   if not NghttpLoad then
     raise ENghttp2Client.CreateFmt(
-      'libnghttp2 could not be loaded — %s.  Install the nghttp2 runtime ' +
+      'libnghttp2 could not be loaded - %s.  Install the nghttp2 runtime ' +
       'library and (Windows) ensure nghttp2.dll is on PATH or next to the .exe.',
       [NghttpLoadError]);
 
@@ -402,7 +402,7 @@ begin
   // NghttpLoad already fired in Create — see comment there.
 
   if FConnected then
-    raise ENghttp2Client.Create('already connected — call Disconnect first');
+    raise ENghttp2Client.Create('already connected - call Disconnect first');
 
   FHost := AHost;
   FPort := APort;
@@ -421,7 +421,7 @@ begin
       FTlsConn.DoHandshake;
       if FTlsConn.NegotiatedProtocol <> 'h2' then
         raise ENghttp2Client.CreateFmt(
-          'ALPN negotiation failed — server selected "%s" (expected "h2"). ' +
+          'ALPN negotiation failed - server selected "%s" (expected "h2"). ' +
           'The server may not support HTTP/2 over TLS, or it may require a ' +
           'protocol other than h2 (which this client does not implement).',
           [FTlsConn.NegotiatedProtocol]);
@@ -565,7 +565,7 @@ begin
   begin
     if MilliSecondsSince(LStart) > ATimeoutMS then
       raise ENghttp2Client.CreateFmt(
-        'request timed out after %d ms — %d stream(s) still open',
+        'request timed out after %d ms - %d stream(s) still open',
         [ATimeoutMS, PendingStreams]);
 
     FlushSession;
@@ -606,7 +606,7 @@ var
   LProviderPtr: Pnghttp2_data_provider;
 begin
   if not FConnected then
-    raise ENghttp2Client.Create('not connected — call Connect first');
+    raise ENghttp2Client.Create('not connected - call Connect first');
 
   { The slot is allocated AFTER submit, once nghttp2 has assigned the id — but
     the body cursor must exist before the first FlushSession, because the read
@@ -732,7 +732,7 @@ begin
     raise ENghttp2Client.CreateFmt('no such stream: %d', [AStreamId]);
   if not FStreams[LIdx].Done then
     raise ENghttp2Client.CreateFmt(
-      'stream %d has not completed — call PumpAll first', [AStreamId]);
+      'stream %d has not completed - call PumpAll first', [AStreamId]);
 
   Result := FStreams[LIdx].Response;
   LErr   := FStreams[LIdx].Error;
@@ -776,13 +776,13 @@ begin
   LSchemePos := Pos('://', AURL);
   if LSchemePos = 0 then
     raise ENghttp2Client.CreateFmt(
-      'malformed URL "%s" — expected http://host[:port]/path or https://...', [AURL]);
+      'malformed URL "%s" - expected http://host[:port]/path or https://...', [AURL]);
 
   LScheme  := LowerCase(Copy(AURL, 1, LSchemePos - 1));
   LIsHttps := LScheme = 'https';
   if (LScheme <> 'http') and (LScheme <> 'https') then
     raise ENghttp2Client.CreateFmt(
-      'unsupported URL scheme "%s" — only http and https are supported', [LScheme]);
+      'unsupported URL scheme "%s" - only http and https are supported', [LScheme]);
 
   LHost := Copy(AURL, LSchemePos + 3, MaxInt);
   LSlashPos := Pos('/', LHost);

@@ -1667,7 +1667,7 @@ begin
     NghttpLoad is idempotent, so a host that already called it pays nothing. }
   if not NghttpLoad then
     raise ENghttp2Socket.CreateFmt(
-      'TNghttp2Server.Start: libnghttp2 could not be loaded — %s', [NghttpLoadError]);
+      'TNghttp2Server.Start: libnghttp2 could not be loaded - %s', [NghttpLoadError]);
 
   FConfig := AConfig;
   TInterlocked.Exchange(FStopping, 0);

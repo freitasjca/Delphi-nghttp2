@@ -1008,7 +1008,7 @@ begin
     loudly at setup instead of hanging later with no clue why. }
   if not FSession.FAsyncMode then
     raise Exception.Create(
-      'BeginInbound: incremental inbound requires async dispatch — ' +
+      'BeginInbound: incremental inbound requires async dispatch - ' +
       'ReadInbound blocks, and in synchronous mode the handler is the ' +
       'connection thread that would have to feed it.');
 

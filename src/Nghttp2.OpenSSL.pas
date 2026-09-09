@@ -471,7 +471,7 @@ begin
   if not ResolveSymbols(GLibSSL, GLibCrypto) then
   begin
     GLastLoadError := Format(
-      'Loaded %s but failed to resolve a required symbol — likely an OpenSSL ' +
+      'Loaded %s but failed to resolve a required symbol - likely an OpenSSL ' +
       'version older than 1.1.0 (unified TLS_*_method API required).',
       [ALibSslNames[Low(ALibSslNames)]]);
     DoUnloadLib(GLibSSL);
