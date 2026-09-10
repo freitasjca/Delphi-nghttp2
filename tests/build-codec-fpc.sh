@@ -24,6 +24,9 @@
 #                                                      runtime carry
 #                                                      google.protobuf.Struct)
 #    3  Nghttp2AllocBench               build + run   (reports, never gates)
+#    3c Nghttp2ServerSmoke              build + run   (gates; the only stage
+#                                       that STARTS a server. Skips LOUDLY
+#                                       when libnghttp2 is absent.)
 #    3b Nghttp2ProtobufConformance      build + run   (reports; gates only on
 #                                                      a BROKEN probe)
 #    4  samples/grpc-server             compile only  (gates)
@@ -470,6 +473,51 @@ if [[ -f "$CONF" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2ProtobufConformance.dpr not present"
+fi
+
+# ── 3c · live server smoke (A4) — the ONLY stage here that starts one ────────
+# `grep -rl TNghttp2Server tests/ tools/` returned nothing until this existed.
+# Every other stage is codec or codegen, and the samples/grpc-server stage below
+# is COMPILE ONLY — so a fully green run had never opened a socket. That is not
+# hypothetical: the Windows suite was passing on a machine with no nghttp2.dll
+# on it, which is how the gap was found.
+#
+# Drives the library's own client against its own server in one process: bind,
+# h2c with prior knowledge, GET /smoke, an unrouted 404, clean stop. No curl and
+# no fixture — both halves already shipped and nothing joined them.
+#
+# Exit 3 means libnghttp2 is absent. That is a SKIP, because it is a genuine
+# runtime dependency — but a loud one, since a quiet skip is indistinguishable
+# from a passing stage and that is precisely the failure being fixed here.
+echo
+echo "── live server smoke (A4) ────────────────────────────────────────────"
+if [[ -f "$HERE/Nghttp2ServerSmoke.dpr" ]]; then
+  SMOUT="$OUT/server-smoke"
+  mkdir -p "$SMOUT"
+  rm -f "$SMOUT"/*.ppu "$SMOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$SMOUT" -FE"$SMOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ServerSmoke.dpr" > "$SMOUT/build.log" 2>&1 \
+     && [[ -x "$SMOUT/Nghttp2ServerSmoke" ]]; then
+    "$SMOUT/Nghttp2ServerSmoke" < /dev/null | sed 's/^/  /'
+    SM_RC=${PIPESTATUS[0]}
+    case "$SM_RC" in
+      0) echo "  server smoke: PASSED" ;;
+      3) echo "  SKIP  libnghttp2 absent - the transport was NOT exercised by"
+         echo "        this run. Every other stage passes without it." ;;
+      *) echo "  FAIL  live server smoke"
+         [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ServerSmoke.dpr did not compile"
+    grep -E "Error|Fatal" "$SMOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $SMOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2ServerSmoke.dpr not present"
 fi
 
 # ── samples/grpc-server — compile only ───────────────────────────────────────
