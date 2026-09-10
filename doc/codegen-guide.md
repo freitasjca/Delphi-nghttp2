@@ -326,9 +326,10 @@ affect a real schema: a **message member inside a `oneof`** (the common shape of
 a oneof, and 19% of the googleapis corpus on its own), **`optional` on a message
 field** (a no-op label in proto3), and **two enums sharing a value name**, which
 is now resolved by prefixing rather than refused. `protogen` parses and emits
-99.5% of 7301 real googleapis schemas; the 35 it turns away are proto2, Group B
-scalars, two reflection well-known types, and one enum that declares both
-`minimal` and `MINIMAL` — legal proto3, impossible in case-insensitive Pascal.
+7287 of 7301 real googleapis schemas; the 14 it turns away are Group B scalars
+(7), the `Api`/`DescriptorProto` reflection types (6), and one enum that
+declares both `minimal` and `MINIMAL` — legal proto3, impossible in
+case-insensitive Pascal.
 
 Two further points that are easy to miss:
 

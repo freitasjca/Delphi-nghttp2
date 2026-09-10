@@ -92,9 +92,9 @@ Being explicit, since the table above may read as if it handles everything:
 `oneof`, `optional`, `map`, and the `Struct` family and `Any` were on this list
 until PRESENCE-1 / ONEOF-1 / MAP-1 / STRUCT-1 / ANY-1.
 
-Against 7301 real googleapis schemas it **parses and emits 99.5%** (7266),
-refuses the remaining 35 by name, and has never accepted a schema `protoc`
-rejects. Those 35 are 21 wanting proto2 `extend`, 7 wanting `sint*`/`fixed*`,
+Against 7301 real googleapis schemas it **parses and emits 7287**, refuses the
+remaining 14 by name, and has never accepted a schema `protoc` rejects. Those 14
+are 7 wanting `sint*`/`fixed*`,
 6 wanting `Api`/`DescriptorProto`, and one enum declaring both `minimal` and
 `MINIMAL` — legal proto3, impossible in case-insensitive Pascal.
 

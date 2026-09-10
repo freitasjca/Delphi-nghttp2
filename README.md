@@ -300,11 +300,18 @@ ProtogenCheck service.proto
 ```
 
 **What is refused**, measured against 7301 real googleapis schemas rather than
-guessed: `sint*`/`fixed*`/`sfixed*`, proto2 in any form, and
-`google.protobuf.Api`/`DescriptorProto`. Everything else — including `map`,
-`oneof` (with message members), `optional`, the `Struct` family, `Any`, and
-since 1.16.0 the whole `import` closure — is supported, and a refusal always
-names the construct and explains the obstacle.
+guessed: **14 files**, and they are worth naming individually because there are
+so few. Seven want Group B scalars (`fixed64` ×5, `sint32`, `fixed32`), six want
+`google.protobuf.Api` or `DescriptorProto`, and one is an enum declaring both
+`minimal` and `MINIMAL` — legal proto3, where identifiers are case-sensitive,
+and impossible in Pascal, where they are not. That last one cannot be fixed by
+renaming: both values sit in the same enum, so any prefix lands on both.
+
+Everything else — `map`, `oneof` (with message members), `optional`, the
+`Struct` family, `Any`, and the whole `import` closure — is supported, and a
+refusal always names the construct and explains the obstacle. Refusals were 35
+before 1.16.0; the 21 that went away were all proto2 `extend`, which the parser
+now skips rather than rejecting outright.
 
 **Which layer a number describes matters here more than the number.** The
 figure above is `7216 / 7301` schemas whose generated Pascal *compiles* — the
