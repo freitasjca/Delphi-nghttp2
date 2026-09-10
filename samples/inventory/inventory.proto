@@ -1,0 +1,57 @@
+// ============================================================================
+//  inventory.proto - the contract for the warehouse sample.
+//
+//  This file is the single source of truth. Everything Pascal in this
+//  directory either IS generated from it (Sample.Inventory.Messages.pas) or is
+//  written against the shapes it defines. Change a field number here and you
+//  have changed the wire format; change a field NAME and you have not.
+//
+//  Generate the Pascal messages with:
+//
+//    Protogen -i inventory.proto -o . --unit-prefix Sample.Inventory
+//
+//  Three RPCs, chosen to cover the three things a real service does:
+//    GetProduct      unary          - one in, one out
+//    CreateShipment  unary          - a repeated field on the way in
+//    WatchStock      server stream  - many out over one call
+// ============================================================================
+
+syntax = "proto3";
+
+package inventory;
+
+message Product {
+  int64  id      = 1;
+  string barcode = 2;
+  string name    = 3;
+  int32  stock   = 4;
+}
+
+message GetProductRequest {
+  string barcode = 1;
+}
+
+message CreateShipmentRequest {
+  // `repeated int64` becomes TArray<Int64> in the generated Pascal.
+  repeated int64 product_ids = 1;
+}
+
+message CreateShipmentResponse {
+  int64 shipment_id = 1;
+  int32 line_count  = 2;
+}
+
+service InventoryService {
+  rpc GetProduct     (GetProductRequest)     returns (GetProductResponse);
+  rpc CreateShipment (CreateShipmentRequest) returns (CreateShipmentResponse);
+  rpc WatchStock     (GetProductRequest)     returns (stream Product);
+}
+
+// GetProduct returns a wrapper rather than a bare Product so it can report
+// "not found" without an error status. A bare Product would force the choice
+// between returning an empty message (indistinguishable from a product whose
+// fields are all default) and failing the RPC for an ordinary miss.
+message GetProductResponse {
+  bool    found   = 1;
+  Product product = 2;
+}
