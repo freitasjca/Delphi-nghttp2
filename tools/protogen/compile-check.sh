@@ -145,6 +145,49 @@ echo "candidates: $TOTAL schemas (every .proto in the corpus)"
 echo "compiling:  $PICKED"
 echo
 
+# ── Progress ─────────────────────────────────────────────────────────────────
+# --all is a ~1 hour run. Without this you cannot tell a slow sweep from a hung
+# one, which is the only question you actually have while waiting.
+#
+# Written to STDERR, not stdout, so `| tail -25` still shows the report and
+# nothing else. Redraws in place on a terminal; falls back to one line every
+# 250 schemas when stderr is redirected, so a log file does not fill with
+# carriage returns.
+PROG_START=$(date +%s)
+
+hms() {                       # seconds -> 1h02m03s / 2m03s / 43s
+  local t=$1
+  if   [[ $t -ge 3600 ]]; then printf '%dh%02dm%02ds' $((t/3600)) $((t%3600/60)) $((t%60))
+  elif [[ $t -ge 60   ]]; then printf '%dm%02ds' $((t/60)) $((t%60))
+  else                         printf '%ds' "$t"
+  fi
+}
+
+progress() {                  # <done> <total>
+  local done=$1 total=$2 now elapsed eta rate pct
+  [[ $total -le 0 ]] && return 0
+  now=$(date +%s); elapsed=$(( now - PROG_START ))
+  pct=$(( done * 100 / total ))
+
+  # ETA from the average so far. Honest for this workload: every schema is one
+  # generate + one compile, so the per-item cost has no long tail to skew it.
+  if [[ $done -gt 0 && $elapsed -gt 0 ]]; then
+    eta=$(( elapsed * (total - done) / done ))
+  else
+    eta=0
+  fi
+
+  if [[ -t 2 ]]; then
+    printf '\r  [%5d/%5d %3d%%]  ok %-5d crash %-4d defect %-4d refused %-5d  %s elapsed, ~%s left   ' \
+      "$done" "$total" "$pct" "$OK" "$CRASH" "$COMPFAIL" "$GENFAIL" \
+      "$(hms "$elapsed")" "$(hms "$eta")" >&2
+  elif [[ $done -gt 0 && ( $(( done % 250 )) -eq 0 || $done -eq $total ) ]]; then
+    printf '  [%5d/%5d %3d%%]  ok %d crash %d defect %d refused %d  %s elapsed, ~%s left\n' \
+      "$done" "$total" "$pct" "$OK" "$CRASH" "$COMPFAIL" "$GENFAIL" \
+      "$(hms "$elapsed")" "$(hms "$eta")" >&2
+  fi
+}
+
 # ── Generate + compile ───────────────────────────────────────────────────────
 OK=0; GENFAIL=0; COMPFAIL=0; CRASH=0; N=0
 : > "$OUT/failures.txt"
@@ -201,7 +244,12 @@ while IFS= read -r proto; do
       } >> "$OUT/failures.txt"
     fi
   fi
+
+  progress "$N" "$PICKED"
 done < "$OUT/selected.txt"
+
+# Close the in-place line so the report does not land on top of it.
+[[ -t 2 ]] && printf '\r%*s\r' 110 '' >&2
 
 # ── Report ───────────────────────────────────────────────────────────────────
 echo "==========================================================="

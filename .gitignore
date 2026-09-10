@@ -101,6 +101,7 @@ tools/protogen/.corpus-out/
 
 # compile-check.sh output: thousands of generated units per --all run
 tools/protogen/.compile-out/
+tools/protogen/.spot-out/
 
 # The qualified-reference probe's build output. FOURTH time an extensionless
 # compiled binary has been staged in this repo -- the three comments above say

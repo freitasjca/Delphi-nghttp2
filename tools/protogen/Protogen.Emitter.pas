@@ -119,6 +119,7 @@ type
     // ONEOF-1 naming, public for the same reason.
     //   CaseEnumName  'TM', 'pick'      -> 'TMPickCase'
     //   CaseValueName 'TM', 'pick', 'a' -> 'MPickCaseA'   ('' member -> None)
+    class function TruncIdent(const AName: string): string;
     class function CaseEnumName(const AClassName, AOneof: string): string;
     class function CaseValueName(const AClassName, AOneof,
       AMemberProp: string): string;
@@ -1034,11 +1035,55 @@ begin
   end;
 end;
 
+{ FIX-IDENT-1. Bound a GENERATED identifier the same way BaseEnumValueName
+  bounds a proto enum value, and for the same reason: FPC dies rather than
+  diagnosing when one gets long enough.
+
+  Measured 2026-09-10 over the 7301-schema corpus. Of 57 schemas where FPC
+  crashed, exactly 10 carried a generated identifier of 127 characters or more,
+  and those 10 are precisely the ones reporting `Internal error 2015071505` -
+  10 of 10, with none of the other 47 crashes reaching 127. A control sample of
+  57 non-crashing schemas produced no identifier at 120 or beyond at all. The
+  other two crash families (2015071503, `List index exceeds bounds`) are NOT
+  explained by length and remain unattributed.
+
+  The offender is the oneof case-enum type name, which FLATTEN-1 builds from
+  the whole parent chain:
+
+    CustomerSkAdNetworkConversionValueSchemaSkAdNetworkConversionValueSchema
+    PostbackMappingLock_window_triggerCase                   -- 145 characters
+
+  MAX_IDENT already existed and already recorded this exact crash at 127, but
+  it guarded enum VALUES only, so no generated type name was ever bounded.
+
+  The hash is of the FULL name, so two identifiers sharing a long prefix stay
+  distinct after truncation. }
+class function TMessagesEmitter.TruncIdent(const AName: string): string;
+const
+  { Same 120 as BaseEnumValueName's MAX_IDENT, and deliberately the same
+    number: both exist to stay clear of the 127 where FPC stops diagnosing and
+    starts crashing. Kept as its own constant rather than hoisting the other
+    one, because that local carries a long explanation of the enum-value case
+    and moving it would separate the reason from what it explains. }
+  MAX_IDENT_TYPE = 120;
+var
+  LHash: Cardinal;
+  K: Integer;
+begin
+  Result := AName;
+  if Length(Result) <= MAX_IDENT_TYPE then
+    Exit;
+  LHash := 2166136261;                                     // FNV-1a
+  for K := 1 to Length(AName) do
+    LHash := (LHash xor Ord(AName[K])) * 16777619;
+  Result := Copy(AName, 1, MAX_IDENT_TYPE - 9) + '_' + IntToHex(LHash, 8);
+end;
+
 class function TMessagesEmitter.CaseEnumName(const AClassName,
   AOneof: string): string;
 begin
   { AClassName already carries the leading T. }
-  Result := AClassName + CapFirst(AOneof) + 'Case';
+  Result := TruncIdent(AClassName + CapFirst(AOneof) + 'Case');
 end;
 
 class function TMessagesEmitter.CaseValueName(const AClassName, AOneof,
@@ -1048,11 +1093,16 @@ begin
     the whole unit. Deriving from the enum type name (minus its leading T)
     makes collisions impossible between two oneofs, or two messages that
     happen to use the same member names. }
-  Result := Copy(CaseEnumName(AClassName, AOneof), 2, MaxInt);
+  { Built from the UNTRUNCATED base so the member suffix always lands on the
+    full name, then bounded in its own right - a value is longer than its type
+    by that suffix, so truncating only the type would leave values over the
+    limit. Both hash the full string, so distinctness survives either cut. }
+  Result := Copy(AClassName + CapFirst(AOneof) + 'Case', 2, MaxInt);
   if AMemberProp = '' then
     Result := Result + 'None'
   else
     Result := Result + CapFirst(AMemberProp);
+  Result := TruncIdent(Result);
 end;
 
 { The generated has-bit / setter / clear names for one optional field.
