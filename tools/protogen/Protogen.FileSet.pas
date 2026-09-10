@@ -631,9 +631,33 @@ begin
       LTrim := '';
   end;
 
-  if not LFound then
-    if LPkg <> '' then
-      LFound := Sweep(LPkg + '.' + LName);
+  { SCOPE-2. Walk the PACKAGE outward too, not just the enclosing message
+    chain. proto resolves innermost-outward through the whole dotted scope, and
+    a package is part of that scope - so from `grafeas.v1beta1.attestation`, a
+    bare `Signature` must find `grafeas.v1beta1.Signature`.
+
+    SCOPE-1 trimmed the message scope and then tried the FULL package only, so
+    a type declared in a PARENT package resolved nowhere. It emitted the bare
+    Pascal name anyway - `TArray<TSignature>` against a TSignature that is
+    neither declared nor forward-declared nor qualified - and the generated
+    unit failed with "Identifier not found". Real and current: grafeas
+    attestation.proto references Signature from the imported common.proto,
+    one package level up.
+
+    The first iteration is the full package, so this subsumes the single sweep
+    it replaces. }
+  LTrim := LPkg;
+  while (not LFound) and (LTrim <> '') do
+  begin
+    LFound := Sweep(LTrim + '.' + LName);
+    if LFound then
+      Break;
+    LDot := LastDelimiter('.', LTrim);
+    if LDot > 0 then
+      LTrim := Copy(LTrim, 1, LDot - 1)
+    else
+      LTrim := '';
+  end;
 
   if not LFound then
     LFound := Sweep(LName);

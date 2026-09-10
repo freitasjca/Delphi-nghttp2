@@ -1560,7 +1560,7 @@ begin
 
     W('function ' + LClass + '.' + LName + 'Count: Integer;');
     W('begin');
-    W('  Result := Length(F' + LProp + ');');
+    W('  Result := System.Length(F' + LProp + ');');
     W('end;');
     W;
 
@@ -1569,7 +1569,7 @@ begin
     W('var');
     W('  I: Integer;');
     W('begin');
-    W('  for I := 0 to High(F' + LProp + ') do');
+    W('  for I := 0 to System.High(F' + LProp + ') do');
     W('    if F' + LProp + '[I].key = AKey then Exit(True);');
     W('  Result := False;');
     W('end;');
@@ -1583,7 +1583,7 @@ begin
     W('var');
     W('  I: Integer;');
     W('begin');
-    W('  for I := 0 to High(F' + LProp + ') do');
+    W('  for I := 0 to System.High(F' + LProp + ') do');
     W('    if F' + LProp + '[I].key = AKey then Exit(F' + LProp + '[I].value);');
     W('  Result := Default(' + LV + ');');
     W('end;');
@@ -1606,7 +1606,7 @@ begin
     W('  I: Integer;');
     W('  LEntry: ' + LEntryCls + ';');
     W('begin');
-    W('  for I := 0 to High(F' + LProp + ') do');
+    W('  for I := 0 to System.High(F' + LProp + ') do');
     W('    if F' + LProp + '[I].key = AKey then');
     W('    begin');
     if LOwnsValue then
@@ -1622,8 +1622,8 @@ begin
     W('  LEntry := ' + LEntryCls + '.Create;');
     W('  LEntry.key   := AKey;');
     W('  LEntry.value := AValue;');
-    W('  SetLength(F' + LProp + ', Length(F' + LProp + ') + 1);');
-    W('  F' + LProp + '[High(F' + LProp + ')] := LEntry;');
+    W('  System.SetLength(F' + LProp + ', System.Length(F' + LProp + ') + 1);');
+    W('  F' + LProp + '[System.High(F' + LProp + ')] := LEntry;');
     W('end;');
     W;
 
@@ -1634,9 +1634,9 @@ begin
     W('var');
     W('  I: Integer;');
     W('begin');
-    W('  for I := 0 to High(F' + LProp + ') do');
+    W('  for I := 0 to System.High(F' + LProp + ') do');
     W('    F' + LProp + '[I].Free;');
-    W('  SetLength(F' + LProp + ', 0);');
+    W('  System.SetLength(F' + LProp + ', 0);');
     W('end;');
     W;
   end;
@@ -1671,7 +1671,7 @@ begin
     LProp := PascalFieldName(LField.Name, LRenamed);
     if LField.IsRepeated then
     begin
-      W('  for I := 0 to High(F' + LProp + ') do');
+      W('  for I := 0 to System.High(F' + LProp + ') do');
       W('    F' + LProp + '[I].Free;');
     end
     else
