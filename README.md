@@ -18,7 +18,12 @@ Parallels the ecosystem's proven pattern:
 
 ## Roadmap
 
-All items marked **✓** ship in the v1.0.0 public release. The internal milestone labels (M0–M5) reflect the development sequence, not semver versions.
+Everything marked **✓** is released. Where a section below names a version it
+is a tag of **this** repository, which has been on `1.x` since the first public
+release; the `M0`–`M5` labels are development-sequence milestones, not versions.
+Anything marked `v2.x` in an older draft came from `horse-provider-nghttp2`'s
+own numbering before this library was extracted from it — those features all
+arrived here in **1.0.0**.
 
 | Layer | State |
 |---|---|
@@ -27,7 +32,7 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | Client-side FFI (`nghttp2_session_client_new`, `nghttp2_submit_request`, …) | **✓** |
 | `TNghttp2Client` — synchronous request/response API | **✓** |
 | **Multiplexed client streams** — `BeginRequest` / `PumpAll` / `TakeResponse` | **✓** (MULTISTREAM-1 — N concurrent streams on ONE connection) |
-| Native HTTP/2 test client (94/94 pass) | **✓** |
+| Native HTTP/2 test client (106/106, six suite configurations) | **✓** |
 | TLS + ALPN — server side (`TTlsServerContext`, `TTlsConnection`) | **✓** |
 | TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** |
 | OpenSSL 3.x + 1.1.x FFI with auto-detect + `SetDllDirectory` for local libs | **✓** |
@@ -46,7 +51,7 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 
 ---
 
-## Async dispatch (v2.1)
+## Async dispatch (since 1.0.0)
 
 By default `OnRequest` runs inline on the connection thread: one request at a
 time per connection, so a slow handler blocks every other stream the client
@@ -79,7 +84,7 @@ it:
 concurrency at the other end, since this transport is one thread per
 connection.
 
-## Graceful shutdown (v2.1)
+## Graceful shutdown (since 1.0.0)
 
 `TNghttp2Server` separates **draining** from **stopping** — one flag used to
 mean both, which tore down the pumps the moment a drain began and discarded
@@ -103,7 +108,7 @@ one-shot client exits the moment its stream ends, so anything later misses it
 `nghttp2_session_terminate_session`, which discards frames already submitted
 for open streams.
 
-## Memory-BIO TLS (v2.2)
+## Memory-BIO TLS (since 1.0.0)
 
 `Nghttp2.Tls.pas` no longer hands OpenSSL the socket. `SSL_set_fd` is replaced
 by a pair of in-memory BIOs, and the unit performs every socket read and write
@@ -132,7 +137,11 @@ against is unchanged.
 Validated 2026-08-16 with no new tests: on Windows/Delphi 12, 94/94 over h2c,
 TLS **and** mTLS plus 16/16 gRPC on all three; `build-fpc.sh` 15/15 stages on
 FPC 3.3.1, including mTLS positive and the uncertified-client rejection; clean
-`dcclinux64` compile. The 94 checks run in 117 ms h2c → 146 ms TLS → 189 ms
+`dcclinux64` compile. **Those totals are the suite as it stood that day** — the
+point of the record is that a rewrite this deep needed no new tests, so the
+numbers are left as they were rather than restated. It has since grown to
+106/106 HTTP and 35/35 gRPC; the current matrix lives in the provider's
+[`doc/platform-coverage.md`](https://github.com/freitasjca/horse-provider-nghttp2/blob/master/doc/platform-coverage.md). The 94 checks run in 117 ms h2c → 146 ms TLS → 189 ms
 mTLS, so the handshake pump adds no round trips and the mTLS increment is just
 the client-certificate flight.
 
@@ -156,7 +165,7 @@ code 141 and no exception to catch.
 
 `SIG_IGN` was originally required because `Nghttp2.Tls.pas` used `SSL_set_fd`:
 OpenSSL wrote straight to the descriptor, where a per-call `MSG_NOSIGNAL`
-could never reach. Since the memory-BIO rewrite (v2.2) every write is our own
+could never reach. Since the memory-BIO rewrite every write is our own
 `SocketSendAll`, so per-send flags *would* now be reachable — but `SIG_IGN` is
 kept, because it is one line covering every send site including any added
 later, and process-wide termination is too severe a failure mode to guard
@@ -346,7 +355,7 @@ such a trampoline; `horse-provider-nghttp2` does exactly that.
 to that property, which compiles on neither Delphi nor FPC.)*
 
 `Start` loads libnghttp2 itself and raises if it cannot — no explicit
-`NghttpLoad` call is needed. Before v2.2 it did not, and only the Horse
+`NghttpLoad` call is needed. Earlier versions did not, and only the Horse
 provider and `TNghttp2Client` loaded the library: a program built on
 `TNghttp2Server` directly (this example included) left every FFI pointer nil.
 The listener still bound and the banner still printed — that is plain socket
