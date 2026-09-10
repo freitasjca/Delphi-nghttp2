@@ -39,7 +39,8 @@ All items marked **✓** ship in the v1.0.0 public release. The internal milesto
 | **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
 | **gRPC layer** — protobuf codec, registry (procedural + `RegisterService<T>`), dispatcher, all four RPC shapes | **✓** (extracted from `horse-provider-nghttp2` 2026-08-23; the units never depended on Horse, only their names did) |
 | **`.proto` tooling** — parser, `ProtogenCheck` verdict CLI, `protoc` differential test (`tools/protogen`) | **✓** (26 cases, 0 disagreements `protoc` would call a defect, vs libprotoc 35.1). See [`doc/protogen.md`](doc/protogen.md) |
-| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **99.5%** of 7301 real googleapis schemas parsed AND emitted (2026-09-07) |
+| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **7,216 of 7,301** real googleapis schemas generate code that **compiles** — parsed, emitted, and accepted by the compiler (2026-09-09) |
+| **`import` closure** — `protogen` follows imports and emits one unit per file | **✓** (IMPORT-1, 1.16.0 — path-derived unit names, qualified cross-file references) |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
@@ -181,7 +182,11 @@ call-by-call.
   from-source route. Windows uses MSVC + CMake ([Win64 and Win32 recipes](doc/getting-nghttp2-windows.md#option-c--build-from-source-msvc--cmake));
   Linux uses the standard autotools build ([from source](doc/getting-nghttp2-linux.md#build-from-source),
   plus [ARM / cross-compile notes](doc/getting-nghttp2-linux.md#arm--cross-compile-targets)).
-- **Platforms:** Windows (Win32/Win64), Linux (x86_64, ARM64 via SONAME), macOS (Intel + Apple Silicon).
+- **Platforms:** Windows (Win32/Win64) and Linux (x86_64, ARM64 via SONAME) are
+  gated on every release. **macOS is expected to work but is not tested** — the
+  loader knows `libnghttp2.dylib` and the default thread-per-connection path is
+  portable POSIX, but the two event-loop engines are epoll and IOCP, and no
+  suite has ever run on a Mac. Treat it as unverified rather than supported.
 
 The library loads libnghttp2 by its stable SONAME (`libnghttp2.so.14` on Linux, `libnghttp2.dylib` on macOS, `nghttp2.dll` on Windows). No binaries bundled — the platform's package manager owns the file.
 
@@ -232,7 +237,14 @@ tools/
 samples/
   PingClient.dpr              — minimal HTTP/2 client
   grpc-server/                — a gRPC server on this library alone, no framework
-  tests/                      — protocol-level and integration tests
+  rest-and-grpc/              — REST through Horse and gRPC through this library,
+                                one binary, two listeners
+
+tests/                        — the gates. run-tests.bat (Windows) and
+                                build-codec-fpc.sh (FPC) drive every .dpr here:
+                                codec, gRPC framing, conformance, and
+                                Nghttp2ServerSmoke, which is the one stage that
+                                starts a real server
 
 doc/                          — design docs, upstream notes, migration guides
 ```
@@ -245,6 +257,19 @@ units from a `.proto`:
 ```bash
 Protogen -i service.proto -o src/ --unit-prefix MyApp.Service
 ```
+
+**Imports are followed.** Since 1.16.0 the generator loads the whole import
+closure rather than the one file named on the command line, emitting **one unit
+per `.proto`** with unit names derived from each file's path and cross-file
+references qualified. A schema that imports another no longer has to be
+flattened by hand or generated file-by-file.
+
+Two name-resolution rules ride along, and both can rename identifiers that
+generated successfully before: nested types are flattened into unit scope and
+disambiguated when two of them share a leaf name, and type names resolve
+**innermost-outward** from the enclosing scope as proto requires. Where your
+schemas already produced compiling code the output is unchanged — the renames
+land where the old output did not compile or bound the wrong type.
 
 It **never overwrites** a service implementation you have edited — that one is
 written as `.new.pas` beside the original, and the other three are regenerated
@@ -267,17 +292,26 @@ ProtogenCheck service.proto
 
 **What is refused**, measured against 7301 real googleapis schemas rather than
 guessed: `sint*`/`fixed*`/`sfixed*`, proto2 in any form, and
-`google.protobuf.Api`/`DescriptorProto`. That is **35 of 7301 files** —
-everything else, including `map`, `oneof` (with message members), `optional`,
-the `Struct` family and `Any`, is supported. A refusal always names the
-construct and explains the obstacle.
+`google.protobuf.Api`/`DescriptorProto`. Everything else — including `map`,
+`oneof` (with message members), `optional`, the `Struct` family, `Any`, and
+since 1.16.0 the whole `import` closure — is supported, and a refusal always
+names the construct and explains the obstacle.
 
-That figure counts schemas that **parse *and* emit**. Until 2026-09-07 the
-corpus tool ran the parser only, so an earlier "99.5%" said nothing about
-whether generated Pascal was produced at all — and behind it sat three emitter
-gaps worth 27% of the corpus, the largest being message members inside a
-`oneof`. The number is now measured end to end; the distinction is kept here
-because the old one was quoted as evidence the generator worked.
+**Which layer a number describes matters here more than the number.** The
+figure above is `7216 / 7301` schemas whose generated Pascal *compiles* — the
+strongest of the three measures, and the only one that says the generator
+works. Two weaker ones have each been quoted as if they were it:
+
+- *parses* — what an earlier "99.5%" meant for a month. It says nothing about
+  whether Pascal was emitted at all, and behind it sat three emitter gaps worth
+  27% of the corpus, the largest being message members inside a `oneof`.
+- *parses and emits* — better, but still no evidence the compiler accepts the
+  result.
+
+`corpus-check.sh` reports parse-and-emit; `compile-check.sh --all` reports the
+compile figure and splits FPC compiler crashes from genuine emitter defects,
+having once overstated the latter by 3.5x. Re-run both after any generator
+change and quote the column you actually ran.
 
 ---
 

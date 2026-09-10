@@ -38,11 +38,22 @@ the exit status too, so a failing build looks green twice over.
 
 ```bash
 bash tools/protogen/corpus-check.sh      # parse + emit, ~99.5% of 7301 schemas
-bash tools/protogen/compile-check.sh --all   # 3019/3019 must compile
+bash tools/protogen/compile-check.sh --all   # 7216/7301, 7 emitter defects
 ```
 
 `--all`, not the default sample: a 10% sample once reported four defect classes
 and the full sweep found three more.
+
+**Read the right column.** `3019/3019 must compile` stood here until 1.16.0 and
+was wrong in the way that matters: 3019 was every schema the generator *did not
+refuse*, so a perfect score excluded 59% of the corpus and got better every
+time the generator refused more. The denominator is 7301 — every schema — and
+the three numbers to read are COMPILED, DID NOT COMPILE (emitter defects) and
+`compiler crashed`, which is FPC falling over rather than our output being
+rejected and once overstated the defect count by 3.5x.
+
+Skip the sweep only when `git diff --name-only <last-swept-commit>..HEAD --
+tools/protogen/` is empty, and say which commit that was.
 
 ---
 
