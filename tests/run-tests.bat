@@ -12,6 +12,9 @@ REM                                                     + reassembly chunking
 REM    2c ProtoOptionalProbe              build + run   (gates) - what this
 REM                                                     compiler permits as a
 REM                                                     published property
+REM    2d ProtoStructProbe                build + run   (reports) - can the
+REM                                                     RTTI layer carry the
+REM                                                     Struct family here
 REM   C6b ProtogenOptionalCompileCheck    build + run   (gates) - compiles AND
 REM                                                     runs generated
 REM                                                     `optional` code
@@ -121,6 +124,21 @@ REM would break PRESENCE-1, and one refusing generic class properties would
 REM break the submessage path.
 set "STAGE=ProtoOptionalProbe"
 set "GATES=1"
+call :build_run
+
+REM Stage 2d. The sibling probe, and it was FPC-only until 2026-09-10 - so the
+REM Windows suite silently covered less than the Linux one while both reported
+REM ALL STAGES PASSED. That asymmetry is the reason to run it here, not the
+REM probe's original question: 2c exists precisely BECAUSE the two compilers
+REM disagree about what a published property may be, and a capability probe
+REM that runs on only one of them answers half the question it was written for.
+REM
+REM Reports rather than gates, matching the FPC side. It measures a capability,
+REM and the Struct family it probes now ships (STRUCT-1), so a NO here is a
+REM finding to read rather than a build to stop - the behaviour itself is
+REM gated by stages 1 and C6b, which assert what the bundle actually does.
+set "STAGE=ProtoStructProbe"
+set "GATES=0"
 call :build_run
 
 set "STAGE=Nghttp2AllocBench"
