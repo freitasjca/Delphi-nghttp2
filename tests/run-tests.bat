@@ -17,6 +17,9 @@ REM                                                     runs generated
 REM                                                     `optional` code
 REM    3  Nghttp2AllocBench               build + run   (reports, never gates)
 REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
+REM    4b Nghttp2ServerSmoke              build + run   (gates; the only stage
+REM                                       that starts a server. Skips LOUDLY
+REM                                       when libnghttp2 is absent.)
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
 REM    6  ProtogenEmitTests               build + run   (gates) - same dir
@@ -73,6 +76,7 @@ REM  no diagnostic. These suites are small; a full build costs under a second.
 REM ===========================================================================
 
 set "FAILED=0"
+set "SKIPPED=0"
 REM Unit search path for :build_run. Every stage in tests\ wants ..\src; the
 REM protogen stage overrides it and restores this afterwards.
 set "STAGEUNITS=..\src"
@@ -125,6 +129,23 @@ call :build_run
 
 set "STAGE=Nghttp2ProtobufConformance"
 set "GATES=1"
+call :build_run
+
+REM -- Stage 4b. The only stage here that STARTS A SERVER. ------------------
+REM
+REM Until this existed, `grep -rl TNghttp2Server tests\ tools\` returned
+REM nothing: every stage was codec or codegen, and ProtogenGeneratedCompileCheck
+REM only REGISTERS services. This suite therefore passed, for years, on a
+REM machine with no nghttp2.dll on it - which is exactly what happened, and how
+REM the gap was found. "ALL STAGES PASSED" did not mean the transport worked.
+REM
+REM Drives the library's own client against its own server in one process, so
+REM it needs no curl, no grpcurl and no fixture. Exit 3 means libnghttp2 is
+REM absent: reported as a LOUD skip rather than a pass, because a quiet skip is
+REM indistinguishable from a green stage and that is the failure being fixed.
+set "STAGE=Nghttp2ServerSmoke"
+set "GATES=1"
+set "SKIPRC=3"
 call :build_run
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
@@ -335,11 +356,29 @@ echo  FAILED  - !FAILED! stage^(s^) did not pass
 exit /b !FAILED!
 
 :all_ok
+if not "!SKIPPED!"=="0" goto :ok_but_skipped
 echo  ALL STAGES PASSED
+goto :ok_done
+
+:ok_but_skipped
+REM The whole point of stage 4b: a run that skipped it has NOT touched the
+REM transport, and the last line of the log is the part people read.
+echo  ALL STAGES PASSED  --  but !SKIPPED! stage^(s^) SKIPPED
+echo.
+echo  A skipped stage exercised nothing. If Nghttp2ServerSmoke skipped,
+echo  no server was started and the transport is UNTESTED by this run.
+echo  See doc/getting-nghttp2-windows.md.
+
+:ok_done
 exit /b 0
 
 REM ===========================================================================
 :build_run
+REM SKIPRC is an OPTIONAL exit code meaning "did not run, and that is not a
+REM failure" - captured and cleared immediately so it cannot leak into the
+REM next stage, which would silently turn a real failure into a skip.
+set "MYSKIP=!SKIPRC!"
+set "SKIPRC="
 echo -- !STAGE! ---------------------------------------------------------------
 if not exist "!STAGE!.dpr" goto :br_missing
 
@@ -353,9 +392,18 @@ REM The codec suite ends on a ReadLn prompt with no trailing newline, so
 REM without this the verdict below lands on the same row as it.
 echo.
 
+if not "!MYSKIP!"=="" if "!RC!"=="!MYSKIP!" goto :br_skip
 if "!GATES!"=="0" goto :br_report
 if not "!RC!"=="0" goto :br_runfail
 echo    PASS  !STAGE!
+goto :eof
+
+:br_skip
+REM Loud on purpose. A skip that reads like a pass is what let the
+REM no-live-server gap survive: every stage was green and none had ever
+REM opened a socket.
+set /a SKIPPED+=1
+echo    SKIP  !STAGE!  -- did not run; see the message above
 goto :eof
 
 :br_report
