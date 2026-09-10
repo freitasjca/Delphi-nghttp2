@@ -32,7 +32,7 @@ arrived here in **1.0.0**.
 | Client-side FFI (`nghttp2_session_client_new`, `nghttp2_submit_request`, …) | **✓** |
 | `TNghttp2Client` — synchronous request/response API | **✓** |
 | **Multiplexed client streams** — `BeginRequest` / `PumpAll` / `TakeResponse` | **✓** (MULTISTREAM-1 — N concurrent streams on ONE connection) |
-| Native HTTP/2 test client (106/106, six suite configurations) | **✓** |
+| Native HTTP/2 test client (114/114, six suite configurations) | **✓** |
 | TLS + ALPN — server side (`TTlsServerContext`, `TTlsConnection`) | **✓** |
 | TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** |
 | OpenSSL 3.x + 1.1.x FFI with auto-detect + `SetDllDirectory` for local libs | **✓** |
@@ -140,7 +140,7 @@ FPC 3.3.1, including mTLS positive and the uncertified-client rejection; clean
 `dcclinux64` compile. **Those totals are the suite as it stood that day** — the
 point of the record is that a rewrite this deep needed no new tests, so the
 numbers are left as they were rather than restated. It has since grown to
-106/106 HTTP and 35/35 gRPC; the current matrix lives in the provider's
+114/114 HTTP and 35/35 gRPC; the current matrix lives in the provider's
 [`doc/platform-coverage.md`](https://github.com/freitasjca/horse-provider-nghttp2/blob/master/doc/platform-coverage.md). The 94 checks run in 117 ms h2c → 146 ms TLS → 189 ms
 mTLS, so the handshake pump adds no round trips and the mTLS increment is just
 the client-certificate flight.
