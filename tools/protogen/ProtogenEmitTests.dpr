@@ -716,7 +716,13 @@ begin
     Has(LSrc, 'procedure Seta(const AValue: TPayload);'));
 
   { Freed, not nilled - the class owns the instance. }
-  Check('the group Clear FREES the message member', Has(LSrc, 'Fa.Free'));
+  { SHADOW-4. The cast is the assertion. A proto field named `free` becomes a
+    published property that shadows TObject.Free ON THAT CLASS, so a bare
+    `Fa.Free` resolves to the property and the generated unit fails with
+    "Illegal expression" - migrationcenter/v1 declares `used` and `free` side
+    by side. Asserting the cast keeps a future simplification from quietly
+    reintroducing it. }
+  Check('the group Clear FREES the message member', Has(LSrc, 'TObject(Fa).Free'));
   Check('  and nils it afterwards', Has(LSrc, 'Fa := nil'));
   { FreeAndNil would need SysUtils, which a generated unit does not use. }
   Check('  without reaching for FreeAndNil', not Has(LSrc, 'FreeAndNil'));
@@ -783,7 +789,13 @@ begin
   Check('a safe value is left alone',
     Has(LSrc, 'PLAIN = 4') and (not Has(LSrc, 'PLAIN_')));
   { The destructor must still be able to call High(). }
-  Check('the destructor still uses High()', Has(LSrc, 'High(Fmany)'));
+  { QUALIFIED, and the qualification is the point. A proto field named `high`
+    shadows the High() intrinsic inside its OWN class's methods, so a bare
+    High(Fmany) in a destructor fails with 'Syntax error, "DO" expected' -
+    oracledatabase/v1 has `high` and `low` beside a repeated field. Asserting
+    the bare form would pass on either spelling and guard nothing. }
+  Check('the destructor uses QUALIFIED System.High()',
+        Has(LSrc, 'System.High(Fmany)'));
 end;
 
 procedure TestEmitForwardDecls;

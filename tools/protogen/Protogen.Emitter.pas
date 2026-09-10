@@ -265,7 +265,19 @@ begin
     (LName = 'copy')   or (LName = 'pos')       or (LName = 'ord')      or
     (LName = 'assigned') or (LName = 'inc')     or (LName = 'dec')      or
     (LName = 'true')   or (LName = 'false')     or (LName = 'nil')      or
-    (LName = 'self');
+    (LName = 'self')   or
+    { SHADOW-3. `system` is not a routine - it is the UNIT the generated code
+      now qualifies against: System.High, System.Length, System.SetLength.
+      A Pascal enum value lives at unit scope, so a value spelled SYSTEM
+      shadows that unit and the qualifier resolves to the enum instead:
+      `Identifier idents no member "Length"`. Real and current -
+      migrationcenter/v1 declares SYSTEM = 2.
+
+      This is the qualification fix biting itself: a shadow-proof reference
+      that is itself shadowable. Renaming the enum value is what makes the
+      qualifier safe, so the two changes are one fix and neither stands
+      alone. }
+    (LName = 'system');
 end;
 
 { TYPE names the generated code emits. Missed on the first pass, which covered
@@ -1456,7 +1468,7 @@ begin
           and pulling it in for one call would change the imports of every
           unit protogen has ever emitted. Free-then-nil is the same two
           operations and is what the destructor already emits. }
-        W('  F' + LPropName + '.Free;');
+        W('  TObject(F' + LPropName + ').Free;');
         W('  F' + LPropName + ' := nil;');
         W('end;');
         W;
@@ -1614,7 +1626,7 @@ begin
       { Guarded: Set(k, x) where x is ALREADY the stored instance must not free
         it and then store a dangling pointer. }
       W('      if F' + LProp + '[I].value <> AValue then');
-      W('        F' + LProp + '[I].value.Free;');
+      W('        TObject(F' + LProp + '[I].value).Free;');
     end;
     W('      F' + LProp + '[I].value := AValue;');
     W('      Exit;');
@@ -1635,7 +1647,7 @@ begin
     W('  I: Integer;');
     W('begin');
     W('  for I := 0 to System.High(F' + LProp + ') do');
-    W('    F' + LProp + '[I].Free;');
+    W('    TObject(F' + LProp + '[I]).Free;');
     W('  System.SetLength(F' + LProp + ', 0);');
     W('end;');
     W;
@@ -1672,10 +1684,10 @@ begin
     if LField.IsRepeated then
     begin
       W('  for I := 0 to System.High(F' + LProp + ') do');
-      W('    F' + LProp + '[I].Free;');
+      W('    TObject(F' + LProp + '[I]).Free;');
     end
     else
-      W('  F' + LProp + '.Free;');
+      W('  TObject(F' + LProp + ').Free;');
   end;
   W('  inherited;');
   W('end;');
@@ -1722,7 +1734,7 @@ begin
         same contract PROTOGEN-DTOR pinned for every other message field. }
       if IsOneofMessageMember(AMsg.Fields[I]) then
         begin
-          W('  F' + LProp + '.Free;');
+          W('  TObject(F' + LProp + ').Free;');
           W('  F' + LProp + ' := nil;');
         end
       else

@@ -111,7 +111,13 @@ implementation
 
 destructor TGetProductResponse.Destroy;
 begin
-  Fproduct.Free;
+  { The cast is not decoration. A proto field named `free` becomes a published
+    property that shadows TObject.Free on that class, and `Fx.Free` then
+    resolves to the property rather than the method - "Illegal expression",
+    from generated code the user never wrote. Real: migrationcenter/v1 has
+    `used` and `free` side by side. protogen emits the cast for the same
+    reason. }
+  TObject(Fproduct).Free;
   inherited Destroy;
 end;
 
