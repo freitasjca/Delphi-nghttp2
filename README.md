@@ -319,14 +319,23 @@ strongest of the three measures, and the only one that says the generator
 works. **No schema is rejected because of Pascal we emitted**; the remaining 71
 are 21 deliberate refusals and 50 on which FPC itself crashes.
 
-That 7,230 is a **floor, not the real figure.** The 50 crashes are FPC dying on
-an over-long *mangled* symbol (unit + class + method + parameter types), and
-until 2026-09-11 the test harness prefixed every generated unit with
-`Corpus.S<N>.` — 12 characters no real user has, which were themselves pushing
-symbols over the limit. Re-running those 50 schemas with a one-character prefix
-leaves **7**. So 43 of them were an artefact of how we measured, and with a
-realistic `--unit-prefix` they compile. The corrected full-sweep number has not
-been measured yet and is deliberately not quoted.
+**The 50 crashes are partly a property of the harness, and not in a direction
+that can be optimised away.** FPC dies on some generated units, and how many
+depends on the `--unit-prefix` the harness uses, because the prefix is a term in
+every mangled symbol. Measured over the full corpus:
+
+| | `Corpus.S<N>` | `C<N>` |
+|---|---|---|
+| COMPILED | **7,230** | 7,192 |
+| compiler crashed | **50** | 88 |
+
+A shorter prefix fixed 43 of the original 50 and broke 81 others — net 38 worse.
+So the crash column is not a stable property of the generator, and 7,230 is
+quoted with the prefix that produced it rather than presented as a ceiling.
+
+What *is* prefix-independent, measured under both: **DID NOT COMPILE = 0** and
+**refused = 21**. The emitter-defect figure — the one that says whether the
+generator emits valid Pascal — does not move.
 
 Two weaker measures have each been quoted as if they were the compile one:
 

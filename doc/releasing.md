@@ -52,14 +52,25 @@ the three numbers to read are COMPILED, DID NOT COMPILE (emitter defects) and
 `compiler crashed`, which is FPC falling over rather than our output being
 rejected and once overstated the defect count by 3.5x.
 
-**Figures from before 2026-09-11 are NOT comparable.** The harness used to name
-units `Corpus.S<N>.<path>`, and FPC crashes on an over-long *mangled* symbol
-(unit + class + method + parameter types) — so those 12 extra characters were
-themselves causing crashes. Re-running the 50 crashing schemas with a
-one-character prefix took them to **7**: 43 of 50 were the harness, not the
-generator. The prefix is now `C<N>`, so any COMPILED / `compiler crashed` figure
-quoted from an earlier run understates the generator and must be re-measured
-rather than carried forward.
+**Quote COMPILED and `compiler crashed` with the `--unit-prefix` that produced
+them.** The prefix is a term in every mangled symbol, and FPC's crashes move
+with it — in both directions. Measured over the full corpus on 2026-09-11:
+
+| | `Corpus.S<N>` (default) | `C<N>` |
+|---|---|---|
+| COMPILED | **7,230** | 7,192 |
+| compiler crashed | **50** | 88 |
+| DID NOT COMPILE | 0 | 0 |
+| refused | 21 | 21 |
+
+The short prefix was adopted briefly on the strength of re-running only the 50
+crashing schemas, where it looked like a 43-schema win. **That sample was
+selected on the outcome** — it could not contain a schema that started crashing
+— and the full sweep found 81 new failures. Reverted.
+
+So: **DID NOT COMPILE and refused are trustworthy figures; `compiler crashed` is
+a joint property of the generator and the harness.** Never tune the prefix
+against the crashing subset.
 
 Two debugging tools exist for that bucket, both built 2026-09-11:
 

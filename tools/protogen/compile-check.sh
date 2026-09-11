@@ -242,29 +242,39 @@ while IFS=$'\t' read -r N proto; do
   DONE=$(( DONE + 1 ))
   D="$OUT/g/$N"
   mkdir -p "$D"
-  # The prefix is DELIBERATELY ONE CHARACTER. It used to be "Corpus.S<N>", and
-  # that cost 12 characters of every generated unit name for no measurement
-  # value -- the harness was testing itself.
+  # DO NOT "optimise" this prefix without a FULL --all sweep. It was changed to
+  # "C" on 2026-09-11 and changed straight back, because the measurement that
+  # justified it was selected on the outcome variable.
   #
-  # FPC crashes on a long MANGLED symbol (unit + class + method + parameter
-  # types), and the generated unit name is prefix + path-derived segments, so
-  # the prefix is a direct term in it. Measured 2026-09-11 on the smallest
-  # crashing unit, changing nothing but the unit name:
+  # The reasoning was: FPC crashes on a long MANGLED symbol (unit + class +
+  # method + parameter types), the unit name is prefix + path segments, so a
+  # shorter prefix should crash less. A threshold sweep on the smallest crashing
+  # unit supported it exactly -- 75 chars crashed, 69 compiled, nothing else
+  # changed. Re-running THE 50 CRASHING SCHEMAS with "C" gave crashes 50 -> 7.
   #
-  #   75 chars -> Internal error 2015071503
-  #   69 chars -> compiles clean
+  # That subset could only ever show improvement. It contained schemas selected
+  # BECAUSE they crashed, so a schema that started crashing under the new prefix
+  # was excluded by construction. The full sweep:
   #
-  # A 6-character window, and "Corpus.S4136." was 13 of the 75. Re-running the
-  # 50 crashing schemas with "C" instead: crashes 50 -> 7, COMPILED 0 -> 43.
-  # 43 of the 50 were the HARNESS, never a defect a user could hit.
+  #                       Corpus.S<N>      C<N>
+  #     COMPILED             7230          7192
+  #     compiler crashed       50            88
+  #       EListError           34            69
+  #       Internal error       16            19
   #
-  # Override to reproduce that comparison, or to test a long user prefix:
-  #   PREFIX_BASE=Corpus.S bash compile-check.sh --only .compile-out/crashes.txt
+  # 43 of the original 50 stopped crashing and 81 OTHERS started. Net 38 worse.
+  # The prefix is not a monotonic "shorter is better" knob: it changes every
+  # generated identifier, and EListError in particular roughly DOUBLED. Why is
+  # unknown -- name length alone does not explain it.
   #
-  # NOTE: corpus totals from before 2026-09-11 were measured with the long
-  # prefix and are NOT comparable with figures from this script now. See
-  # doc/releasing.md.
-  PREFIX="${PREFIX_BASE:-C}$N"
+  # What IS prefix-independent, measured under both: DID NOT COMPILE = 0 and
+  # refused = 21. So emitter-defect and refusal figures are trustworthy across
+  # prefixes; the crash column is not, and is a property of the harness as much
+  # as of the generator.
+  #
+  # Override to reproduce the comparison:
+  #   PREFIX_BASE=C bash compile-check.sh --all
+  PREFIX="${PREFIX_BASE:-Corpus.S}$N"
 
   # -I the corpus root: googleapis import paths are corpus-relative
   # ('google/rpc/status.proto'), which is exactly what protoc expects too.
