@@ -38,7 +38,7 @@ the exit status too, so a failing build looks green twice over.
 
 ```bash
 bash tools/protogen/corpus-check.sh      # parse + emit, ~99.5% of 7301 schemas
-bash tools/protogen/compile-check.sh --all   # 7216/7301, 7 emitter defects
+bash tools/protogen/compile-check.sh --all   # 7230/7301, 0 emitter defects (~2h45m)
 ```
 
 `--all`, not the default sample: a 10% sample once reported four defect classes

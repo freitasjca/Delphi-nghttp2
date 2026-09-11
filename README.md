@@ -44,7 +44,7 @@ arrived here in **1.0.0**.
 | **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
 | **gRPC layer** — protobuf codec, registry (procedural + `RegisterService<T>`), dispatcher, all four RPC shapes | **✓** (extracted from `horse-provider-nghttp2` 2026-08-23; the units never depended on Horse, only their names did) |
 | **`.proto` tooling** — parser, `ProtogenCheck` verdict CLI, `protoc` differential test (`tools/protogen`) | **✓** (26 cases, 0 disagreements `protoc` would call a defect, vs libprotoc 35.1). See [`doc/protogen.md`](doc/protogen.md) |
-| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **7,216 of 7,301** real googleapis schemas generate code that **compiles** — parsed, emitted, and accepted by the compiler (2026-09-09) |
+| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **7,230 of 7,301** real googleapis schemas generate code that **compiles** — parsed, emitted, and accepted by the compiler, with **zero** emitter defects remaining (2026-09-11) |
 | **`import` closure** — `protogen` follows imports and emits one unit per file | **✓** (IMPORT-1, 1.16.0 — path-derived unit names, qualified cross-file references) |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
@@ -314,9 +314,11 @@ before 1.16.0; the 21 that went away were all proto2 `extend`, which the parser
 now skips rather than rejecting outright.
 
 **Which layer a number describes matters here more than the number.** The
-figure above is `7216 / 7301` schemas whose generated Pascal *compiles* — the
+figure above is `7230 / 7301` schemas whose generated Pascal *compiles* — the
 strongest of the three measures, and the only one that says the generator
-works. Two weaker ones have each been quoted as if they were it:
+works. The remaining 71 are 21 refusals and 50 schemas on which **FPC itself
+crashes**; no schema is now rejected because of Pascal we emitted. Two weaker
+measures have each been quoted as if they were this one:
 
 - *parses* — what an earlier "99.5%" meant for a month. It says nothing about
   whether Pascal was emitted at all, and behind it sat three emitter gaps worth
