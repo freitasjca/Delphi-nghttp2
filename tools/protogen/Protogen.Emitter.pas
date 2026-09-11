@@ -1840,6 +1840,28 @@ begin
     Result := 'str';
     Exit;
   end;
+  { UNIT-SHADOW-1. `system` is not a Delphi keyword — it is the unit the
+    generated code qualifies ALL array operations through: System.Length,
+    System.High, System.SetLength. A property named `system` shadows that unit
+    in every method body of the class, so `System.Length(FSomeArray)` resolves
+    to <the-property>.Length — which on a string property gives "Illegal
+    qualifier", and on any other type gives a different confusing error.
+
+    google.cloud.dataplex.v1 declares `string system = 11` on EntryType and
+    `string system = 2` on EntrySource; both classes also have map/repeated
+    fields. Those three schemas were the only DID NOT COMPILE cases after
+    IMPORT-1 was shipped.
+
+    Renamed to `sys` following the same abbreviation pattern as `string` -> `str`.
+    Unlike the FIELDWORD-1 cases below, this rename must be unconditional:
+    `System.` is emitted for every repeated and map field accessor regardless
+    of class shape, so there is no per-message narrowing to do. }
+  if AProtoName = 'system' then
+  begin
+    ARenamedFrom := AProtoName;
+    Result := 'sys';
+    Exit;
+  end;
   { Generic rename for a reserved word, or for `default`.
 
     FIELDWORD-1. A property is in scope inside its own class's method bodies,
@@ -1867,7 +1889,8 @@ begin
     Both failures are the same shape: whether a property shadows anything
     depends on what its OWN class's body calls, which this class function
     cannot see. `Default(` is the one call emitted for every has-bit field, so
-    it is the one name worth renaming unconditionally.
+    it is the one name worth renaming unconditionally. See also UNIT-SHADOW-1
+    above for `system`, which follows the same reasoning for a unit name.
 
     KNOWN GAP, unchanged by this fix: a message that has BOTH a repeated field
     and a field named `length`, `high` or `setlength` still collides. Not

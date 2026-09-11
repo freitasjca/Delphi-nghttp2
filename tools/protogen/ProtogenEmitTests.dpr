@@ -408,6 +408,10 @@ begin
   Check('string -> str',          LResult = 'str');
   Check('string: LRenamed set',   LRenamed = 'string');
 
+  LResult := TMessagesEmitter.PascalFieldName('system', LRenamed);
+  Check('system -> sys',          LResult = 'sys');
+  Check('system: LRenamed set',   LRenamed = 'system');
+
   LResult := TMessagesEmitter.PascalFieldName('type', LRenamed);
   Check('type -> type_',          LResult = 'type_');
   Check('type: LRenamed set',     LRenamed = 'type');
