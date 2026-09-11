@@ -48,7 +48,20 @@
 #  --all when you want the full sweep.
 #
 #  USAGE
-#    compile-check.sh [--sample N | --all] [corpus-dir]
+#    compile-check.sh [--sample N | --all | --only FILE] [corpus-dir]
+#
+#  --only FILE re-runs just the schemas named in FILE, which may be a plain
+#  list of .proto paths or crashes.txt / failures.txt copied verbatim -- any
+#  .proto path in it is matched. A --all sweep is ~2h45m; the 50 crashing
+#  schemas take about a minute, which is what makes iterating on them
+#  practical.
+#
+#  It keeps each schema's ORIGINAL corpus index for --unit-prefix, so the
+#  generated unit names are byte-identical to what the full sweep produced.
+#  That is not tidiness: FIX-IDENT-1 is identifier-LENGTH dependent, and a
+#  short-prefix spot-check once falsely disproved it. Renumbering a subset
+#  would let a crash disappear because its unit got a shorter name -- the run
+#  would be measuring the prefix instead of the schema.
 #
 #  ── First run, 2026-09-07 ──
 #
@@ -83,10 +96,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAMPLE=300
 CORPUS=""
 
+ONLY=""
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --all)    SAMPLE=0; shift ;;
     --sample) SAMPLE="${2:-300}"; shift 2 ;;
+    --only)   ONLY="${2:-}"; shift 2 ;;
     *)        CORPUS="$1"; shift ;;
   esac
 done
@@ -130,14 +146,40 @@ echo "collecting schemas..."
 find "$CORPUS" -name '*.proto' | sort > "$OUT/candidates.txt"
 
 TOTAL=$(wc -l < "$OUT/candidates.txt")
-if [[ "$SAMPLE" -gt 0 && "$TOTAL" -gt "$SAMPLE" ]]; then
+
+# selected.txt is "<corpus index><TAB><path>". The INDEX MUST be the line number
+# in candidates.txt, never a position within the selection.
+#
+# It feeds --unit-prefix as Corpus.S<index>, so renumbering renames every
+# generated unit and changes identifier LENGTHS. FIX-IDENT-1 is length-dependent
+# and a short-prefix spot-check once falsely disproved it. A subset run that
+# renumbered could therefore "fix" a crash by shortening its name -- the run
+# would be measuring the prefix, not the schema.
+#
+# --sample used to renumber for exactly this reason, so a sample run and an
+# --all run generated different unit names for the same schema. Now they agree.
+if [[ -n "$ONLY" ]]; then
+  # Re-run named schemas only. Matches full paths OR any unique suffix, so a
+  # line copied straight out of crashes.txt works.
+  [[ -r "$ONLY" ]] || { echo "FAIL: --only list not readable: $ONLY"; exit 2; }
+  grep -oE '/[^[:space:]]+\.proto' "$ONLY" | sed 's|^|/|; s|^//|/|' | sort -u > "$OUT/only.keys"
+  [[ -s "$OUT/only.keys" ]] || { echo "FAIL: no .proto paths found in $ONLY"; exit 2; }
+  awk 'NR==FNR { want[$0]=1; next }
+       { for (k in want) if (index($0, k) || index(k, $0)) { print FNR "\t" $0; next } }' \
+      "$OUT/only.keys" "$OUT/candidates.txt" > "$OUT/selected.txt"
+  WANTED=$(wc -l < "$OUT/only.keys"); GOT=$(wc -l < "$OUT/selected.txt")
+  echo "  --only: $GOT of $WANTED requested schemas matched the corpus"
+  # A silent shortfall would read as "those ones pass now".
+  [[ "$GOT" -eq "$WANTED" ]] || echo "  WARNING: $(( WANTED - GOT )) requested schema(s) NOT FOUND - not the same as passing"
+  [[ "$GOT" -gt 0 ]] || exit 2
+elif [[ "$SAMPLE" -gt 0 && "$TOTAL" -gt "$SAMPLE" ]]; then
   # Every Nth, not random: two runs of one corpus must compile the SAME files,
   # so a new failure is a new defect rather than a new draw.
   STEP=$(( TOTAL / SAMPLE ))
   [[ $STEP -lt 1 ]] && STEP=1
-  awk -v s="$STEP" 'NR % s == 1' "$OUT/candidates.txt" > "$OUT/selected.txt"
+  awk -v s="$STEP" 'NR % s == 1 { print NR "\t" $0 }' "$OUT/candidates.txt" > "$OUT/selected.txt"
 else
-  cp "$OUT/candidates.txt" "$OUT/selected.txt"
+  awk '{ print NR "\t" $0 }' "$OUT/candidates.txt" > "$OUT/selected.txt"
 fi
 PICKED=$(wc -l < "$OUT/selected.txt")
 
@@ -189,15 +231,40 @@ progress() {                  # <done> <total>
 }
 
 # ── Generate + compile ───────────────────────────────────────────────────────
-OK=0; GENFAIL=0; COMPFAIL=0; CRASH=0; N=0
+# N is the CORPUS index (drives --unit-prefix); DONE counts this run's progress.
+# They are equal only in an --all run; keeping them apart is what lets a subset
+# run keep each schema's original unit name.
+OK=0; GENFAIL=0; COMPFAIL=0; CRASH=0; N=0; DONE=0
 : > "$OUT/failures.txt"
 : > "$OUT/crashes.txt"
 
-while IFS= read -r proto; do
-  N=$(( N + 1 ))
+while IFS=$'\t' read -r N proto; do
+  DONE=$(( DONE + 1 ))
   D="$OUT/g/$N"
   mkdir -p "$D"
-  PREFIX="Corpus.S$N"
+  # The prefix is DELIBERATELY ONE CHARACTER. It used to be "Corpus.S<N>", and
+  # that cost 12 characters of every generated unit name for no measurement
+  # value -- the harness was testing itself.
+  #
+  # FPC crashes on a long MANGLED symbol (unit + class + method + parameter
+  # types), and the generated unit name is prefix + path-derived segments, so
+  # the prefix is a direct term in it. Measured 2026-09-11 on the smallest
+  # crashing unit, changing nothing but the unit name:
+  #
+  #   75 chars -> Internal error 2015071503
+  #   69 chars -> compiles clean
+  #
+  # A 6-character window, and "Corpus.S4136." was 13 of the 75. Re-running the
+  # 50 crashing schemas with "C" instead: crashes 50 -> 7, COMPILED 0 -> 43.
+  # 43 of the 50 were the HARNESS, never a defect a user could hit.
+  #
+  # Override to reproduce that comparison, or to test a long user prefix:
+  #   PREFIX_BASE=Corpus.S bash compile-check.sh --only .compile-out/crashes.txt
+  #
+  # NOTE: corpus totals from before 2026-09-11 were measured with the long
+  # prefix and are NOT comparable with figures from this script now. See
+  # doc/releasing.md.
+  PREFIX="${PREFIX_BASE:-C}$N"
 
   # -I the corpus root: googleapis import paths are corpus-relative
   # ('google/rpc/status.proto'), which is exactly what protoc expects too.
@@ -245,7 +312,7 @@ while IFS= read -r proto; do
     fi
   fi
 
-  progress "$N" "$PICKED"
+  progress "$DONE" "$PICKED"
 done < "$OUT/selected.txt"
 
 # Close the in-place line so the report does not land on top of it.

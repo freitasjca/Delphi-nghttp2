@@ -316,9 +316,19 @@ now skips rather than rejecting outright.
 **Which layer a number describes matters here more than the number.** The
 figure above is `7230 / 7301` schemas whose generated Pascal *compiles* — the
 strongest of the three measures, and the only one that says the generator
-works. The remaining 71 are 21 refusals and 50 schemas on which **FPC itself
-crashes**; no schema is now rejected because of Pascal we emitted. Two weaker
-measures have each been quoted as if they were this one:
+works. **No schema is rejected because of Pascal we emitted**; the remaining 71
+are 21 deliberate refusals and 50 on which FPC itself crashes.
+
+That 7,230 is a **floor, not the real figure.** The 50 crashes are FPC dying on
+an over-long *mangled* symbol (unit + class + method + parameter types), and
+until 2026-09-11 the test harness prefixed every generated unit with
+`Corpus.S<N>.` — 12 characters no real user has, which were themselves pushing
+symbols over the limit. Re-running those 50 schemas with a one-character prefix
+leaves **7**. So 43 of them were an artefact of how we measured, and with a
+realistic `--unit-prefix` they compile. The corrected full-sweep number has not
+been measured yet and is deliberately not quoted.
+
+Two weaker measures have each been quoted as if they were the compile one:
 
 - *parses* — what an earlier "99.5%" meant for a month. It says nothing about
   whether Pascal was emitted at all, and behind it sat three emitter gaps worth

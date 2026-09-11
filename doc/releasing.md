@@ -38,7 +38,7 @@ the exit status too, so a failing build looks green twice over.
 
 ```bash
 bash tools/protogen/corpus-check.sh      # parse + emit, ~99.5% of 7301 schemas
-bash tools/protogen/compile-check.sh --all   # 7230/7301, 0 emitter defects (~2h45m)
+bash tools/protogen/compile-check.sh --all   # 0 emitter defects (~2h45m)
 ```
 
 `--all`, not the default sample: a 10% sample once reported four defect classes
@@ -51,6 +51,32 @@ time the generator refused more. The denominator is 7301 — every schema — an
 the three numbers to read are COMPILED, DID NOT COMPILE (emitter defects) and
 `compiler crashed`, which is FPC falling over rather than our output being
 rejected and once overstated the defect count by 3.5x.
+
+**Figures from before 2026-09-11 are NOT comparable.** The harness used to name
+units `Corpus.S<N>.<path>`, and FPC crashes on an over-long *mangled* symbol
+(unit + class + method + parameter types) — so those 12 extra characters were
+themselves causing crashes. Re-running the 50 crashing schemas with a
+one-character prefix took them to **7**: 43 of 50 were the harness, not the
+generator. The prefix is now `C<N>`, so any COMPILED / `compiler crashed` figure
+quoted from an earlier run understates the generator and must be re-measured
+rather than carried forward.
+
+Two debugging tools exist for that bucket, both built 2026-09-11:
+
+```bash
+# re-run only named schemas (accepts crashes.txt verbatim) -- ~1 min, not ~2h45m
+bash tools/protogen/compile-check.sh --only .compile-out/crashes.txt
+
+# ablate + delta-debug one crashing unit down to a minimal reproducer
+bash tools/protogen/crash-reduce.sh .compile-out/g/<N>/<Unit>.pas
+
+# is it name length? sweep the unit name, all else identical
+bash tools/protogen/crash-namelen.sh <minimal-crash-*.pas>
+```
+
+`--only` preserves each schema's ORIGINAL corpus index, because the index feeds
+`--unit-prefix` and renumbering would change name lengths — letting a crash
+vanish for the wrong reason.
 
 Skip the sweep only when `git diff --name-only <last-swept-commit>..HEAD --
 tools/protogen/` is empty, and say which commit that was.
