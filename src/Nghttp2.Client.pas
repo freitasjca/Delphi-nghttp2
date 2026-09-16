@@ -18,18 +18,35 @@ unit Nghttp2.Client;
 //      C.Free;
 //    end;
 //
-//  Design constraints:
+//  Scope: this client drives the test suites and samples. It is not a
+//  general-purpose HTTP client; the constraints below are current fact, and
+//  anything beyond them is roadmap work (see README: session pool, async API).
+//
+//  Design constraints (reviewed 2026-09-16):
 //    - Synchronous only. SubmitRequest blocks until the target stream closes
-//      (END_STREAM from server). One in-flight request per client instance.
-//    - Prior-knowledge h2c only. The client sends the HTTP/2 preface
-//      (RFC 7540 §3.4) immediately after TCP connect — no h2c Upgrade
-//      handshake, no ALPN, no TLS. v1.1 adds TLS.
-//    - Thread affinity: NOT thread-safe. One request at a time per client.
+//      (END_STREAM from the server). BeginRequest / PumpAll / TakeResponse
+//      (MULTISTREAM-1) keep several streams open on ONE connection, but the
+//      caller's thread still drives the pump — there is no non-blocking submit.
+//    - Prior-knowledge HTTP/2 only. The client sends the HTTP/2 preface
+//      (RFC 7540 §3.4) immediately after TCP connect: no h2c Upgrade
+//      handshake, no ALPN negotiation, no HTTP/1.1 fallback, so the peer must
+//      already speak HTTP/2. TLS IS supported — assign TlsContext before
+//      Connect (client certificates included); leave it nil for cleartext.
+//    - Request bodies ARE supported. A non-empty ABody is sent through a
+//      libnghttp2 data_provider, and stays in memory until the stream closes,
+//      so this is not a streaming upload.
+//    - Responses are buffered whole into TNghttp2Response.Body. There is no
+//      incremental delivery, so SSE and large downloads are out of reach.
+//    - Connect takes a host and a port. [CL1] The host may be a NAME on
+//      Delphi (Windows + POSIX) and on FPC/Unix: Nghttp2.Socket resolves it
+//      and tries every address returned, so an IPv6 peer works. On
+//      FPC/Windows it must still be an IPv4 literal — there is no resolver to
+//      call there — and a name raises. No proxy, no redirects, no cookies, no
+//      content decompression, no retries.
+//    - One connection per instance, NOT thread-safe, with no pooling or reuse
+//      across hosts.
 //    - Cross-platform: reuses Nghttp2.Socket for all platform I/O — no
 //      Winapi.WinSock2 / Posix.* / FPC Sockets references in this unit.
-//    - v1 accepts request-body-less requests only (GET, HEAD, DELETE).
-//      POST/PUT with body lands in v0.2 (needs data_provider_read_callback
-//      wiring to stream the body up-front instead of buffering).
 //
 //  Wire behaviour (validated against nghttp / curl --http2-prior-knowledge):
 //    1. TCP connect
@@ -162,7 +179,8 @@ type
 
     // Send one request and block until the response arrives.
     //   AHeaders — regular headers (no pseudo-headers). May be empty.
-    //   ABody    — request body. v1 requires nil/empty; POST body support in v0.2.
+    //   ABody    — request body, sent through a data_provider when non-empty
+    //              and held in memory until the stream closes. nil for none.
     function SubmitRequest(
       const AMethod:  string;
       const APath:    string;
@@ -772,7 +790,8 @@ var
 begin
   // Very small URL parser: (http|https)://host[:port]/path. No auth, no
   // fragment, no query-string escaping beyond what's already in AURL.
-  // IPv4 literal only (no DNS resolution). Default ports: 80 / 443.
+  // [CL1] The host may be a name on Delphi; on FPC it must still be an IPv4
+  // literal (see ConnectToHost). Default ports: 80 / 443.
   LSchemePos := Pos('://', AURL);
   if LSchemePos = 0 then
     raise ENghttp2Client.CreateFmt(

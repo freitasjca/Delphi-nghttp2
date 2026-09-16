@@ -67,6 +67,7 @@ const
 var
   GPass: Integer = 0;
   GFail: Integer = 0;
+  GSkip: Integer = 0;
 
 procedure Check(const AName: string; APassed: Boolean; const ADetail: string = '');
 begin
@@ -83,6 +84,15 @@ begin
       WriteLn('  FAIL  ', AName, '  [', ADetail, ']');
     Inc(GFail);
   end;
+end;
+
+{ A skipped check did not run and did not pass. It is printed on its own line
+  with a reason, counted separately, and repeated in the summary - the one
+  thing it must never do is look like a PASS. }
+procedure Skip(const AName, AReason: string);
+begin
+  WriteLn('  SKIP  ', AName, '  [', AReason, ']');
+  Inc(GSkip);
 end;
 
 { OnRequest is a PLAIN procedure type - not `of object`, not an anonymous
@@ -112,6 +122,9 @@ var
   GConfig: TNghttp2Config;
   GClient: TNghttp2Client;
   GResp:   TNghttp2Response;
+  GByName: TNghttp2Client;   // CL1 - a second client, connected by name
+  GRaised: Boolean;
+  GErrMsg: string;
 
 begin
   WriteLn('Nghttp2ServerSmoke - does the transport actually run here?');
@@ -175,6 +188,70 @@ begin
       GClient.Free;
     end;
 
+    { ── CL1 - peer addressing ──────────────────────────────────────────── }
+
+    { A host NAME. This is the check the whole milestone exists for, so on FPC
+      it must SKIP loudly rather than quietly not happen: the resolver there is
+      still unimplemented and ConnectToHost says so. }
+{$IF DEFINED(FPC) AND NOT DEFINED(UNIX)}
+    { FPC/Windows only: netdb is Unix-only and winsock2 has no getaddrinfo. }
+    Skip('connect by name "localhost" answers 200',
+         'no resolver on FPC/Windows - see ConnectToHost (CL1)');
+    Skip('Nghttp2Get by host name returns 200',
+         'no resolver on FPC/Windows - see ConnectToHost (CL1)');
+{$ELSE}
+    GByName := TNghttp2Client.Create;
+    try
+      GByName.Connect('localhost', PORT);
+      GResp := GByName.SubmitRequest('GET', '/smoke', nil, nil);
+      Check('connect by name "localhost" answers 200', GResp.Status = 200,
+            'status ' + IntToStr(GResp.Status));
+      Check('connect by name returns the handler''s body',
+            TEncoding.UTF8.GetString(GResp.Body) = 'ok',
+            TEncoding.UTF8.GetString(GResp.Body));
+    finally
+      GByName.Free;
+    end;
+
+    { The URL path, which parses host/port itself and used to document
+      "IPv4 literal only". }
+    GResp := Nghttp2Get('http://localhost:' + IntToStr(PORT) + '/smoke');
+    Check('Nghttp2Get by host name returns 200', GResp.Status = 200,
+          'status ' + IntToStr(GResp.Status));
+{$IFEND}
+
+    { A name that cannot resolve must RAISE, and the message must name the
+      host - a bare errno sends the reader hunting through socket code. Runs on
+      both compilers: FPC raises its "must be an IPv4 literal" error here, which
+      also names the host. ".invalid" is reserved by RFC 2606, so this check
+      cannot start passing because somebody registered a domain. }
+    GRaised := False;
+    GErrMsg := '';
+    GByName := TNghttp2Client.Create;
+    try
+      try
+        GByName.Connect('no-such-host.invalid', PORT);
+      except
+        on E: Exception do
+        begin
+          GRaised := True;
+          GErrMsg := E.Message;
+        end;
+      end;
+    finally
+      GByName.Free;
+    end;
+    Check('an unresolvable name raises, naming the host',
+          GRaised and (Pos('no-such-host.invalid', GErrMsg) > 0), GErrMsg);
+
+    { IPv6 cannot be gated end-to-end here yet, and saying so beats a check
+      that quietly proves nothing: CreateListenerSocket binds AF_INET, so this
+      server has no IPv6 address to connect TO. The client-side v6 path is
+      exercised only once the listener learns AF_INET6 - a server-side
+      follow-up, tracked with CL1. }
+    Skip('connect to "::1" answers 200',
+         'server binds AF_INET only - needs an IPv6 listener first');
+
     GServer.Stop;
     Check('server stopped cleanly', True);
   finally
@@ -182,7 +259,12 @@ begin
   end;
 
   WriteLn;
-  WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed');
+  WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed, ', GSkip, ' skipped');
+  if GSkip > 0 then
+  begin
+    WriteLn('        ', GSkip, ' check(s) did NOT run - read the [reason] on each');
+    WriteLn('        SKIP line above before reading this run as complete.');
+  end;
   if GFail > 0 then
     ExitCode := EXIT_FAIL
   else

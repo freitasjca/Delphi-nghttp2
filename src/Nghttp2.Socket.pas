@@ -27,7 +27,9 @@ interface
 
 uses
 {$IF DEFINED(FPC) AND DEFINED(UNIX)}
-  SysUtils, Sockets, BaseUnix;
+  SysUtils, Sockets, BaseUnix;   { [CL1] the resolver is libc's own
+                                   getaddrinfo, bound in the implementation -
+                                   netdb (fcl-net) is deliberately NOT used }
 {$ELSEIF DEFINED(FPC)}
   SysUtils, Sockets, WinSock2;
 {$ELSEIF DEFINED(MSWINDOWS)}
@@ -36,6 +38,7 @@ uses
   System.SysUtils, Posix.Base, Posix.SysSocket, Posix.SysTypes,
   Posix.NetinetIn, Posix.ArpaInet, Posix.Unistd, Posix.Errno,
   Posix.SysSelect, Posix.SysTime, Posix.Signal,
+  Posix.NetDB,   { [CL1] getaddrinfo / freeaddrinfo / addrinfo }
   Posix.Fcntl;   { fcntl + O_NONBLOCK for SetSocketNonBlocking }
 {$IFEND}
 
@@ -88,10 +91,26 @@ function CreateListenerSocket(APort: Word; ABacklog: Integer;
 // APeerAddr is filled with the client's dotted-quad IPv4 address.
 function AcceptConnection(ALSock: TSocketHandle; out APeerAddr: string): TSocketHandle;
 
-// Client-side TCP connect. AHost must be an IPv4 literal ("127.0.0.1", "10.0.0.5"
-// etc.) — DNS resolution is out of scope for v1; add getaddrinfo later if needed.
-// Raises ENghttp2Socket on socket()/connect() failure. On success returns a
-// connected socket that the caller owns and must eventually CloseSocketHandle.
+// Client-side TCP connect.
+//
+// [CL1] On Delphi (Windows and POSIX) AHost may be a host NAME or an IP
+// literal: getaddrinfo is asked for AF_UNSPEC, and the returned list is walked
+// in order until one address connects, so an IPv6-only peer works without the
+// caller knowing. The resolver's ordering decides v4-vs-v6 preference.
+//
+// ON FPC + UNIX the same is true, through libc's getaddrinfo bound directly
+// (see the FFI block in the implementation). netdb is deliberately not used:
+// without -dFPC_USE_LIBC it runs its own DNS client, whose unit header warns
+// it "hardly does any error checking".
+//
+// ON FPC + WINDOWS AHost must still be an IPv4 literal: FPC's winsock2 unit
+// declares no getaddrinfo (checked against 3.2.2 sources), so there is nothing
+// to call without hand-binding ws2_32. A name raises ENghttp2Socket saying so
+// rather than silently connecting somewhere else.
+//
+// Raises ENghttp2Socket on resolve, socket or connect failure — the message
+// always names the host. On success returns a connected socket that the caller
+// owns and must eventually CloseSocketHandle.
 function ConnectToHost(const AHost: string; APort: Word): TSocketHandle;
 
 // Waits up to ATimeoutMS for the socket to become readable.
@@ -429,28 +448,158 @@ begin
 end;
 {$IFEND}
 
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+{ [CL1] libc's resolver, bound here rather than reached through netdb.
+
+  Why not netdb: unless the host application is built with -dFPC_USE_LIBC, its
+  ResolveName runs netdb's own DNS client, and that unit's header warns it
+  "hardly does any error checking" and "could easily be exploited by someone
+  sending malicious UDP packets". Binding libc directly gives every FPC build
+  the platform resolver — the same one the Delphi branches use — with no build
+  flag to remember, and drops the fcl-net package dependency.
+
+  PACKRECORDS C is load-bearing. On 64-bit, the 4-byte ai_addrlen is followed
+  by 4 bytes of padding before the first pointer; a packed record would read
+  ai_addr from the wrong offset and hand connect() garbage.
+
+  The FIELD ORDER differs by platform: Linux declares ai_addr before
+  ai_canonname, the BSDs and macOS put ai_canonname first. Getting this
+  backwards passes a char* to connect(). }
+{$PACKRECORDS C}
+type
+  PNgAddrInfo = ^TNgAddrInfo;
+  TNgAddrInfo = record
+    ai_flags:     Integer;
+    ai_family:    Integer;
+    ai_socktype:  Integer;
+    ai_protocol:  Integer;
+    ai_addrlen:   LongWord;        { socklen_t - 32-bit on Linux and the BSDs }
+  {$IF DEFINED(LINUX) OR DEFINED(ANDROID)}
+    ai_addr:      psockaddr;
+    ai_canonname: PAnsiChar;
+  {$ELSE}
+    ai_canonname: PAnsiChar;
+    ai_addr:      psockaddr;
+  {$IFEND}
+    ai_next:      PNgAddrInfo;
+  end;
+{$PACKRECORDS DEFAULT}
+
+function ng_getaddrinfo(ANode, AService: PAnsiChar; AHints: PNgAddrInfo;
+  var ARes: PNgAddrInfo): Integer; cdecl; external 'c' name 'getaddrinfo';
+procedure ng_freeaddrinfo(ARes: PNgAddrInfo); cdecl;
+  external 'c' name 'freeaddrinfo';
+function ng_gai_strerror(ACode: Integer): PAnsiChar; cdecl;
+  external 'c' name 'gai_strerror';
+{$IFEND}
+
 // ─── ConnectToHost ────────────────────────────────────────────────────────
 // Cross-platform client TCP connect. Mirrors CreateListenerSocket's 3-branch
-// FPC / MSWINDOWS / Delphi POSIX structure. IPv4 literal only in v1.
+// FPC / MSWINDOWS / Delphi POSIX structure.
+//
+// [CL1] The Delphi branches resolve through getaddrinfo and try every address
+// returned, in order, until one connects. Both were previously hand-building
+// an AF_INET sockaddr from a dotted-quad string, which is why a name could not
+// work and — on POSIX — why a malformed literal became a connect to
+// 255.255.255.255 (inet_addr's failure value went in unchecked).
+//
+// Why the whole list rather than the first entry: a dual-stack host commonly
+// returns an IPv6 address first, and on a machine whose IPv6 route is dead
+// that entry fails while the IPv4 one behind it works. Taking only the first
+// address is the classic cause of "works in curl, fails in my program".
 
 function ConnectToHost(const AHost: string; APort: Word): TSocketHandle;
-{$IF DEFINED(FPC)}
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+var
+  LHints:     TNgAddrInfo;
+  LRes, LCur: PNgAddrInfo;
+  LHostAnsi, LPortAnsi: AnsiString;
+  LRc:        Integer;
+  LSock:      LongInt;
+begin
+  { Same shape as the Delphi branches: ask for AF_UNSPEC and walk the whole
+    list, because a dual-stack host commonly returns IPv6 first and that entry
+    fails on a machine whose v6 route is dead. libc also parses literals, so
+    there is no separate literal path to keep in step. }
+  FillChar(LHints, SizeOf(LHints), 0);
+  LHints.ai_family   := AF_UNSPEC;
+  LHints.ai_socktype := SOCK_STREAM;
+  { ai_protocol stays 0 - "any protocol for this socket type", which for
+    SOCK_STREAM is TCP. IPPROTO_TCP is not reliably in scope from Sockets on
+    every Unix target, and 0 says the same thing to getaddrinfo. }
+
+  LHostAnsi := AnsiString(AHost);
+  LPortAnsi := AnsiString(IntToStr(APort));
+  LRes      := nil;
+
+  LRc := ng_getaddrinfo(PAnsiChar(LHostAnsi), PAnsiChar(LPortAnsi),
+                        @LHints, LRes);
+  if (LRc <> 0) or (LRes = nil) then
+    raise ENghttp2Socket.CreateFmt('cannot resolve "%s": %s',
+      [AHost, string(AnsiString(ng_gai_strerror(LRc)))]);
+
+  Result := INVALID_SOCKET_HANDLE;
+  try
+    LCur := LRes;
+    while LCur <> nil do
+    begin
+      LSock := fpSocket(LCur^.ai_family, LCur^.ai_socktype, LCur^.ai_protocol);
+      if LSock >= 0 then
+      begin
+        if fpConnect(LSock, LCur^.ai_addr, LCur^.ai_addrlen) >= 0 then
+        begin
+          Result := LSock;
+          Break;
+        end;
+        CloseSocket(LSock);
+      end;
+      LCur := LCur^.ai_next;
+    end;
+  finally
+    ng_freeaddrinfo(LRes);
+  end;
+
+  if Result = INVALID_SOCKET_HANDLE then
+    raise ENghttp2Socket.CreateFmt(
+      'connect(%s:%d) failed - every resolved address refused the connection',
+      [AHost, APort]);
+
+  // Same reason as the server side — a client that stalls 40 ms per request
+  // makes every measurement taken with it meaningless.
+  SetSocketNoDelay(Result);
+end;
+{$ELSEIF DEFINED(FPC)}
 var
   LSock: LongInt;
   LAddr: TInetSockAddr;
   LHostAnsi: AnsiString;
+  LNetAddr: in_addr;
 begin
+  { [CL1] FPC on Windows resolves nothing: netdb is Unix-only (its
+    implementation uses BaseUnix unconditionally) and FPC's winsock2 unit
+    declares no getaddrinfo at all - verified against the 3.2.2 sources. The
+    remaining option is hand-binding ws2_32's getaddrinfo, which is not worth
+    doing blind; do it on a machine that can compile and run it.
+
+    What DID change: StrToNetAddr's result is now checked, so a host NAME
+    raises instead of silently connecting to 0.0.0.0. }
+  LHostAnsi := AnsiString(AHost);
+  LNetAddr  := StrToNetAddr(LHostAnsi);
+  if LNetAddr.s_addr = 0 then
+    raise ENghttp2Socket.CreateFmt(
+      'cannot connect to "%s" - on FPC/Windows this must be an IPv4 literal; ' +
+      'no resolver is available there (CL1)', [AHost]);
+
   LSock := fpSocket(AF_INET, SOCK_STREAM, 0);
   if LSock < 0 then
     raise ENghttp2Socket.Create('fpSocket failed');
 
   FillChar(LAddr, SizeOf(LAddr), 0);
-  LAddr.sin_family := AF_INET;
-  LAddr.sin_port   := htons(APort);
-  LHostAnsi        := AnsiString(AHost);
-  LAddr.sin_addr.s_addr := StrToNetAddr(LHostAnsi).s_addr;
+  LAddr.sin_family      := AF_INET;
+  LAddr.sin_port        := htons(APort);
+  LAddr.sin_addr.s_addr := LNetAddr.s_addr;
 
-  if fpConnect(LSock, @LAddr, SizeOf(LAddr)) < 0 then
+  if fpConnect(LSock, psockaddr(@LAddr), SizeOf(LAddr)) < 0 then
   begin
     CloseSocket(LSock);
     raise ENghttp2Socket.CreateFmt('fpConnect(%s:%d) failed', [AHost, APort]);
@@ -462,71 +611,128 @@ begin
 end;
 {$ELSEIF DEFINED(MSWINDOWS)}
 var
-  LSock: TSocket;
-  LAddr: sockaddr_in;
-  LHostAnsi: AnsiString;
-  LWsaErr: Integer;
+  LHints:    addrinfo;
+  LRes, LCur: Paddrinfo;
+  LHostAnsi, LPortAnsi: AnsiString;
+  LSock:     TSocket;
+  LRc:       Integer;
+  LWsaErr:   Integer;
 begin
   InitSockets;
 
-  LSock := socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if LSock = INVALID_SOCKET then
-    raise ENghttp2Socket.CreateFmt('socket() failed: WSA=%d', [WSAGetLastError]);
+  FillChar(LHints, SizeOf(LHints), 0);
+  LHints.ai_family   := AF_UNSPEC;      // v4 or v6 — the resolver orders them
+  LHints.ai_socktype := SOCK_STREAM;
+  LHints.ai_protocol := IPPROTO_TCP;
 
-  FillChar(LAddr, SizeOf(LAddr), 0);
-  LAddr.sin_family := AF_INET;
-  LAddr.sin_port   := htons(APort);
-  LHostAnsi        := AnsiString(AHost);
-  LAddr.sin_addr.S_addr := inet_addr(PAnsiChar(LHostAnsi));
-  if LAddr.sin_addr.S_addr = INADDR_NONE then
-  begin
-    closesocket(LSock);
+  LHostAnsi := AnsiString(AHost);
+  LPortAnsi := AnsiString(IntToStr(APort));
+  LRes      := nil;
+
+  LRc := getaddrinfo(MarshaledAString(PAnsiChar(LHostAnsi)),
+                     MarshaledAString(PAnsiChar(LPortAnsi)), LHints, LRes);
+  if (LRc <> 0) or (LRes = nil) then
     raise ENghttp2Socket.CreateFmt(
-      'inet_addr(%s) failed - pass an IPv4 literal (DNS not implemented in v1)',
-      [AHost]);
+      'cannot resolve "%s": getaddrinfo=%d', [AHost, LRc]);
+
+  Result  := INVALID_SOCKET_HANDLE;
+  LWsaErr := 0;
+  try
+    LCur := LRes;
+    while LCur <> nil do
+    begin
+      LSock := socket(LCur^.ai_family, LCur^.ai_socktype, LCur^.ai_protocol);
+      if LSock = INVALID_SOCKET then
+        LWsaErr := WSAGetLastError
+      else
+      begin
+        if Winapi.WinSock2.connect(LSock, LCur^.ai_addr^,
+             Integer(LCur^.ai_addrlen)) <> SOCKET_ERROR then
+        begin
+          Result := LSock;
+          Break;
+        end;
+        // Capture WSA error BEFORE closesocket — closesocket clears the last
+        // WSA error, leaving diagnostic messages like "WSA=0" that hide the
+        // real failure code (typically 10061 ECONNREFUSED or 10060 ETIMEDOUT).
+        LWsaErr := WSAGetLastError;
+        closesocket(LSock);
+      end;
+      LCur := LCur^.ai_next;
+    end;
+  finally
+    // freeaddrinfo takes the record by reference, not the pointer.
+    freeaddrinfo(LRes^);
   end;
 
-  if Winapi.WinSock2.connect(LSock, TSockAddr(LAddr), SizeOf(LAddr)) = SOCKET_ERROR then
-  begin
-    // Capture WSA error BEFORE closesocket — closesocket clears the last
-    // WSA error, leaving diagnostic messages like "WSA=0" that hide the real
-    // failure code (typically 10061 ECONNREFUSED or 10060 ETIMEDOUT).
-    LWsaErr := WSAGetLastError;
-    closesocket(LSock);
+  if Result = INVALID_SOCKET_HANDLE then
     raise ENghttp2Socket.CreateFmt('connect(%s:%d) failed: WSA=%d',
       [AHost, APort, LWsaErr]);
-  end;
+
   // Same reason as the server side — a client that stalls 40 ms per request
   // makes every measurement taken with it meaningless.
-  SetSocketNoDelay(LSock);
-  Result := LSock;
+  SetSocketNoDelay(Result);
 end;
 {$ELSE}
 var
-  LSock: Integer;
-  LAddr: sockaddr_in;
-  LHostAnsi: AnsiString;
+  LHints:    addrinfo;
+  LRes, LCur: Paddrinfo;
+  LHostAnsi, LPortAnsi: AnsiString;
+  LSock:     Integer;
+  LRc:       Integer;
+  LErr:      Integer;
 begin
-  LSock := socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if LSock < 0 then
-    raise ENghttp2Socket.CreateFmt('socket() failed: errno=%d', [errno]);
+  { NOTE: Posix.NetDB's declarations could not be checked in the dev container
+    (this Delphi install ships Windows RTL sources only). The logic is the same
+    walk as the Windows branch; if the Linux build rejects a name here, fix the
+    spelling against the local Posix.NetDB and leave the structure alone. }
+  FillChar(LHints, SizeOf(LHints), 0);
+  LHints.ai_family   := AF_UNSPEC;
+  LHints.ai_socktype := SOCK_STREAM;
+  LHints.ai_protocol := IPPROTO_TCP;
 
-  FillChar(LAddr, SizeOf(LAddr), 0);
-  LAddr.sin_family := AF_INET;
-  LAddr.sin_port   := htons(APort);
-  LHostAnsi        := AnsiString(AHost);
-  LAddr.sin_addr.s_addr := inet_addr(PAnsiChar(LHostAnsi));
+  LHostAnsi := AnsiString(AHost);
+  LPortAnsi := AnsiString(IntToStr(APort));
+  LRes      := nil;
 
-  if connect(LSock, sockaddr(LAddr), SizeOf(LAddr)) < 0 then
-  begin
-    __close(LSock);
-    raise ENghttp2Socket.CreateFmt('connect(%s:%d) failed: errno=%d',
-      [AHost, APort, errno]);
+  LRc := getaddrinfo(MarshaledAString(PAnsiChar(LHostAnsi)),
+                     MarshaledAString(PAnsiChar(LPortAnsi)), LHints, LRes);
+  if (LRc <> 0) or (LRes = nil) then
+    raise ENghttp2Socket.CreateFmt(
+      'cannot resolve "%s": getaddrinfo=%d', [AHost, LRc]);
+
+  Result := INVALID_SOCKET_HANDLE;
+  LErr   := 0;
+  try
+    LCur := LRes;
+    while LCur <> nil do
+    begin
+      LSock := socket(LCur^.ai_family, LCur^.ai_socktype, LCur^.ai_protocol);
+      if LSock < 0 then
+        LErr := errno
+      else
+      begin
+        if connect(LSock, LCur^.ai_addr^, LCur^.ai_addrlen) >= 0 then
+        begin
+          Result := LSock;
+          Break;
+        end;
+        LErr := errno;
+        __close(LSock);
+      end;
+      LCur := LCur^.ai_next;
+    end;
+  finally
+    freeaddrinfo(LRes^);
   end;
+
+  if Result = INVALID_SOCKET_HANDLE then
+    raise ENghttp2Socket.CreateFmt('connect(%s:%d) failed: errno=%d',
+      [AHost, APort, LErr]);
+
   // Same reason as the server side — a client that stalls 40 ms per request
   // makes every measurement taken with it meaningless.
-  SetSocketNoDelay(LSock);
-  Result := LSock;
+  SetSocketNoDelay(Result);
 end;
 {$IFEND}
 
