@@ -639,7 +639,24 @@ begin
 
   LNames[0] := ':method';    LValues[0] := AnsiString(UpperCase(AMethod));
   LNames[1] := ':path';      LValues[1] := AnsiString(APath);
-  LNames[2] := ':scheme';    LValues[2] := 'http';
+
+  { [CL2] :scheme names the scheme of the TARGET URI (RFC 7540 §8.1.2.3), so a
+    request travelling over TLS must say https. This used to be hardcoded to
+    'http', which meant every TLS request advertised the wrong scheme - legal
+    to parse, but gRPC peers and proxies are entitled to reject the mismatch,
+    and anything keying a virtual host off it sees the wrong value.
+
+    FTlsConn is the honest signal, not FTlsContext: it becomes non-nil only
+    after DoHandshake succeeded AND ALPN selected h2, it is what DoRead and
+    DoSendAll route bytes through, and it is nilled during teardown before the
+    socket closes. FTlsContext merely records what the caller assigned, so it
+    would still claim https after a handshake that never ran. }
+  LNames[2] := ':scheme';
+  if FTlsConn <> nil then
+    LValues[2] := 'https'
+  else
+    LValues[2] := 'http';
+
   LNames[3] := ':authority'; LValues[3] := AnsiString(LAuthority);
   for I := 0 to High(AHeaders) do
   begin

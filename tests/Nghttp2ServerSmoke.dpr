@@ -106,6 +106,15 @@ begin
     AStream.Header['content-type'] := 'text/plain; charset=utf-8';
     AStream.Send(TEncoding.UTF8.GetBytes('ok'));
   end
+  else if AStream.Header[':path'] = '/scheme' then
+  begin
+    { [CL2] Echo back the :scheme pseudo-header the CLIENT advertised. This
+      server is h2c, so the only value provable here is "http"; the https half
+      is proven by the provider's TLS stages, which echo the same header. }
+    AStream.StatusCode := 200;
+    AStream.Header['content-type'] := 'text/plain; charset=utf-8';
+    AStream.Send(TEncoding.UTF8.GetBytes(AStream.Header[':scheme']));
+  end
   else
   begin
     { A second path, so the test proves the request REACHED the handler and was
@@ -184,6 +193,15 @@ begin
       GResp := GClient.SubmitRequest('GET', '/nothing-here', nil, nil);
       Check('an unrouted path returned 404', GResp.Status = 404,
             'status ' + IntToStr(GResp.Status));
+
+      { [CL2] The client must advertise the scheme it is actually using. Over
+        h2c that is "http" - the value this connection can prove. The TLS half
+        ("https") is asserted by the provider's 114-check suite, which runs the
+        same echo against a TLS server. }
+      GResp := GClient.SubmitRequest('GET', '/scheme', nil, nil);
+      Check('client advertised :scheme = http on h2c',
+            TEncoding.UTF8.GetString(GResp.Body) = 'http',
+            TEncoding.UTF8.GetString(GResp.Body));
     finally
       GClient.Free;
     end;
