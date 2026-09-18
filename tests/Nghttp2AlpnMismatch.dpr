@@ -41,11 +41,18 @@ program Nghttp2AlpnMismatch;
 //  noalpn    the full CL2b diagnostic: raises, names ALPN, names host and port,
 //            says no protocol was negotiated, and does NOT emit the pre-CL2b
 //            'selected ""'.
-//  nooverlap only that the client REFUSES and stays unusable. Deliberately no
-//            ALPN-wording assertion: this failure is raised by the TLS layer as
-//            a raw OpenSSL reason code and never mentions ALPN. Asserting
-//            otherwise would be asserting a fiction. (Improving that message is
-//            tracked separately - it is a behaviour change, not a test.)
+//  nooverlap [B5] the same diagnostic quality: raises, names ALPN, names host
+//            and port, names alert 120, and says the peer shares no ALPN
+//            protocol with us.
+//
+//            This arm used to assert only "the client REFUSES", because the
+//            message was whatever raw prose OpenSSL had for reason 1120 - and
+//            that prose DIFFERS BY VERSION: 3.0.13 says "reason(1120)", 3.6.0
+//            says "tlsv1 alert no application protocol". Any wording assertion
+//            would have passed on one machine and failed on the next. B5 keys
+//            off the reason CODE instead, so the explanation is now stable and
+//            can be demanded here. The last check in this arm pins exactly
+//            that property rather than either spelling.
 //
 //  In both modes the client must NOT be left looking connected.
 //
@@ -228,15 +235,39 @@ begin
   end
   else
   begin
-    { This peer kills the handshake with alert 120 before any ALPN check can
-      run, so the only honest assertion is that the failure came from the
-      handshake itself. No ALPN-wording check here on purpose - see the header. }
-    Check('the refusal came from the TLS handshake (SSL_connect)',
-          GRaised and (Pos('SSL_connect', GMsg) > 0), GMsg);
-    WriteLn('  note: this peer sends a fatal no_application_protocol alert, so');
-    WriteLn('        the message is a raw OpenSSL reason code and mentions');
-    WriteLn('        neither ALPN nor h2. That is current behaviour, not a bug');
-    WriteLn('        this test asserts away.');
+    { [B5] This peer kills the handshake with alert 120 before any ALPN check
+      can run. Until B5 the only honest assertion was "SSL_connect appears in
+      the text", because the message was a raw OpenSSL reason string that named
+      neither ALPN nor h2 - and worse, named it DIFFERENTLY per OpenSSL version.
+      Now the reason code is recognised and the message is uniform, so the same
+      diagnostic quality the noalpn arm gets can be demanded here. }
+    Check('the message names ALPN',
+          GRaised and (Pos('ALPN', GMsg) > 0), GMsg);
+    Check('the message names the host that failed',
+          GRaised and (Pos(GHost, GMsg) > 0), GMsg);
+    Check('the message names the port that failed',
+          GRaised and (Pos(IntToStr(GPort), GMsg) > 0), GMsg);
+    Check('the message names the alert that caused it',
+          GRaised and (Pos('120', GMsg) > 0), GMsg);
+    Check('the message says the peer shares no protocol with us',
+          GRaised and (Pos('no ALPN protocol', GMsg) > 0), GMsg);
+
+    { THE VERSION-INDEPENDENCE ASSERTION, and the reason B5 exists.
+
+      OpenSSL 3.0.13 renders this reason as "reason(1120)" and 3.6.0 as
+      "tlsv1 alert no application protocol" - same error code, different prose.
+      A message built from that text says something different on every machine.
+      Matching on the reason CODE is what makes the sentence above stable, and
+      this check pins the property rather than either spelling: whichever raw
+      text OpenSSL appends as evidence, the ALPN explanation must be present.
+
+      Deliberately NOT asserting the raw text is absent - it is kept on purpose
+      as evidence, and asserting its absence would forbid that. }
+    Check('the diagnosis does not depend on the OpenSSL version''s wording',
+          GRaised and (Pos('no ALPN protocol', GMsg) > 0)
+                  and ((Pos('reason(1120)', GMsg) > 0)
+                    or (Pos('no application protocol', GMsg) > 0)
+                    or (Pos('alert', GMsg) > 0)), GMsg);
   end;
 
   WriteLn;

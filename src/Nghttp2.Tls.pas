@@ -47,6 +47,20 @@ const
 type
   ENghttp2Tls = class(Exception);
 
+  { [B5] The peer refused the handshake with a fatal no_application_protocol
+    alert (alert 120, RFC 7301 §3.2) - it shares no ALPN protocol with us.
+
+    A SUBCLASS rather than a flag, so that every existing `on E: ENghttp2Tls`
+    handler and all 15 RaiseTls call sites keep working untouched, while a
+    caller that knows the host and port can catch this one case and say
+    something useful about it. TNghttp2Client.Connect does exactly that.
+
+    Server-side this is unreachable: AlpnSelectH2Only returns NOACK rather than
+    sending the alert, so our server never produces one. Raised from the shared
+    RaiseTls anyway, because "unreachable" is a claim about code that can
+    change. }
+  ENghttp2TlsAlpnRefused = class(ENghttp2Tls);
+
   { Outcome of a non-blocking TLS operation.
 
     The two WANT states are NOT errors. They name the readiness the caller
@@ -369,10 +383,31 @@ end;
 
 procedure RaiseTls(const AWhere: string; AResult: Integer; ASsl: PSSL);
 var
-  LSslErr: Integer;
-  LErrStr: string;
+  LSslErr:  Integer;
+  LErrStr:  string;
+  LErrCode: Cardinal;
 begin
-  LErrStr := NghttpsslLastError;
+  { [B5] One pop, yielding BOTH text and code. NghttpsslLastError used to be
+    called here, and ERR_get_error consumes the entry - so the reason was gone
+    before anyone could test it, and the only thing left to report was prose
+    that differs between OpenSSL versions. }
+  LErrStr := NghttpsslLastErrorEx(LErrCode);
+
+  { The no-ALPN-overlap case, raised as its own class so a caller with the host
+    and port can replace this with something a reader can act on. The check is
+    on the REASON CODE, never the text: 3.0.13 renders this as "reason(1120)"
+    and 3.6.0 as "tlsv1 alert no application protocol" for the identical code,
+    so any string match would pass on one machine and fail on the next. The raw
+    OpenSSL text is still appended - it is the evidence, and discarding it would
+    trade one unhelpful message for another. }
+  if NghttpsslReasonOf(LErrCode) = SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL then
+    raise ENghttp2TlsAlpnRefused.CreateFmt(
+      'ALPN: the peer refused the handshake with a fatal ' +
+      'no_application_protocol alert (alert 120, RFC 7301 3.2). It shares no ' +
+      'ALPN protocol with this client, which offers "h2" only. Use an HTTP/2 ' +
+      'server, or h2c (no TlsContext) if the endpoint is cleartext HTTP/2. ' +
+      '[%s, ERR=%s]', [AWhere, LErrStr]);
+
   if ASsl <> nil then
   begin
     LSslErr := SSL_get_error(ASsl, AResult);

@@ -526,7 +526,8 @@ end;
 
 procedure TNghttp2Client.Connect(const AHost: string; APort: Word);
 var
-  LRet: Integer;
+  LRet:   Integer;
+  LTlsOk: Boolean;   { [B5] gates the TLS teardown - see the block below }
 begin
   // NghttpLoad already fired in Create — see comment there.
 
@@ -545,7 +546,13 @@ begin
   // failure closes the socket and re-raises — no fallback to cleartext.
   if FTlsContext <> nil then
   begin
+    { [B5] LTlsOk gates the teardown in the finally below. The cleanup used to
+      live as bare statements in the except block, which cannot coexist with an
+      `on` handler - so it moved here, where it runs once on every path and
+      stays in one place. }
+    LTlsOk := False;
     try
+     try
       { [CL2b, corrected by FIX-ALPN-RACE-1] Offering 'h2' is not optional for
         this client - it has no HTTP/1.1 fallback, so there is no configuration
         in which NOT offering h2 is useful, and leaving it opt-in only created
@@ -603,15 +610,45 @@ begin
           'The server may not support HTTP/2 over TLS, or it may require a ' +
           'protocol other than h2 (which this client does not implement).',
           [FTlsConn.NegotiatedProtocol]);
+
+      LTlsOk := True;
+     finally
+       { Runs on EVERY path, exactly once. LTlsOk is set only after the last
+         statement that can raise, so any failure above - Create, DoHandshake,
+         or either ALPN raise - lands here with it still False and tears the
+         connection down. On success it is True and this does nothing. }
+       if not LTlsOk then
+       begin
+         if FTlsConn <> nil then
+           FreeAndNil(FTlsConn);
+         CloseSocketHandle(FSocket);
+         FSocket := INVALID_SOCKET_HANDLE;
+       end;
+     end;
     except
-      // On TLS failure, tear down everything and re-raise. The caller sees
-      // the ENghttp2Tls / ENghttp2Client with a specific error message.
-      if FTlsConn <> nil then
-      begin
-        FreeAndNil(FTlsConn);
-      end;
-      CloseSocketHandle(FSocket);
-      FSocket := INVALID_SOCKET_HANDLE;
+      { [B5] A Pascal except block is EITHER a statement list OR a list of `on`
+        handlers - never both. The teardown that used to sit here as bare
+        statements is now in the nested try..finally that closes just above,
+        which runs it on every path exactly once. Writing it into each `on` arm
+        instead would compile, and would leave two copies of cleanup to drift
+        apart.
+
+        The no-overlap refusal is the one TLS failure this layer can say more
+        about than Nghttp2.Tls can: only here are the host and port known.
+        Re-raised as ENghttp2Client so it reads like the sibling ALPN failures
+        above, which name the endpoint too - a caller should not have to care
+        whether ALPN died during the handshake or after it.
+
+        Everything else keeps the bare re-raise, unwrapped and unclassified. }
+      on E: ENghttp2TlsAlpnRefused do
+        raise ENghttp2Client.CreateFmt(
+          'ALPN: %s:%d refused the handshake - it shares no ALPN protocol ' +
+          'with this client, which offers "h2" only and has no HTTP/1.1 ' +
+          'fallback. The peer sent a fatal no_application_protocol alert ' +
+          '(alert 120, RFC 7301 3.2), so the connection never completed. Use ' +
+          'an HTTP/2 server, or h2c (no TlsContext) if the endpoint is ' +
+          'cleartext HTTP/2. [%s]', [FHost, FPort, E.Message]);
+    else
       raise;
     end;
   end;

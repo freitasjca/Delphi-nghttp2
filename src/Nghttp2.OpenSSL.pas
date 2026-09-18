@@ -247,6 +247,22 @@ function NghttpsslVersion: string;
 // Returns '(no error)' if the error queue is empty.
 function NghttpsslLastError: string;
 
+// [B5] Same single pop as NghttpsslLastError, but also yields the raw error
+// code so the caller can test the REASON. Needed because ERR_get_error
+// CONSUMES the entry: text and code cannot be fetched by two separate calls,
+// which is why the reason was unavailable to RaiseTls before.
+function NghttpsslLastErrorEx(out ACode: Cardinal): string;
+
+// [B5] The reason field of an OpenSSL error code — the version-stable part.
+// The rendered TEXT is not stable: 3.0.13 prints "reason(1120)" where 3.6.0
+// prints "tlsv1 alert no application protocol" for the SAME code. Never match
+// on the string.
+function NghttpsslReasonOf(ACode: Cardinal): Cardinal;
+
+const
+  // RFC 7301 §3.2 no_application_protocol, as OpenSSL reports it.
+  SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL = 1120;
+
 implementation
 
 const
@@ -609,18 +625,45 @@ begin
     Result := GLastLoadError;
 end;
 
+function NghttpsslLastErrorEx(out ACode: Cardinal): string;
+var
+  LBuf: array[0..255] of AnsiChar;
+begin
+  ACode := 0;
+  if not GLoaded then Exit('(OpenSSL not loaded)');
+  ACode := ERR_get_error();
+  if ACode = 0 then
+    Exit('(no error)');
+  FillChar(LBuf, SizeOf(LBuf), 0);
+  ERR_error_string_n(ACode, @LBuf[0], SizeOf(LBuf) - 1);
+  Result := string(AnsiString(PAnsiChar(@LBuf[0])));
+end;
+
 function NghttpsslLastError: string;
 var
   LCode: Cardinal;
-  LBuf:  array[0..255] of AnsiChar;
 begin
-  if not GLoaded then Exit('(OpenSSL not loaded)');
-  LCode := ERR_get_error();
-  if LCode = 0 then
-    Exit('(no error)');
-  FillChar(LBuf, SizeOf(LBuf), 0);
-  ERR_error_string_n(LCode, @LBuf[0], SizeOf(LBuf) - 1);
-  Result := string(AnsiString(PAnsiChar(@LBuf[0])));
+  { [B5] Reimplemented on the Ex form so the code and the text come from ONE
+    pop. ERR_get_error CONSUMES the entry, so a caller that wanted both would
+    otherwise get the text and then an empty queue - which is exactly why the
+    reason was unavailable to RaiseTls before. All existing callers are
+    unaffected. }
+  Result := NghttpsslLastErrorEx(LCode);
+end;
+
+function NghttpsslReasonOf(ACode: Cardinal): Cardinal;
+begin
+  { [B5] ERR_GET_REASON is a MACRO, not an exported symbol, so the mask is
+    reimplemented here - and the two OpenSSL branches disagree about its width:
+    1.1.x masks $FFF, 3.x masks $7FFFFF.
+
+    The wider mask is used because it is correct on 3.x and, for any reason
+    below 4096, produces the identical answer on 1.1.x. That covers the value
+    this is for: SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL = 1120 = $460, so
+    $0A000460 yields $460 under either mask. A reason of 4096 or more WOULD
+    diverge between the branches; none is tested against here, and if one ever
+    is, this needs a version split rather than a wider constant. }
+  Result := ACode and $7FFFFF;
 end;
 
 initialization
