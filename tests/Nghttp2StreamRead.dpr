@@ -282,7 +282,7 @@ begin
 
       Check('ReadChunk delivered the body across several calls',
             GCalls >= 2, IntToStr(GCalls) + ' call(s)');
-      Check('no call exceeded the requested size',
+      Check('the whole body arrived - nothing lost between chunks',
             GAccLen = TOTAL_LEN, IntToStr(GAccLen) + ' of ' + IntToStr(TOTAL_LEN));
       Check('the terminal call returned 0 (end of stream, not a timeout)',
             GLast = 0, IntToStr(GLast));
