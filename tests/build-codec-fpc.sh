@@ -741,6 +741,87 @@ else
   fi
 fi
 
+# ── loader thread-safety (FIX-LOADRACE-1) ────────────────────────────────────
+# Both FFI loaders were `if GLoaded then Exit(True)` ... an entire library load
+# ... `GLoaded := True`, with no lock between the halves. NghttpsslLoad also had
+# a Boolean "recursion guard" whose own comment said "single-threaded init
+# assumed", and which answered a second thread arriving mid-load with
+# Exit(False) — telling the caller OpenSSL had failed to load while it was in
+# fact succeeding on the other thread.
+#
+# WHY THIS STAGE LOOPS, where no other stage does. The guarded region is entered
+# exactly ONCE per process: after the first load every caller takes the raceless
+# early return. So one execution is one sample, and the sampling has to happen
+# out here by running the binary repeatedly. That is the same lesson as the ALPN
+# race — a single green run of a concurrency bug is luck, not evidence.
+#
+# EXIT CODES, and the one that matters: 0 clean, 1 the race was observed, 3 the
+# OpenSSL arm never ran because the library is absent. All-3 is NOT a pass — it
+# means the only arm that can detect this defect did not execute, and it is
+# reported as a SKIP that says so.
+echo
+echo "── loader thread-safety (FIX-LOADRACE-1) ─────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2LoaderRace.dpr" ]]; then
+  echo "  SKIP  Nghttp2LoaderRace.dpr not present"
+else
+  LROUT="$OUT/loader-race"
+  mkdir -p "$LROUT"
+  rm -f "$LROUT"/*.ppu "$LROUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$LROUT" -FE"$LROUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2LoaderRace.dpr" > "$LROUT/build.log" 2>&1 \
+     && [[ -x "$LROUT/Nghttp2LoaderRace" ]]; then
+
+    LR_RUNS=20
+    LR_RACED=0
+    LR_NOARM=0
+    LR_OTHER=0
+    LR_FIRSTBAD=""
+
+    for LR_I in $(seq 1 $LR_RUNS); do
+      if command -v timeout > /dev/null 2>&1; then
+        timeout 60 "$LROUT/Nghttp2LoaderRace" < /dev/null > "$LROUT/run-$LR_I.log" 2>&1
+        LR_RC=$?
+      else
+        "$LROUT/Nghttp2LoaderRace" < /dev/null > "$LROUT/run-$LR_I.log" 2>&1
+        LR_RC=$?
+      fi
+      case "$LR_RC" in
+        0) ;;
+        3) LR_NOARM=$((LR_NOARM + 1)) ;;
+        1) LR_RACED=$((LR_RACED + 1))
+           if [[ -z "$LR_FIRSTBAD" ]]; then LR_FIRSTBAD="$LROUT/run-$LR_I.log"; fi ;;
+        *) LR_OTHER=$((LR_OTHER + 1))
+           if [[ -z "$LR_FIRSTBAD" ]]; then LR_FIRSTBAD="$LROUT/run-$LR_I.log"; fi ;;
+      esac
+    done
+
+    echo "  $LR_RUNS fresh processes — raced: $LR_RACED, no OpenSSL arm: $LR_NOARM, other: $LR_OTHER"
+
+    if [[ $LR_NOARM -eq $LR_RUNS ]]; then
+      echo "  SKIP  OpenSSL absent in every run, so the ONLY arm that can detect"
+      echo "        this race never executed. This stage verified NOTHING —"
+      echo "        do not read it as a pass."
+    elif [[ $LR_RACED -gt 0 ]] || [[ $LR_OTHER -gt 0 ]]; then
+      echo "  FAIL  $LR_RACED of $LR_RUNS runs saw a PARTIAL load failure"
+      echo "        (some threads refused, others succeeded, same instant)."
+      echo "        That is FIX-LOADRACE-1 — a concurrent first load."
+      if [[ -n "$LR_FIRSTBAD" ]]; then sed 's/^/        | /' "$LR_FIRSTBAD"; fi
+      [[ $RC -eq 0 ]] && RC=1
+    else
+      echo "  loader race: PASSED — $LR_RUNS/$LR_RUNS clean"
+    fi
+  else
+    echo "  FAIL  Nghttp2LoaderRace.dpr did not compile"
+    grep -E "Error|Fatal" "$LROUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $LROUT/build.log"
+    RC=2
+  fi
+fi
+
 # ── samples/grpc-server — compile only ───────────────────────────────────────
 # That sample is this library's claim that the gRPC layer needs no web
 # framework, and a claim nobody compiles is a claim nobody has checked. It is

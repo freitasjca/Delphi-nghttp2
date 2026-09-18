@@ -367,6 +367,79 @@ echo    SKIP  Nghttp2StreamRead.dpr not present
 
 :after_streamread
 
+REM -- Stage 4f. Loader thread-safety (FIX-LOADRACE-1). ------------------
+REM
+REM Both FFI loaders were `if GLoaded then Exit(True)` ... an entire library
+REM load ... `GLoaded := True`, with no lock between the halves. NghttpsslLoad
+REM also carried a Boolean "recursion guard" whose own comment read
+REM "single-threaded init assumed", and which answered a second thread arriving
+REM mid-load with Exit(False) - telling the caller OpenSSL had FAILED TO LOAD
+REM while it was in fact succeeding on the other thread.
+REM
+REM WHY THIS STAGE LOOPS, where no other stage does. The guarded region is
+REM entered exactly ONCE per process: after the first load every caller takes
+REM the raceless early return. One execution is therefore one sample, and the
+REM sampling has to happen out here. A single green run of a concurrency bug is
+REM luck, not evidence - that is what the ALPN race cost us.
+REM
+REM EXIT CODES: 0 clean, 1 the race was observed, 3 the OpenSSL arm never ran
+REM because the library is absent. ALL-3 IS NOT A PASS - it means the only arm
+REM that can detect this defect did not execute, and it is reported as a SKIP
+REM saying exactly that.
+REM
+REM Exact string compares below, not "if errorlevel N": errorlevel means >= N,
+REM so a crash (a huge exit code) would be miscounted as "OpenSSL absent" and
+REM reported as a SKIP. That is the wrong direction to be wrong in.
+if not exist "Nghttp2LoaderRace.dpr" goto :no_loaderrace
+echo -- Nghttp2LoaderRace ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2LoaderRace.dpr" > "Nghttp2LoaderRace.buildlog" 2>&1
+if errorlevel 1 goto :loaderrace_buildfail
+if not exist "Nghttp2LoaderRace.exe" goto :loaderrace_buildfail
+set "LR_RUNS=20"
+set /a LR_RACED=0
+set /a LR_NOARM=0
+set /a LR_OTHER=0
+for /L %%i in (1,1,20) do (
+  Nghttp2LoaderRace.exe < nul > "Nghttp2LoaderRace.run%%i.log" 2>&1
+  set "LR_RC=!errorlevel!"
+  if "!LR_RC!"=="3" ( set /a LR_NOARM+=1 ) else if "!LR_RC!"=="1" ( set /a LR_RACED+=1 ) else if not "!LR_RC!"=="0" ( set /a LR_OTHER+=1 )
+)
+echo.
+echo    !LR_RUNS! fresh processes -- raced: !LR_RACED!, no OpenSSL arm: !LR_NOARM!, other: !LR_OTHER!
+if "!LR_NOARM!"=="!LR_RUNS!" goto :loaderrace_skip
+if not "!LR_RACED!"=="0" goto :loaderrace_fail
+if not "!LR_OTHER!"=="0" goto :loaderrace_fail
+echo    PASS  Nghttp2LoaderRace - !LR_RUNS!/!LR_RUNS! clean concurrent first loads
+goto :after_loaderrace
+
+:loaderrace_fail
+echo    FAIL  Nghttp2LoaderRace - !LR_RACED! of !LR_RUNS! runs saw a PARTIAL load failure
+echo          (some threads refused while others succeeded, in the same instant).
+echo          That is FIX-LOADRACE-1 - a concurrent first load.
+echo          Per-run logs: Nghttp2LoaderRace.run*.log
+set /a FAILED+=1
+goto :after_loaderrace
+
+:loaderrace_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2LoaderRace - OpenSSL absent in every run; the ONLY arm
+echo          that can detect this race never executed. NOT a pass.
+goto :after_loaderrace
+
+:loaderrace_buildfail
+echo    FAIL  Nghttp2LoaderRace did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2LoaderRace.buildlog"
+echo.
+echo    Full log: Nghttp2LoaderRace.buildlog
+set /a FAILED+=1
+goto :after_loaderrace
+
+:no_loaderrace
+echo -- Nghttp2LoaderRace ---------------------------------------------------------------
+echo    SKIP  Nghttp2LoaderRace.dpr not present
+
+:after_loaderrace
+
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in
 REM    no Nghttp2 unit, so STAGEUNITS is "." rather than ..\src -- if it ever
