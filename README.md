@@ -32,9 +32,12 @@ arrived here in **1.0.0**.
 | Client-side FFI (`nghttp2_session_client_new`, `nghttp2_submit_request`, …) | **✓** |
 | `TNghttp2Client` — synchronous request/response API | **✓** |
 | **Multiplexed client streams** — `BeginRequest` / `PumpAll` / `TakeResponse` | **✓** (MULTISTREAM-1 — N concurrent streams on ONE connection) |
-| Native HTTP/2 test client (114/114, six suite configurations) | **✓** |
+| Native HTTP/2 test client (115/115, six suite configurations) | **✓** |
 | TLS + ALPN — server side (`TTlsServerContext`, `TTlsConnection`) | **✓** |
-| TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** |
+| TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** (1.18.0 — `Connect` offers `h2` itself; a peer that negotiates nothing, or something never offered, is refused with a message that says which) |
+| **Host names + IPv6 in `ConnectToHost`** | **✓** (1.18.0 — `getaddrinfo` on all four platform arms, walking the address list; previously an IPv4 literal only, and two of three branches never checked the parse) |
+| **Request timeout that actually expires** | **✓** (1.18.0 — the deadline was documented and checked, but only *between* reads, so a peer that accepted and went silent parked the client forever) |
+| **Incremental response reads** — `ReadChunk` | **✓** (1.18.0 — opt in per stream with `BeginRequest(…, AStreamResponse := True)`; the body is delivered as it arrives instead of buffered whole, which is what SSE and large downloads need) |
 | OpenSSL 3.x + 1.1.x FFI with auto-detect + `SetDllDirectory` for local libs | **✓** |
 | mTLS (client cert verification) | **✓** |
 | Password-protected private keys (`SSL_CTX_set_default_passwd_cb`) | **implemented, untested** — callback wired, no fixture uses an encrypted key |
@@ -140,7 +143,7 @@ FPC 3.3.1, including mTLS positive and the uncertified-client rejection; clean
 `dcclinux64` compile. **Those totals are the suite as it stood that day** — the
 point of the record is that a rewrite this deep needed no new tests, so the
 numbers are left as they were rather than restated. It has since grown to
-114/114 HTTP and 35/35 gRPC; the current matrix lives in the provider's
+115/115 HTTP and 35/35 gRPC; the current matrix lives in the provider's
 [`doc/platform-coverage.md`](https://github.com/freitasjca/horse-provider-nghttp2/blob/master/doc/platform-coverage.md). The 94 checks run in 117 ms h2c → 146 ms TLS → 189 ms
 mTLS, so the handshake pump adds no round trips and the mTLS increment is just
 the client-certificate flight.
@@ -230,7 +233,8 @@ src/
   Nghttp2.Engine.Epoll.pas    — Linux epoll event loop
   Nghttp2.Engine.Iocp.pas     — Windows IOCP event loop
   Nghttp2.Server.pas          — accept loop + per-connection session lifecycle
-  Nghttp2.Client.pas          — synchronous HTTP/2 client (TNghttp2Client + TNghttp2Response)
+  Nghttp2.Client.pas          — synchronous HTTP/2 client (TNghttp2Client + TNghttp2Response),
+                                with opt-in incremental reads via ReadChunk
   Nghttp2.Protobuf.pas        — Protobuf wire-format codec
   Nghttp2.Protobuf.Rtti.pas   — RTTI-driven Protobuf ↔ Delphi/FPC record mapping
   Nghttp2.Grpc.Attributes.pas — [TGrpcService('pkg.Svc')] for the IInvokable API
