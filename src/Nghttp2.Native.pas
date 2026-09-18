@@ -40,14 +40,16 @@ interface
 uses
 {$IF DEFINED(FPC)}
   { FPC: DynLibs is FPC's cross-platform DLL loader.  Windows unit only
-    needed for GetLastError / SysErrorMessage on that platform. }
-  SysUtils, DynLibs
+    needed for GetLastError / SysErrorMessage on that platform.
+    SyncObjs supplies TCriticalSection - see GLoadLock (FIX-LOADRACE-1). }
+  SysUtils, SyncObjs, DynLibs
   {$IFDEF MSWINDOWS}, Windows{$ENDIF};
 {$ELSE}
   { Delphi: System.SysUtils provides SafeLoadLibrary + POSIX shims for
     GetProcAddress/FreeLibrary.  On Windows HMODULE/GetProcAddress/FreeLibrary
-    live in Winapi.Windows.  Posix.Dlfcn used on POSIX for dlerror only. }
-  System.SysUtils
+    live in Winapi.Windows.  Posix.Dlfcn used on POSIX for dlerror only.
+    System.SyncObjs supplies TCriticalSection - see GLoadLock. }
+  System.SysUtils, System.SyncObjs
   {$IF DEFINED(MSWINDOWS)}
   , Winapi.Windows
   {$ELSE}
@@ -473,6 +475,24 @@ var
   GLastLoadError: string;
   GVersion: string;
 
+  { [FIX-LOADRACE-1] Serialises NghttpLoad and NghttpUnload.
+
+    NghttpLoad was `if GLoaded then Exit(True)` followed, forty lines later, by
+    `GLoaded := True` - a check-then-set with the entire load between the two.
+    Two threads arriving together both saw False and both ran the whole
+    sequence: DoLoadLib twice, ResolveSymbols twice rewriting the same ~50
+    function pointers, and two handles acquired where the unload path only ever
+    releases one.
+
+    Every other unit in src/ that shares state across threads already uses a
+    TCriticalSection - Session, Server, both engines, the gRPC registry. These
+    two loaders were the exception, and the comment on the OpenSSL one said so
+    outright: "single-threaded init assumed".
+
+    Created in initialization, which runs before any user thread exists, and
+    freed in finalization AFTER NghttpUnload has finished using it. }
+  GLoadLock: TCriticalSection;
+
 // ─── Cross-platform / cross-compiler dynamic loading helpers ────────────
 // Mirrors Nghttp2.OpenSSL.pas — same three shims.
 
@@ -629,45 +649,56 @@ var
   Attempted: string;
   LInfo: Pnghttp2_info;
 begin
-  if GLoaded then Exit(True);
+  { [FIX-LOADRACE-1] The GLoaded test is INSIDE the lock, deliberately. An
+    unlocked double-checked read would be correct only under memory-ordering
+    assumptions this codebase has no business making, and nothing here needs
+    the speed: NghttpLoad is reached from TNghttp2Client.Create,
+    TNghttp2Server.Start and test mains - never per request, never per
+    connection. The body below is unchanged apart from its indentation. }
+  GLoadLock.Enter;
+  try
+    if GLoaded then Exit(True);
 
-  Attempted := '';
-  for I := Low(LIBNGHTTP2_NAMES) to High(LIBNGHTTP2_NAMES) do
-  begin
-    if Attempted <> '' then Attempted := Attempted + ', ';
-    Attempted := Attempted + LIBNGHTTP2_NAMES[I];
-    GLib := DoLoadLib(LIBNGHTTP2_NAMES[I]);
-    if GLib <> HANDLE_ZERO then Break;
+    Attempted := '';
+    for I := Low(LIBNGHTTP2_NAMES) to High(LIBNGHTTP2_NAMES) do
+    begin
+      if Attempted <> '' then Attempted := Attempted + ', ';
+      Attempted := Attempted + LIBNGHTTP2_NAMES[I];
+      GLib := DoLoadLib(LIBNGHTTP2_NAMES[I]);
+      if GLib <> HANDLE_ZERO then Break;
+    end;
+
+    if GLib = HANDLE_ZERO then
+    begin
+      GLastLoadError := Format(
+        'libnghttp2 not found - tried [%s]. OS error: %s',
+        [Attempted, LastOsLoadError]);
+      Exit(False);
+    end;
+
+    if not ResolveSymbols(GLib) then
+    begin
+      // ResolveSymbols already populated GLastLoadError with the missing symbol.
+      DoUnloadLib(GLib);
+      GLib := HANDLE_ZERO;
+      Exit(False);
+    end;
+
+    // Success — cache the version string for NghttpVersion accessor.
+    // nghttp2_version(0) returns a pointer to an nghttp2_info struct owned by
+    // the library (never nil, never needs freeing per nghttp2 docs).
+    LInfo := nghttp2_version(0);
+    if (LInfo <> nil) and (LInfo^.version_str <> nil) then
+      GVersion := string(AnsiString(LInfo^.version_str))
+    else
+      GVersion := '(unknown)';
+
+    GLoaded := True;
+    GLastLoadError := '';
+    Result := True;
+  finally
+    GLoadLock.Leave;
   end;
-
-  if GLib = HANDLE_ZERO then
-  begin
-    GLastLoadError := Format(
-      'libnghttp2 not found - tried [%s]. OS error: %s',
-      [Attempted, LastOsLoadError]);
-    Exit(False);
-  end;
-
-  if not ResolveSymbols(GLib) then
-  begin
-    // ResolveSymbols already populated GLastLoadError with the missing symbol.
-    DoUnloadLib(GLib);
-    GLib := HANDLE_ZERO;
-    Exit(False);
-  end;
-
-  // Success — cache the version string for NghttpVersion accessor.
-  // nghttp2_version(0) returns a pointer to an nghttp2_info struct owned by
-  // the library (never nil, never needs freeing per nghttp2 docs).
-  LInfo := nghttp2_version(0);
-  if (LInfo <> nil) and (LInfo^.version_str <> nil) then
-    GVersion := string(AnsiString(LInfo^.version_str))
-  else
-    GVersion := '(unknown)';
-
-  GLoaded := True;
-  GLastLoadError := '';
-  Result := True;
 end;
 
 function NghttpLoadError: string;
@@ -692,21 +723,38 @@ end;
 
 procedure NghttpUnload;
 begin
-  if not GLoaded then Exit;
-  DoUnloadLib(GLib);
-  GLib := HANDLE_ZERO;
-  GLoaded := False;
-  GVersion := '';
-  // Function-pointer vars retain their stale pointers; that's fine because
-  // NghttpIsLoaded=False will prevent callers from invoking them. Callers
-  // must re-check IsLoaded after Unload if they intend to Load again.
+  { [FIX-LOADRACE-1] Same lock as NghttpLoad. This writes GLib and GLoaded, so
+    a thread part-way through a load must not have them torn down underneath
+    it - and two concurrent unloads must not both reach DoUnloadLib. }
+  GLoadLock.Enter;
+  try
+    if not GLoaded then Exit;
+    DoUnloadLib(GLib);
+    GLib := HANDLE_ZERO;
+    GLoaded := False;
+    GVersion := '';
+    // Function-pointer vars retain their stale pointers; that's fine because
+    // NghttpIsLoaded=False will prevent callers from invoking them. Callers
+    // must re-check IsLoaded after Unload if they intend to Load again.
+  finally
+    GLoadLock.Leave;
+  end;
 end;
 
 initialization
+  { The lock FIRST - it has to exist before anything can call NghttpLoad. Unit
+    initialization runs before any user thread exists, so it needs no guard of
+    its own, and Pascal runs a used unit's initialization before its user's. }
+  GLoadLock := TCriticalSection.Create;
   GLib := HANDLE_ZERO;
   GLoaded := False;
 
 finalization
+  { Order matters: NghttpUnload TAKES the lock, so it must run before the lock
+    is freed. Reversing these two lines is a use-after-free that would only
+    show up at process exit. }
   NghttpUnload;
+  GLoadLock.Free;
+  GLoadLock := nil;
 
 end.

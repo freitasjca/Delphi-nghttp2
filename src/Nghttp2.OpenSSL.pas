@@ -38,7 +38,7 @@ uses
   { FPC (Windows + Linux + macOS): DynLibs is FPC's cross-platform DLL loader
     (wraps LoadLibrary on Windows, dlopen on POSIX). Windows unit is only
     needed on Windows for SetDllDirectory. }
-  SysUtils, Classes, DynLibs
+  SysUtils, Classes, SyncObjs, DynLibs
   {$IFDEF MSWINDOWS}, Windows{$ENDIF};
 {$ELSE}
   { Delphi (Windows + Linux + macOS): System.SysUtils provides
@@ -48,7 +48,7 @@ uses
     dlopen already resolves against the exe directory via rpath).
     Posix.Dlfcn is included on POSIX ONLY for `dlerror` (better error text
     than SysUtils exposes) — we don't call dlopen/dlsym/dlclose directly. }
-  System.SysUtils, System.Classes
+  System.SysUtils, System.Classes, System.SyncObjs
   {$IF DEFINED(MSWINDOWS)}
   , Winapi.Windows
   {$ELSE}
@@ -319,7 +319,21 @@ var
   GLibCrypto: TDllHandle;
   GLoaded:    Boolean;
   GVersion:   string;
-  GLoadLock:  Boolean;      // simple recursion guard (single-threaded init assumed)
+  { [FIX-LOADRACE-1] Was `GLoadLock: Boolean`, commented "simple recursion
+    guard (single-threaded init assumed)". That assumption was false:
+    NghttpsslLoad is reached from TTlsClientContext.Create and
+    TTlsServerContext.Create, which application threads call freely.
+
+    For the threaded case the Boolean was worse than no guard at all. A second
+    thread arriving during a first-time load hit `if GLoadLock then Exit(False)`
+    and was told OpenSSL had FAILED TO LOAD - a spurious, misleading failure -
+    rather than waiting for the load already in flight. A real lock makes it
+    wait and then observe GLoaded = True.
+
+    Nothing is lost by dropping the re-entry concept: there is no recursion
+    path into NghttpsslLoad. TryLoad calls only DoLoadLib and GetProcAddress,
+    neither of which re-enters this unit. }
+  GLoadLock:  TCriticalSection;
   GLastLoadError: string;   // populated by TryLoad on failure — surfaced via NghttpsslLoadError
 
 // ─── Cross-platform / cross-compiler dynamic loading helpers ────────────
@@ -501,10 +515,13 @@ var
   LExeDir: string;
 {$IFEND}
 begin
-  if GLoaded then Exit(True);
-  if GLoadLock then Exit(False);   // recursion / re-entry guard
-  GLoadLock := True;
+  { [FIX-LOADRACE-1] Lock FIRST, then test GLoaded - the test is part of what
+    has to be serialised. See GLoadLock's declaration for what the old Boolean
+    guard did to a second thread arriving mid-load. }
+  GLoadLock.Enter;
   try
+    if GLoaded then Exit(True);
+
 {$IF DEFINED(MSWINDOWS)}
     // Force LoadLibrary to search the .exe's directory BEFORE the system
     // directory. Without this, Windows' default DLL search order finds any
@@ -549,19 +566,27 @@ begin
       '[OpenSSL 1.1.x attempt] ' + LErr11;
     Result := False;
   finally
-    GLoadLock := False;
+    GLoadLock.Leave;
   end;
 end;
 
 procedure NghttpsslUnload;
 begin
-  if not GLoaded then Exit;
-  DoUnloadLib(GLibSSL);
-  DoUnloadLib(GLibCrypto);
-  GLibSSL    := HANDLE_ZERO;
-  GLibCrypto := HANDLE_ZERO;
-  GLoaded    := False;
-  GVersion   := '';
+  { [FIX-LOADRACE-1] Same lock as NghttpsslLoad. This releases both handles and
+    clears GLoaded - state a thread part-way through a load is actively using,
+    and state two concurrent unloads must not both act on. }
+  GLoadLock.Enter;
+  try
+    if not GLoaded then Exit;
+    DoUnloadLib(GLibSSL);
+    DoUnloadLib(GLibCrypto);
+    GLibSSL    := HANDLE_ZERO;
+    GLibCrypto := HANDLE_ZERO;
+    GLoaded    := False;
+    GVersion   := '';
+  finally
+    GLoadLock.Leave;
+  end;
 end;
 
 function NghttpsslIsLoaded: Boolean;
@@ -599,13 +624,21 @@ begin
 end;
 
 initialization
+  { The lock FIRST - it has to exist before anything can call NghttpsslLoad.
+    Unit initialization runs before any user thread exists, and Pascal runs a
+    used unit's initialization before its user's, so this needs no guard. }
+  GLoadLock  := TCriticalSection.Create;
   GLoaded    := False;
   GLibSSL    := HANDLE_ZERO;
   GLibCrypto := HANDLE_ZERO;
   GVersion   := '';
-  GLoadLock  := False;
 
 finalization
+  { Order matters: NghttpsslUnload TAKES the lock, so it must run before the
+    lock is freed. Reversing these two lines is a use-after-free that would
+    surface only at process exit. }
   NghttpsslUnload;
+  GLoadLock.Free;
+  GLoadLock  := nil;
 
 end.
