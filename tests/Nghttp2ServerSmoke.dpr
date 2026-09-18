@@ -106,6 +106,16 @@ begin
     AStream.Header['content-type'] := 'text/plain; charset=utf-8';
     AStream.Send(TEncoding.UTF8.GetBytes('ok'));
   end
+  else if AStream.Header[':path'] = '/authority' then
+  begin
+    { [B4] Echo what the CLIENT put in :authority. This connection runs on a
+      NON-default port, so the provable case here is that the port survives;
+      the omit-the-default and bracket-IPv6 rules are gated as pure-function
+      checks, since this server binds AF_INET on 19311 and can reach neither. }
+    AStream.StatusCode := 200;
+    AStream.Header['content-type'] := 'text/plain; charset=utf-8';
+    AStream.Send(TEncoding.UTF8.GetBytes(AStream.Header[':authority']));
+  end
   else if AStream.Header[':path'] = '/scheme' then
   begin
     { [CL2] Echo back the :scheme pseudo-header the CLIENT advertised. This
@@ -202,6 +212,48 @@ begin
       Check('client advertised :scheme = http on h2c',
             TEncoding.UTF8.GetString(GResp.Body) = 'http',
             TEncoding.UTF8.GetString(GResp.Body));
+
+      { [B4] End to end: a NON-default port must still appear. The rule is
+        "omit the default", not "omit the port", and a builder that dropped it
+        unconditionally would pass every check below while breaking every real
+        request. }
+      GResp := GClient.SubmitRequest('GET', '/authority', nil, nil);
+      Check('client advertised :authority with its non-default port',
+            TEncoding.UTF8.GetString(GResp.Body) = '127.0.0.1:' + IntToStr(PORT),
+            TEncoding.UTF8.GetString(GResp.Body));
+
+      { [B4] The two RFC rules, as pure-function checks. They cannot be reached
+        end to end here: this server binds AF_INET on a non-default port, so
+        neither a default port nor an IPv6 peer exists to talk to. }
+      Check('https + 443 omits the default port (RFC 9110 §4.2)',
+            Nghttp2BuildAuthority('example.com', 443, True) = 'example.com',
+            Nghttp2BuildAuthority('example.com', 443, True));
+      Check('http + 80 omits the default port',
+            Nghttp2BuildAuthority('example.com', 80, False) = 'example.com',
+            Nghttp2BuildAuthority('example.com', 80, False));
+      Check('https + 8443 KEEPS a non-default port',
+            Nghttp2BuildAuthority('example.com', 8443, True) = 'example.com:8443',
+            Nghttp2BuildAuthority('example.com', 8443, True));
+
+      { 443 is default for https ONLY. Over cleartext it is an ordinary port
+        and must survive - the discriminating case for a builder that compares
+        against a constant instead of the scheme's default. }
+      Check('http + 443 keeps the port (443 is default for https only)',
+            Nghttp2BuildAuthority('example.com', 443, False) = 'example.com:443',
+            Nghttp2BuildAuthority('example.com', 443, False));
+
+      Check('an IPv6 literal is bracketed (RFC 3986 §3.2.2)',
+            Nghttp2BuildAuthority('::1', 9010, False) = '[::1]:9010',
+            Nghttp2BuildAuthority('::1', 9010, False));
+      Check('a bracketed IPv6 literal on its default port drops the port',
+            Nghttp2BuildAuthority('::1', 80, False) = '[::1]',
+            Nghttp2BuildAuthority('::1', 80, False));
+      Check('an ALREADY-bracketed host is not bracketed twice',
+            Nghttp2BuildAuthority('[::1]', 9010, False) = '[::1]:9010',
+            Nghttp2BuildAuthority('[::1]', 9010, False));
+      Check('an IPv4 literal is never bracketed',
+            Nghttp2BuildAuthority('127.0.0.1', 443, True) = '127.0.0.1',
+            Nghttp2BuildAuthority('127.0.0.1', 443, True));
     finally
       GClient.Free;
     end;

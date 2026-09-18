@@ -291,6 +291,31 @@ type
   // sends, receives, closes. Useful for smoke tests.
   function Nghttp2Get(const AURL: string; ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS): TNghttp2Response;
 
+  { [B4] Builds the :authority pseudo-header for one request.
+
+    Two rules, both of which this client used to break:
+
+      RFC 3986 §3.2.2 — an IPv6 literal is bracketed. `::1` alone is not a
+      host; the authority form is `[::1]`, and `[::1]:8443` with a port.
+      Emitting `::1:9010` (which is what concatenation produced) is malformed,
+      and became reachable the moment CL1 taught ConnectToHost to resolve IPv6.
+
+      RFC 3986 §3.2.3 / RFC 9110 §4.2 — the port is omitted when it is the
+      scheme's default: 443 under https, 80 under http. `example.com:443` and
+      `example.com` identify the same origin, but they are different BYTES, so
+      a cache, a virtual-host map or an HMAC over the authority can disagree
+      about two requests that are the same request.
+
+    Note 443 is only default for https: `http://host:443` keeps its port, and
+    the AIsHttps argument is what decides. That is why this takes the scheme
+    rather than inferring it from the port number.
+
+    Exported deliberately. It is a pure function of three values, so every
+    combination of the two rules is gated without needing a server on a default
+    port or an IPv6 listener — neither of which the smoke has. }
+  function Nghttp2BuildAuthority(const AHost: string; APort: Word;
+    AIsHttps: Boolean): string;
+
 implementation
 
 // ─── nghttp2 callbacks ────────────────────────────────────────────────────
@@ -839,7 +864,11 @@ begin
     callback can fire during it. AllocSlot below therefore runs immediately
     after nghttp2_submit_request and before any pumping. }
 
-  LAuthority := FHost + ':' + IntToStr(FPort);
+  { [B4] Not FHost + ':' + FPort. See Nghttp2BuildAuthority: an IPv6 literal
+    needs brackets, and a default port must be omitted. FTlsConn is the https
+    signal for the same reason it is for :scheme below — it is non-nil only
+    after a handshake that actually succeeded. }
+  LAuthority := Nghttp2BuildAuthority(FHost, FPort, FTlsConn <> nil);
   LBase := 4;   // 4 pseudo-headers
   SetLength(LNvs,    LBase + Length(AHeaders));
   SetLength(LNames,  LBase + Length(AHeaders));
@@ -1116,6 +1145,28 @@ end;
 
 // ─── Convenience one-shot helper ─────────────────────────────────────────
 
+function Nghttp2BuildAuthority(const AHost: string; APort: Word;
+  AIsHttps: Boolean): string;
+var
+  LDefaultPort: Word;
+begin
+  Result := AHost;
+
+  { A colon can only be part of an IPv6 address here: a reg-name may not
+    contain one and an IPv4 literal has none. Already-bracketed input is left
+    alone so a caller who did it correctly is not double-bracketed. }
+  if (Result <> '') and (Result[1] <> '[') and (Pos(':', Result) > 0) then
+    Result := '[' + Result + ']';
+
+  if AIsHttps then
+    LDefaultPort := 443
+  else
+    LDefaultPort := 80;
+
+  if APort <> LDefaultPort then
+    Result := Result + ':' + IntToStr(APort);
+end;
+
 function Nghttp2Get(const AURL: string; ATimeoutMS: Integer): TNghttp2Response;
 var
   LClient:    TNghttp2Client;
@@ -1150,17 +1201,38 @@ begin
     SetLength(LHost, LSlashPos - 1);
   end;
 
-  LColonPos := Pos(':', LHost);
-  if LColonPos > 0 then
+  if LIsHttps then LPort := 443 else LPort := 80;
+
+  { [B4] An IPv6 literal is bracketed in a URL (RFC 3986 §3.2.2), so the FIRST
+    colon is part of the address, not a port separator. `Pos(':', LHost)` on
+    `[::1]:8443` returned 2, yielding host `[` and a garbage port — and it did
+    so silently. The port, when present, follows the closing bracket.
+
+    Brackets are stripped here on purpose: getaddrinfo wants the bare address,
+    and ConnectToHost is what receives this. Nghttp2BuildAuthority puts them
+    back for the wire. Bare host in, bracketed host out — the two live in
+    different places and must not be confused. }
+  if (LHost <> '') and (LHost[1] = '[') then
   begin
-    LPort := StrToIntDef(Copy(LHost, LColonPos + 1, MaxInt),
-                         Ord(LIsHttps) * 443 + Ord(not LIsHttps) * 80);
-    SetLength(LHost, LColonPos - 1);
+    LColonPos := Pos(']', LHost);
+    if LColonPos = 0 then
+      raise ENghttp2Client.CreateFmt(
+        'malformed URL "%s" - an IPv6 literal must be bracketed as [addr] '
+        + '(RFC 3986 §3.2.2), and this one opens a bracket it never closes',
+        [AURL]);
+    if (Length(LHost) > LColonPos) and (LHost[LColonPos + 1] = ':') then
+      LPort := StrToIntDef(Copy(LHost, LColonPos + 2, MaxInt), LPort);
+    LHost := Copy(LHost, 2, LColonPos - 2);
   end
-  else if LIsHttps then
-    LPort := 443
   else
-    LPort := 80;
+  begin
+    LColonPos := Pos(':', LHost);
+    if LColonPos > 0 then
+    begin
+      LPort := StrToIntDef(Copy(LHost, LColonPos + 1, MaxInt), LPort);
+      SetLength(LHost, LColonPos - 1);
+    end;
+  end;
 
   LTls    := nil;
   LClient := TNghttp2Client.Create;
