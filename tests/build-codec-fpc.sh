@@ -155,7 +155,16 @@ rm -f "$OUT"/*.ppu "$OUT"/*.o 2>/dev/null || true
 # Advisory, not a gate: it is a lint over comments, and a build should not be
 # blocked by one. The compile that follows is the gate.
 if command -v python3 > /dev/null 2>&1 && [[ -f "$HERE/brace-scan.py" ]]; then
-  BRACE_FILES=$(find "$HERE/.." -name '*.pas' -o -name '*.dpr' | sort)
+  # Scoped to OUR source dirs, not the whole tree. Walking "$HERE/.." swept in
+  # tools/ — which holds the vendored googleapis corpus — and handed python
+  # 56,409 paths / 7.1 MB of argv against a 2 MB ARG_MAX. The scan then died
+  # with "Argument list too long" on every run while printing "(advisory)",
+  # so it read as a passing lint for as long as the corpus has been there.
+  # A lint that cannot fail is the same defect as a skip that reads as a pass.
+  # Linting a third-party corpus was never the intent either: this checks OUR
+  # comments for the { } non-nesting trap.
+  BRACE_FILES=$(find "$HERE/../src" "$HERE/../tests" "$HERE/../samples" \
+                  \( -name '*.pas' -o -name '*.dpr' \) 2>/dev/null | sort)
   if [[ -n "$BRACE_FILES" ]]; then
     BRACE_OUT=$(python3 "$HERE/brace-scan.py" $BRACE_FILES 2>&1)
     if [[ "$BRACE_OUT" != *", 0 problem(s)"* ]]; then
@@ -518,6 +527,218 @@ if [[ -f "$HERE/Nghttp2ServerSmoke.dpr" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2ServerSmoke.dpr not present"
+fi
+
+# ── ALPN refusal (CL2b) — the first stage with a peer that is NOT ours ───────
+# Every other TLS check in this repo points the client at our own server, which
+# always selects h2. So the client's "ALPN did not yield h2" raise had never
+# once executed, and it was wrong in a quiet way: it printed the common case as
+# 'server selected ""', blaming the server for what is nearly always "that
+# endpoint does not do HTTP/2 over TLS".
+#
+# openssl is the independent peer our own server cannot be. Two peers are run,
+# because they are NOT the same failure - this was measured after an earlier
+# version of this stage used the wrong one and would have failed on contact:
+#
+#   noalpn     `openssl s_server` with NO -alpn flag. ALPN is disabled, the
+#              handshake COMPLETES, NegotiatedProtocol is ''. This is the only
+#              peer that reaches the client's empty-ALPN branch, so it is the
+#              one that actually gates the CL2b message.
+#
+#   nooverlap  `openssl s_server -alpn http/1.1`. No overlap with our 'h2', and
+#              OpenSSL does not complete the handshake selecting nothing - it
+#              sends a FATAL no_application_protocol alert (alert 120,
+#              RFC 7301 §3.2). SSL_connect fails before any ALPN check runs.
+#
+# The trap worth recording: `openssl s_client` prints "No ALPN negotiated" on
+# the way out of a FAILED handshake too, so that line alone is not evidence a
+# session was established. Exit code is (s_client exit 0 vs 1).
+#
+# This stage is also the first here to spawn a background process, so it owns
+# its own cleanup rather than borrowing a convention that does not exist yet.
+#
+# The cert is generated per run into $OUT and never committed. That is
+# deliberate: the provider suite's committed 30-day fixtures silently expired
+# and took 110 checks down with them, reading like a code regression when it
+# was a calendar. A fixture rebuilt every run cannot expire.
+echo
+echo "── ALPN refusal (CL2b) ───────────────────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2AlpnMismatch.dpr" ]]; then
+  echo "  SKIP  Nghttp2AlpnMismatch.dpr not present"
+elif ! command -v openssl > /dev/null 2>&1; then
+  echo "  SKIP  openssl absent - the client's ALPN refusal was NOT exercised."
+  echo "        This is the only stage that can reach that path; the rest of"
+  echo "        the run passes without it."
+else
+  AOUT="$OUT/alpn-mismatch"
+  mkdir -p "$AOUT"
+  rm -f "$AOUT"/*.ppu "$AOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$AOUT" -FE"$AOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2AlpnMismatch.dpr" > "$AOUT/build.log" 2>&1 \
+     && [[ -x "$AOUT/Nghttp2AlpnMismatch" ]]; then
+
+    openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout "$AOUT/k.pem" -out "$AOUT/c.pem" \
+      -subj "/CN=127.0.0.1" -days 2 > "$AOUT/cert.log" 2>&1
+
+    if [[ ! -s "$AOUT/c.pem" || ! -s "$AOUT/k.pem" ]]; then
+      echo "  SKIP  could not generate a throwaway cert (see $AOUT/cert.log)"
+    else
+      # $1 label, $2 port, $3 client mode, $4.. extra s_server args.
+      # -naccept 1 exits after the single connection; the kill is belt-and-
+      # braces for a handshake that dies before accept returns.
+      run_alpn_case() {
+        local LABEL="$1" CPORT="$2" CMODE="$3"; shift 3
+        echo
+        echo "  · $LABEL"
+        openssl s_server -accept "$CPORT" \
+          -cert "$AOUT/c.pem" -key "$AOUT/k.pem" \
+          -naccept 1 -quiet "$@" > "$AOUT/$CMODE.server.log" 2>&1 &
+        local SPID=$!
+        sleep 0.4
+        "$AOUT/Nghttp2AlpnMismatch" 127.0.0.1 "$CPORT" "$CMODE" \
+          < /dev/null | sed 's/^/    /'
+        local CRC=${PIPESTATUS[0]}
+        kill "$SPID" 2>/dev/null || true
+        wait "$SPID" 2>/dev/null || true
+        case "$CRC" in
+          0) echo "    PASSED - the client refused this peer" ;;
+          3) echo "    SKIP  client could not load libnghttp2/OpenSSL - the"
+             echo "          refusal was NOT exercised by this run." ;;
+          *) echo "    FAIL  see $AOUT/$CMODE.server.log"
+             [[ $RC -eq 0 ]] && RC=1 ;;
+        esac
+      }
+
+      run_alpn_case "peer with ALPN disabled (reaches the CL2b message)" \
+                    19312 noalpn
+      run_alpn_case "peer offering only http/1.1 (fatal alert 120)" \
+                    19313 nooverlap -alpn http/1.1
+    fi
+  else
+    echo "  FAIL  Nghttp2AlpnMismatch.dpr did not compile"
+    grep -E "Error|Fatal" "$AOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $AOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── read timeout (CL2c) — the one stage that can HANG instead of failing ─────
+# PumpUntilDone always documented a timeout and always checked it, but only
+# BETWEEN reads: DoRead went straight to a blocking recv with no SO_RCVTIMEO
+# anywhere, so a peer that accepted and then said nothing parked the client
+# forever and the check never ran again. Real in the source, inert at runtime.
+#
+# The peer is a listener that never calls accept(). The kernel finishes the TCP
+# handshake from the backlog regardless, so connect() succeeds and the client
+# then waits on a socket nobody will ever write to. No thread, no second
+# process, identical on every platform.
+#
+# `timeout` is not optional here. A regression does not make this program fail,
+# it makes it HANG - and a suite that stops is worse reporting than one that
+# fails, because nobody can tell a hang from a slow machine. Exit 124 is
+# timeout(1)'s signal that it killed the child; that is reported as the
+# failure it is, naming the likely cause.
+echo
+echo "── read timeout (CL2c) ───────────────────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ReadTimeout.dpr" ]]; then
+  echo "  SKIP  Nghttp2ReadTimeout.dpr not present"
+else
+  RTOUT="$OUT/read-timeout"
+  mkdir -p "$RTOUT"
+  rm -f "$RTOUT"/*.ppu "$RTOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$RTOUT" -FE"$RTOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ReadTimeout.dpr" > "$RTOUT/build.log" 2>&1 \
+     && [[ -x "$RTOUT/Nghttp2ReadTimeout" ]]; then
+
+    if command -v timeout > /dev/null 2>&1; then
+      timeout 60 "$RTOUT/Nghttp2ReadTimeout" < /dev/null | sed 's/^/  /'
+      RT_RC=${PIPESTATUS[0]}
+    else
+      echo "  note: timeout(1) unavailable - a regression will hang here"
+      "$RTOUT/Nghttp2ReadTimeout" < /dev/null | sed 's/^/  /'
+      RT_RC=${PIPESTATUS[0]}
+    fi
+
+    case "$RT_RC" in
+      0)   echo "  read timeout: PASSED - the deadline fired" ;;
+      3)   echo "  SKIP  libnghttp2 absent - the timeout path was NOT exercised" ;;
+      124) echo "  FAIL  the client HUNG - killed after 60s. That is the CL2c"
+           echo "        regression itself: DoRead is blocking again."
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  read timeout did not behave as specified"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ReadTimeout.dpr did not compile"
+    grep -E "Error|Fatal" "$RTOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $RTOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── incremental response delivery (CL3a) ─────────────────────────────────────
+# Until CL3 every response was buffered whole into TNghttp2Response.Body, which
+# put SSE and large downloads out of reach. BeginRequest(..., True) now opts one
+# stream into incremental delivery through ReadChunk.
+#
+# Proves the API contract: the body arrives across several calls, reassembles
+# complete and in order, ends with 0 rather than a timeout, and Response.Body is
+# EMPTY afterwards -- which is the memory claim in checkable form, since it
+# shows the body was DIVERTED rather than buffered and copied.
+#
+# Does NOT prove chunks arrive before END_STREAM. This server runs inline
+# dispatch, where the handler IS the connection thread, so it returns before the
+# pump runs and the client sees one burst. That assertion lives in the provider
+# suite's stage 15, which times real arrivals with curl -N. The program SKIPs it
+# loudly rather than omitting it.
+echo
+echo "── incremental response delivery (CL3a) ──────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2StreamRead.dpr" ]]; then
+  echo "  SKIP  Nghttp2StreamRead.dpr not present"
+else
+  SROUT="$OUT/stream-read"
+  mkdir -p "$SROUT"
+  rm -f "$SROUT"/*.ppu "$SROUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$SROUT" -FE"$SROUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2StreamRead.dpr" > "$SROUT/build.log" 2>&1 \
+     && [[ -x "$SROUT/Nghttp2StreamRead" ]]; then
+
+    if command -v timeout > /dev/null 2>&1; then
+      timeout 60 "$SROUT/Nghttp2StreamRead" < /dev/null | sed 's/^/  /'
+      SR_RC=${PIPESTATUS[0]}
+    else
+      "$SROUT/Nghttp2StreamRead" < /dev/null | sed 's/^/  /'
+      SR_RC=${PIPESTATUS[0]}
+    fi
+
+    case "$SR_RC" in
+      0)   echo "  stream read: PASSED - the body arrived incrementally" ;;
+      3)   echo "  SKIP  libnghttp2 absent - ReadChunk was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s - ReadChunk is not returning."
+           echo "        A stream that never ends looks exactly like this."
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  incremental delivery did not behave as specified"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2StreamRead.dpr did not compile"
+    grep -E "Error|Fatal" "$SROUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $SROUT/build.log"
+    RC=2
+  fi
 fi
 
 # ── samples/grpc-server — compile only ───────────────────────────────────────

@@ -23,6 +23,9 @@ REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
 REM    4b Nghttp2ServerSmoke              build + run   (gates; the only stage
 REM                                       that starts a server. Skips LOUDLY
 REM                                       when libnghttp2 is absent.)
+REM    4c Nghttp2AlpnMismatch             build + run   (gates; the only stage
+REM                                       whose PEER is openssl rather than our
+REM                                       own server. Skips LOUDLY without it.)
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
 REM    6  ProtogenEmitTests               build + run   (gates) - same dir
@@ -165,6 +168,204 @@ set "STAGE=Nghttp2ServerSmoke"
 set "GATES=1"
 set "SKIPRC=3"
 call :build_run
+
+REM -- Stage 4c. ALPN refusal (CL2b). The only stage whose PEER is not ours. --
+REM
+REM Every other TLS check drives our own server, which always selects h2, so
+REM the client's "ALPN did not yield h2" raise had never executed anywhere.
+REM openssl is the independent peer our own server cannot be.
+REM
+REM TWO peers run, because they are NOT the same failure. This was measured
+REM after a first version of this gate used the wrong one and would have failed
+REM on contact:
+REM
+REM   noalpn     s_server with NO -alpn. ALPN is disabled, the handshake
+REM              COMPLETES, and NegotiatedProtocol is empty. This is the ONLY
+REM              peer that reaches the client's empty-ALPN branch, so it is the
+REM              only one that gates the CL2b message.
+REM   nooverlap  s_server -alpn http/1.1. No overlap with our h2, so OpenSSL
+REM              sends a FATAL no_application_protocol alert and SSL_connect
+REM              fails BEFORE any ALPN check runs. A peer offering only
+REM              http/1.1 does NOT select http/1.1.
+REM
+REM The trap worth recording: openssl s_client prints "No ALPN negotiated" on
+REM the way out of a FAILED handshake too, so that line alone is not evidence a
+REM session was established. The exit code is.
+REM
+REM NOT routed through :build_run - that helper runs a bare exe with no
+REM arguments, and this program takes host, port and mode.
+REM
+REM The peer is started in a TITLED window and killed BY THAT TITLE, never by
+REM image name: taskkill /IM openssl.exe would kill every openssl process on the
+REM developer's machine, not just this one. -naccept 1 means it normally exits
+REM by itself once the single connection closes; the kill is belt-and-braces
+REM for a handshake that dies before accept returns, which would otherwise
+REM leave the port held against the next run.
+REM
+REM The cert is generated per run into TEMP and never committed. The provider
+REM suite's committed 30-day fixtures expired and took 110 checks down with
+REM them, reading like a code regression when it was a calendar. A fixture
+REM rebuilt every run cannot expire.
+if not exist "Nghttp2AlpnMismatch.dpr" goto :no_alpn_dpr
+
+set "OPENSSL="
+for /f "delims=" %%I in ('where openssl.exe 2^>nul') do if not defined OPENSSL set "OPENSSL=%%I"
+if not defined OPENSSL goto :no_alpn_openssl
+
+echo -- Nghttp2AlpnMismatch ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2AlpnMismatch.dpr" > "Nghttp2AlpnMismatch.buildlog" 2>&1
+if errorlevel 1 goto :alpn_buildfail
+if not exist "Nghttp2AlpnMismatch.exe" goto :alpn_buildfail
+
+set "ALPNDIR=%TEMP%\nghttp2-alpn"
+if exist "!ALPNDIR!" rmdir /s /q "!ALPNDIR!"
+mkdir "!ALPNDIR!"
+"!OPENSSL!" req -x509 -newkey rsa:2048 -nodes -keyout "!ALPNDIR!\k.pem" -out "!ALPNDIR!\c.pem" -subj "/CN=127.0.0.1" -days 2 > "!ALPNDIR!\cert.log" 2>&1
+if not exist "!ALPNDIR!\c.pem" goto :no_alpn_cert
+if not exist "!ALPNDIR!\k.pem" goto :no_alpn_cert
+
+set "ALPNPORT=19312"
+set "ALPNMODE=noalpn"
+set "ALPNARGS="
+call :alpn_case
+
+set "ALPNPORT=19313"
+set "ALPNMODE=nooverlap"
+set "ALPNARGS=-alpn http/1.1"
+call :alpn_case
+goto :after_alpn
+
+:alpn_buildfail
+echo    FAIL  Nghttp2AlpnMismatch did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2AlpnMismatch.buildlog"
+echo.
+echo    Full log: Nghttp2AlpnMismatch.buildlog
+set /a FAILED+=1
+goto :after_alpn
+
+:no_alpn_dpr
+echo -- Nghttp2AlpnMismatch ---------------------------------------------------------------
+echo    SKIP  Nghttp2AlpnMismatch.dpr not present
+goto :after_alpn
+
+:no_alpn_openssl
+echo -- Nghttp2AlpnMismatch ---------------------------------------------------------------
+set /a SKIPPED+=1
+echo    SKIP  openssl.exe not on PATH - the client's ALPN refusal was NOT
+echo          exercised. This is the only stage that can reach that path.
+echo          Install OpenSSL for Windows, or add its bin directory to PATH.
+goto :after_alpn
+
+:no_alpn_cert
+echo    SKIP  could not generate a throwaway cert - see !ALPNDIR!\cert.log
+set /a SKIPPED+=1
+goto :after_alpn
+
+:after_alpn
+
+REM -- Stage 4d. Read timeout (CL2c). The stage that can HANG. -----------
+REM
+REM PumpUntilDone always documented a timeout and always checked it, but only
+REM BETWEEN reads - DoRead went straight to a blocking recv with no
+REM SO_RCVTIMEO anywhere. A peer that accepted and then said nothing parked
+REM the client forever and the check never ran again.
+REM
+REM The peer is a listener that never calls accept(): the kernel completes the
+REM handshake from the backlog, so connect succeeds and the client then waits
+REM on a socket nobody will ever write to. No thread, no second process.
+REM
+REM NOTE, and it is a real gap: cmd has no watchdog, so unlike the bash
+REM harness this stage cannot convert a hang into a failure. If the suite
+REM stops here, THAT IS THE RESULT - the read timeout is not working and
+REM DoRead is blocking again. Ctrl+C and read this comment.
+if not exist "Nghttp2ReadTimeout.dpr" goto :no_readtimeout
+echo -- Nghttp2ReadTimeout ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ReadTimeout.dpr" > "Nghttp2ReadTimeout.buildlog" 2>&1
+if errorlevel 1 goto :readtimeout_buildfail
+if not exist "Nghttp2ReadTimeout.exe" goto :readtimeout_buildfail
+Nghttp2ReadTimeout.exe < nul
+set "RT_RC=!errorlevel!"
+echo.
+if "!RT_RC!"=="0" goto :readtimeout_pass
+if "!RT_RC!"=="3" goto :readtimeout_skip
+echo    FAIL  Nghttp2ReadTimeout - the deadline did not behave as specified
+set /a FAILED+=1
+goto :after_readtimeout
+
+:readtimeout_pass
+echo    PASS  Nghttp2ReadTimeout - the deadline fired
+goto :after_readtimeout
+
+:readtimeout_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ReadTimeout - libnghttp2 absent; timeout NOT exercised
+goto :after_readtimeout
+
+:readtimeout_buildfail
+echo    FAIL  Nghttp2ReadTimeout did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ReadTimeout.buildlog"
+echo.
+echo    Full log: Nghttp2ReadTimeout.buildlog
+set /a FAILED+=1
+goto :after_readtimeout
+
+:no_readtimeout
+echo -- Nghttp2ReadTimeout ---------------------------------------------------------------
+echo    SKIP  Nghttp2ReadTimeout.dpr not present
+
+:after_readtimeout
+
+REM -- Stage 4e. Incremental response delivery (CL3a). ------------------
+REM
+REM Until CL3 every response was buffered whole into TNghttp2Response.Body,
+REM which put SSE and large downloads out of reach. BeginRequest(..., True)
+REM opts one stream into incremental delivery through ReadChunk.
+REM
+REM Proves: the body arrives across several calls, reassembles complete and
+REM in order, ends with 0 rather than a timeout, and Response.Body is EMPTY
+REM afterwards - the memory claim in checkable form, since it shows the body
+REM was DIVERTED rather than buffered and copied.
+REM
+REM Does NOT prove chunks arrive before END_STREAM: inline dispatch means the
+REM handler IS the connection thread, so it returns before the pump runs. The
+REM program SKIPs that check with its reason; the provider suite's stage 15
+REM times real arrivals with curl -N.
+if not exist "Nghttp2StreamRead.dpr" goto :no_streamread
+echo -- Nghttp2StreamRead ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2StreamRead.dpr" > "Nghttp2StreamRead.buildlog" 2>&1
+if errorlevel 1 goto :streamread_buildfail
+if not exist "Nghttp2StreamRead.exe" goto :streamread_buildfail
+Nghttp2StreamRead.exe < nul
+set "SR_RC=!errorlevel!"
+echo.
+if "!SR_RC!"=="0" goto :streamread_pass
+if "!SR_RC!"=="3" goto :streamread_skip
+echo    FAIL  Nghttp2StreamRead - incremental delivery did not behave as specified
+set /a FAILED+=1
+goto :after_streamread
+
+:streamread_pass
+echo    PASS  Nghttp2StreamRead - the body arrived incrementally
+goto :after_streamread
+
+:streamread_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2StreamRead - libnghttp2 absent; ReadChunk NOT exercised
+goto :after_streamread
+
+:streamread_buildfail
+echo    FAIL  Nghttp2StreamRead did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2StreamRead.buildlog"
+echo.
+echo    Full log: Nghttp2StreamRead.buildlog
+set /a FAILED+=1
+goto :after_streamread
+
+:no_streamread
+echo -- Nghttp2StreamRead ---------------------------------------------------------------
+echo    SKIP  Nghttp2StreamRead.dpr not present
+
+:after_streamread
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in
@@ -449,6 +650,36 @@ goto :eof
 
 :br_missing
 echo    SKIP  !STAGE!.dpr not present
+goto :eof
+
+REM ===========================================================================
+:alpn_case
+REM One ALPN peer: start it, drive the client at it, tear it down.
+REM Reads !ALPNPORT! !ALPNMODE! !ALPNARGS! !ALPNDIR! !OPENSSL!.
+REM
+REM ping is the sleep here: `timeout` refuses to run with redirected stdin,
+REM which is exactly how this script invokes its test programs.
+set "ALPNTITLE=NGHTTP2ALPN-!ALPNMODE!"
+start "!ALPNTITLE!" /min "!OPENSSL!" s_server -accept !ALPNPORT! -cert "!ALPNDIR!\c.pem" -key "!ALPNDIR!\k.pem" -naccept 1 -quiet !ALPNARGS!
+ping -n 2 127.0.0.1 > nul
+Nghttp2AlpnMismatch.exe 127.0.0.1 !ALPNPORT! !ALPNMODE! < nul
+set "ALPNRC=!errorlevel!"
+taskkill /FI "WINDOWTITLE eq !ALPNTITLE!" /F > nul 2>&1
+if "!ALPNRC!"=="0" goto :alpn_case_pass
+if "!ALPNRC!"=="3" goto :alpn_case_skip
+echo    FAIL  ALPN !ALPNMODE! - the client did not refuse this peer, or said so unusably
+set /a FAILED+=1
+goto :eof
+
+:alpn_case_pass
+echo    PASS  ALPN !ALPNMODE! - the client refused this peer
+goto :eof
+
+:alpn_case_skip
+REM Loud, for the same reason stage 4b is: a quiet skip is indistinguishable
+REM from a green stage, and this is the only place the refusal path runs.
+set /a SKIPPED+=1
+echo    SKIP  ALPN !ALPNMODE! - client could not load libnghttp2/OpenSSL; NOT exercised
 goto :eof
 
 REM ===========================================================================

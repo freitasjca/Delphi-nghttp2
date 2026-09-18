@@ -25,7 +25,8 @@ unit Nghttp2.Client;
 //  Design constraints (reviewed 2026-09-16):
 //    - Synchronous only. SubmitRequest blocks until the target stream closes
 //      (END_STREAM from the server). BeginRequest / PumpAll / TakeResponse
-//      (MULTISTREAM-1) keep several streams open on ONE connection, but the
+//      (MULTISTREAM-1), and ReadChunk (CL3) for a streamed body, keep several
+//      streams open on ONE connection, but the
 //      caller's thread still drives the pump — there is no non-blocking submit.
 //    - Prior-knowledge HTTP/2 only. The client sends the HTTP/2 preface
 //      (RFC 7540 §3.4) immediately after TCP connect: no h2c Upgrade
@@ -35,8 +36,12 @@ unit Nghttp2.Client;
 //    - Request bodies ARE supported. A non-empty ABody is sent through a
 //      libnghttp2 data_provider, and stays in memory until the stream closes,
 //      so this is not a streaming upload.
-//    - Responses are buffered whole into TNghttp2Response.Body. There is no
-//      incremental delivery, so SSE and large downloads are out of reach.
+//    - Responses are buffered whole into TNghttp2Response.Body BY DEFAULT.
+//      [CL3] Pass AStreamResponse=True to BeginRequest to opt one stream out:
+//      its body is then delivered incrementally through ReadChunk and never
+//      accumulates, which is what SSE and large downloads need. Opt-in per
+//      stream, mirroring INBOUND-1 on the server side — nothing changes for a
+//      stream that does not ask for it.
 //    - Connect takes a host and a port. [CL1] The host may be a NAME on
 //      Delphi (Windows + POSIX) and on FPC/Unix: Nghttp2.Socket resolves it
 //      and tries every address returned, so an IPv6 peer works. On
@@ -113,6 +118,21 @@ type
     Response:   TNghttp2Response;
     ReqBody:    TBytes;      { pulled by ReadRequestBodyCallback }
     ReqBodyPos: Integer;
+
+    { [CL3] Opt-in incremental delivery. When Streaming is set, DATA goes to
+      Inbound for ReadChunk to drain instead of accumulating in Response.Body.
+
+      That choice is the whole point: buffering the whole body is right for a
+      request/response exchange and wrong for anything long-lived — SSE, a
+      large download, a streaming gRPC call — where the caller must see bytes
+      while the peer is still sending. It mirrors INBOUND-1 on the server side,
+      which is opt-in per stream for the same reason.
+
+      InboundLen is the count of VALID bytes; Length(Inbound) is capacity and
+      runs ahead of it, so a chunk does not reallocate on every DATA frame. }
+    Streaming:  Boolean;
+    Inbound:    TBytes;
+    InboundLen: Integer;
   end;
 
   TNghttp2Client = class
@@ -162,11 +182,27 @@ type
     procedure FlushSession;
     procedure PumpUntilDone(ATimeoutMS: Integer);
 
+    { [CL3] ONE pass of the pump, bounded by ATimeoutMS.
+
+      PumpUntilDone loops `while AnyPending`, so ReadChunk cannot use it: it
+      would block until the whole stream finished, which is exactly what
+      incremental delivery is not. This is the same loop body, run once.
+
+      Returns  1  bytes were received and fed to nghttp2
+               0  the deadline passed with nothing to read
+              -1  the session no longer wants to read (nothing more is coming) }
+    function  PumpOnce(ATimeoutMS: Integer): Integer;
+
     // Transport-agnostic I/O helpers. Route through TLS if FTlsConn <> nil,
     // otherwise use the plain-socket helpers from Nghttp2.Socket. Same
     // pattern as Nghttp2.Server's connection thread (nested procs there;
     // methods here because the client has methods to call from anyway).
-    function DoRead(ABuf: Pointer; ALen: Integer): Integer;
+    { [CL2c] ATimeoutMS <= 0 blocks indefinitely, which is what every caller
+      got before this. Above 0, ATimedOut comes back True when the deadline
+      passed with no bytes and the connection is still healthy — distinct from
+      a 0 return, which means the peer closed. }
+    function DoRead(ABuf: Pointer; ALen: Integer;
+      ATimeoutMS: Integer; out ATimedOut: Boolean): Integer;
     function DoSendAll(ABuf: Pointer; ALen: Integer): Boolean;
 
     function MilliSecondsSince(const AStart: TDateTime): Int64;
@@ -200,14 +236,40 @@ type
       until every open stream has closed, or the timeout expires. TakeResponse
       hands back one stream's result and frees its slot — raising if THAT stream
       failed, so one broken stream does not discard the others. }
+    { [CL3] AStreamResponse opts this stream into incremental delivery: the body
+      is NOT accumulated into the response, and must be drained with ReadChunk.
+      Default False, so every existing caller is unaffected. }
     function  BeginRequest(
       const AMethod:  string;
       const APath:    string;
       const AHeaders: TNghttp2Headers;
-      const ABody:    TBytes): Int32;
+      const ABody:    TBytes;
+      AStreamResponse: Boolean = False): Int32;
     procedure PumpAll(ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS);
     function  TakeResponse(AStreamId: Int32): TNghttp2Response;
     function  PendingStreams: Integer;
+
+    { [CL3] Read the next piece of a streaming response.
+
+        > 0   bytes copied into ABuffer (which is sized to exactly that many)
+        = 0   end of stream: the peer sent END_STREAM and nothing more is coming
+        < 0   the deadline passed and the stream is STILL OPEN — call again
+
+      Deliberately the same three-way contract as INghttp2Stream.ReadInbound on
+      the server side, so a reader written against one works against the other.
+
+      NOTE the convention clash this sits on, because it has exactly one
+      sensible resolution and the wrong guess is silent: ReadInbound uses <0 for
+      "timed out, still open", while Nghttp2.Socket's SocketWaitReadable uses 0
+      for timeout and >0 for ready. This follows ReadInbound — it is a
+      stream-read API, and its callers already know that shape. Anyone wiring
+      the two together must convert rather than assume.
+
+      Partial reads are normal: this returns what has ARRIVED, not what was
+      asked for. Only valid on a stream opened with AStreamResponse = True. }
+    function  ReadChunk(AStreamId: Int32; var ABuffer: TBytes;
+      ACount: Integer;
+      ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS): Integer;
 
     property Connected:  Boolean            read FConnected;
     property Host:       string             read FHost;
@@ -215,6 +277,13 @@ type
     // Optional TLS. Assign BEFORE calling Connect. Non-owning: caller
     // creates + configures + frees the TTlsClientContext. Leave nil for
     // cleartext h2c. See Delphi-nghttp2/samples for a full example.
+    //
+    // Assigning this implies ALPN 'h2': Connect calls EnableHttp2Alpn on the
+    // context itself, so callers need not. That happens at CONNECT time, not
+    // on assignment — assignment order does not matter, and the list is
+    // re-applied on every Connect. Calling EnableHttp2Alpn yourself is still
+    // fine (it is idempotent); the four call sites that do were written before
+    // this and are left alone.
     property TlsContext: TTlsClientContext  read FTlsContext write FTlsContext;
   end;
 
@@ -277,6 +346,19 @@ begin
   if (LClient = nil) or (len = 0) then Exit(0);
   LIdx := LClient.FindSlot(stream_id);   { MULTISTREAM-1 }
   if LIdx < 0 then Exit(0);
+
+  { [CL3] Streaming streams divert here: the bytes go to Inbound for ReadChunk
+    to drain, and Response.Body stays empty. Capacity is doubled rather than
+    grown exactly, so a long stream does not reallocate on every DATA frame. }
+  if LClient.FStreams[LIdx].Streaming then
+  begin
+    LOldLen := LClient.FStreams[LIdx].InboundLen;
+    if LOldLen + Integer(len) > Length(LClient.FStreams[LIdx].Inbound) then
+      SetLength(LClient.FStreams[LIdx].Inbound, (LOldLen + Integer(len)) * 2);
+    Move(data^, LClient.FStreams[LIdx].Inbound[LOldLen], len);
+    Inc(LClient.FStreams[LIdx].InboundLen, Integer(len));
+    Exit(0);
+  end;
 
   LOldLen := Length(LClient.FStreams[LIdx].Response.Body);
   SetLength(LClient.FStreams[LIdx].Response.Body, LOldLen + Integer(len));
@@ -435,9 +517,63 @@ begin
   if FTlsContext <> nil then
   begin
     try
+      { [CL2b] Offer 'h2' ourselves rather than trusting the caller to have
+        called EnableHttp2Alpn. This client has no HTTP/1.1 fallback, so there
+        is no configuration in which NOT offering h2 is useful - making it
+        opt-in only created a way to reach the confusing failure below.
+
+        WHEN this applies is deliberate, and it is here rather than in the
+        TlsContext setter. The ALPN list is (re)applied at CONNECT time, on
+        every Connect, so the behaviour does not depend on the order in which
+        the caller assigns TlsContext and configures it. A setter-side call
+        would be order-sensitive in exactly the way that is hard to see: it
+        would fire once, against whatever state the context happened to be in
+        at assignment, and a later Disconnect/Connect pair would not revisit
+        it. Applying it here means there is a single moment when the list has
+        to be right, and it always is.
+
+        Calling it twice is harmless: SSL_CTX_set_alpn_protos REPLACES the
+        stored list rather than appending, and all four existing call sites
+        set the same three bytes. Note this does mutate the caller-owned
+        context - acceptable because the only value it can write is the one an
+        h2-only client requires. }
+      FTlsContext.EnableHttp2Alpn;
+
       FTlsConn := TTlsClientConnection.Create(FTlsContext, FSocket);
       FTlsConn.DoHandshake;
-      if FTlsConn.NegotiatedProtocol <> 'h2' then
+
+      { Two different failures, deliberately worded apart.
+
+        EMPTY is reached when the peer has ALPN DISABLED: it echoes no ALPN
+        extension, the handshake COMPLETES, and NegotiatedProtocol is ''.
+        Measured against `openssl s_server` with no -alpn flag - handshake ok,
+        "No ALPN negotiated". The old message rendered that as
+        'server selected ""', which reads like the server returned garbage when
+        the real meaning is "this endpoint does not do HTTP/2 over TLS".
+
+        What does NOT reach here, contrary to an earlier draft of this very
+        comment: a peer that offers only http/1.1. With no overlap OpenSSL does
+        not complete the handshake and select nothing - it sends a FATAL
+        no_application_protocol alert (alert 120, RFC 7301 §3.2). DoHandshake
+        above raises first and neither branch below runs. Confirmed by running
+        both peers: `-alpn http/1.1` gives s_client exit 1 and alert 120, while
+        no -alpn gives exit 0 and an empty protocol. The earlier claim came
+        from reading s_client's "No ALPN negotiated" line, which it prints on
+        the way out of a FAILED handshake too - that line is not evidence of
+        success.
+
+        NON-EMPTY AND NOT h2 means the peer chose something we never offered,
+        which RFC 7301 §3.2 forbids. Unreachable against a conformant peer, and
+        kept precisely because "unreachable" is a claim about other people's
+        servers. }
+      if FTlsConn.NegotiatedProtocol = '' then
+        raise ENghttp2Client.CreateFmt(
+          'ALPN: %s:%d negotiated no protocol. This client offers "h2" only ' +
+          'and has no HTTP/1.1 fallback, so a peer that selects nothing is ' +
+          'either HTTP/1.1-only or has ALPN disabled. Use an HTTP/2 server, ' +
+          'or h2c (no TlsContext) if the endpoint is cleartext HTTP/2.',
+          [FHost, FPort])
+      else if FTlsConn.NegotiatedProtocol <> 'h2' then
         raise ENghttp2Client.CreateFmt(
           'ALPN negotiation failed - server selected "%s" (expected "h2"). ' +
           'The server may not support HTTP/2 over TLS, or it may require a ' +
@@ -506,12 +642,60 @@ begin
   FConnected := False;
 end;
 
-function TNghttp2Client.DoRead(ABuf: Pointer; ALen: Integer): Integer;
+{ [CL2c] Reads with a deadline.
+
+  The bug this closes: PumpUntilDone has always documented a timeout and always
+  checked it — but only BETWEEN reads. DoRead went straight to a blocking recv
+  with no SO_RCVTIMEO set anywhere, so a peer that accepted the connection and
+  then said nothing parked the client forever and the elapsed check never ran
+  again. The timeout was real in the source and inert at runtime.
+
+  The plain path gates on readability here; the TLS path pushes the same
+  deadline into TTlsClientConnection, whose FeedIn gates before its own recv.
+  See the KNOWN LIMIT note in FeedIn: select cannot wait on an fd >= 1024 and
+  reports it ready instead, so this is dependable for ordinary client use and
+  not a guarantee under heavy descriptor pressure. }
+function TNghttp2Client.DoRead(ABuf: Pointer; ALen: Integer;
+  ATimeoutMS: Integer; out ATimedOut: Boolean): Integer;
+var
+  LReady: Integer;
 begin
+  ATimedOut := False;
+
   if FTlsConn <> nil then
-    Result := FTlsConn.Read(ABuf, ALen)
-  else
-    Result := SocketRecv(FSocket, ABuf, ALen);
+  begin
+    FTlsConn.ReadTimeoutMS := ATimeoutMS;
+    Result := FTlsConn.Read(ABuf, ALen);
+    if Result = TLS_READ_TIMED_OUT then
+    begin
+      ATimedOut := True;
+      Result    := 0;
+    end;
+    Exit;
+  end;
+
+  if ATimeoutMS > 0 then
+  begin
+    LReady := SocketWaitReadable(FSocket, ATimeoutMS);
+    if LReady = 0 then
+    begin
+      ATimedOut := True;
+      Exit(0);
+    end;
+    { EINTR is a signal, not a dead socket — come round again rather than
+      reporting a failure the connection has not suffered. }
+    if LReady < 0 then
+    begin
+      if SocketLastErrorIsWouldBlock then
+      begin
+        ATimedOut := True;
+        Exit(0);
+      end;
+      Exit(-1);
+    end;
+  end;
+
+  Result := SocketRecv(FSocket, ABuf, ALen);
 end;
 
 function TNghttp2Client.DoSendAll(ABuf: Pointer; ALen: Integer): Boolean;
@@ -576,12 +760,18 @@ var
   LStart: TDateTime;
   LRecvLen: Integer;
   LConsumed: NativeInt;
+  LRemainingMS: Int64;      { [CL2c] }
+  LTimedOut: Boolean;       { [CL2c] }
 begin
   LStart := Now;
   { MULTISTREAM-1 — run until every open stream has closed, not just one. }
   while AnyPending do
   begin
-    if MilliSecondsSince(LStart) > ATimeoutMS then
+    { [CL2c] >= rather than >. With the read now bounded by what remains of the
+      budget, an elapsed time of EXACTLY ATimeoutMS left zero to wait on, and
+      the old strict > sent us round the loop to spin until the clock ticked
+      past. Harmless on Linux; Now has ~15 ms granularity on Windows. }
+    if MilliSecondsSince(LStart) >= ATimeoutMS then
       raise ENghttp2Client.CreateFmt(
         'request timed out after %d ms - %d stream(s) still open',
         [ATimeoutMS, PendingStreams]);
@@ -591,7 +781,24 @@ begin
     if nghttp2_session_want_read(FSession) = 0 then
       Break;
 
-    LRecvLen := DoRead(@FRecvBuffer[0], Length(FRecvBuffer));
+    { [CL2c] Hand the read what is LEFT of the budget, so a silent peer expires
+      the deadline instead of parking in recv. On expiry we loop rather than
+      raise here: the check at the top of the loop owns the timeout message and
+      already names how many streams were still open. }
+    LRemainingMS := ATimeoutMS - MilliSecondsSince(LStart);
+    if LRemainingMS <= 0 then
+      Continue;
+
+    { MilliSecondsSince returns Int64 and ATimeoutMS is an Integer, so the
+      subtraction is Int64. Narrow explicitly rather than letting the call site
+      do it implicitly: the value is bounded above by ATimeoutMS and below by 1
+      on this line, so the cast cannot lose anything — but an implicit
+      conversion here is a warning on Delphi and a range-check failure with
+      $R+, neither of which this container can catch. }
+    LRecvLen := DoRead(@FRecvBuffer[0], Length(FRecvBuffer),
+                       Integer(LRemainingMS), LTimedOut);
+    if LTimedOut then
+      Continue;
     if LRecvLen <= 0 then
       raise ENghttp2Client.Create('peer closed connection before stream end');
 
@@ -611,7 +818,8 @@ function TNghttp2Client.BeginRequest(
   const AMethod:  string;
   const APath:    string;
   const AHeaders: TNghttp2Headers;
-  const ABody:    TBytes): Int32;
+  const ABody:    TBytes;
+  AStreamResponse: Boolean): Int32;
 var
   LNvs:         array of Tnghttp2_nv;
   LNames:       array of AnsiString;    // hold refs so PAnsiChar stays valid
@@ -693,6 +901,7 @@ begin
   LIdx := AllocSlot(LStreamId);
   FStreams[LIdx].ReqBody    := ABody;
   FStreams[LIdx].ReqBodyPos := 0;
+  FStreams[LIdx].Streaming  := AStreamResponse;   { [CL3] }
 
   Result := LStreamId;
 end;
@@ -755,6 +964,106 @@ begin
   PumpUntilDone(ATimeoutMS);
 end;
 
+{ [CL3] One pass of PumpUntilDone's loop body. See the declaration for the
+  three return values. Kept beside it deliberately: if that loop changes, this
+  must change with it, and two pumps that drift apart would be a defect nothing
+  here would catch. }
+function TNghttp2Client.PumpOnce(ATimeoutMS: Integer): Integer;
+var
+  LRecvLen:  Integer;
+  LConsumed: NativeInt;
+  LTimedOut: Boolean;
+begin
+  FlushSession;
+
+  { Nothing further will arrive — the caller must treat this as end of data
+    rather than looping, or it spins until its deadline. }
+  if nghttp2_session_want_read(FSession) = 0 then
+    Exit(-1);
+
+  LRecvLen := DoRead(@FRecvBuffer[0], Length(FRecvBuffer), ATimeoutMS, LTimedOut);
+  if LTimedOut then
+    Exit(0);
+  if LRecvLen <= 0 then
+    raise ENghttp2Client.Create('peer closed connection before stream end');
+
+  LConsumed := nghttp2_session_mem_recv(FSession, @FRecvBuffer[0], LRecvLen);
+  if LConsumed < 0 then
+    raise ENghttp2Client.CreateFmt('nghttp2_session_mem_recv: %d', [LConsumed]);
+
+  { Callbacks fired during mem_recv may have queued WINDOW_UPDATE frames; get
+    them onto the wire now or the peer stalls waiting for window. }
+  FlushSession;
+  Result := 1;
+end;
+
+function TNghttp2Client.ReadChunk(AStreamId: Int32; var ABuffer: TBytes;
+  ACount: Integer; ATimeoutMS: Integer): Integer;
+var
+  LIdx:       Integer;
+  LStart:     TDateTime;
+  LRemaining: Int64;
+  LTook:      Integer;
+  LPumped:    Integer;
+begin
+  LIdx := FindSlot(AStreamId);
+  if LIdx < 0 then
+    raise ENghttp2Client.CreateFmt('no such stream: %d', [AStreamId]);
+  if not FStreams[LIdx].Streaming then
+    raise ENghttp2Client.CreateFmt(
+      'stream %d was not opened for streaming - pass AStreamResponse=True to '
+      + 'BeginRequest, or use PumpAll/TakeResponse for a buffered response',
+      [AStreamId]);
+  if ACount <= 0 then
+    raise ENghttp2Client.CreateFmt('ACount must be positive, got %d', [ACount]);
+
+  LStart := Now;
+  repeat
+    { Buffered bytes first: return what has arrived rather than waiting for a
+      full ACount. A reader that blocks for a full buffer on a live stream is
+      the classic way to turn incremental delivery back into batch delivery. }
+    if FStreams[LIdx].InboundLen > 0 then
+    begin
+      LTook := FStreams[LIdx].InboundLen;
+      if LTook > ACount then
+        LTook := ACount;
+      SetLength(ABuffer, LTook);
+      Move(FStreams[LIdx].Inbound[0], ABuffer[0], LTook);
+      if LTook < FStreams[LIdx].InboundLen then
+        Move(FStreams[LIdx].Inbound[LTook], FStreams[LIdx].Inbound[0],
+             FStreams[LIdx].InboundLen - LTook);
+      Dec(FStreams[LIdx].InboundLen, LTook);
+      Exit(LTook);
+    end;
+
+    { Buffer empty AND the stream closed: that is end of data, not a timeout.
+      Checked after the buffer, because END_STREAM can land in the same pass as
+      the final bytes and those bytes must be delivered first. }
+    if FStreams[LIdx].Done then
+    begin
+      SetLength(ABuffer, 0);
+      Exit(0);
+    end;
+
+    LRemaining := ATimeoutMS - MilliSecondsSince(LStart);
+    if LRemaining <= 0 then
+    begin
+      SetLength(ABuffer, 0);
+      Exit(-1);
+    end;
+
+    LPumped := PumpOnce(Integer(LRemaining));
+    if LPumped < 0 then
+    begin
+      { The session will not read again, so no further DATA can arrive. Report
+        end of stream rather than spinning to the deadline and calling it a
+        timeout — a timeout would tell the caller to retry forever. }
+      SetLength(ABuffer, 0);
+      Exit(0);
+    end;
+  until False;
+end;
+
 { Frees the slot as it hands the response back, so the caller cannot read a
   stale response twice and a long run does not accumulate slots. }
 function TNghttp2Client.TakeResponse(AStreamId: Int32): TNghttp2Response;
@@ -768,6 +1077,17 @@ begin
   if not FStreams[LIdx].Done then
     raise ENghttp2Client.CreateFmt(
       'stream %d has not completed - call PumpAll first', [AStreamId]);
+
+  { [CL3] Refuse to discard bytes the caller has not read. On a streaming
+    stream Response.Body is empty BY DESIGN — the body went to ReadChunk — and
+    handing that back silently would look exactly like a server that sent no
+    body at all. Drain to end-of-stream first, then take the status/headers. }
+  if FStreams[LIdx].Streaming and (FStreams[LIdx].InboundLen > 0) then
+    raise ENghttp2Client.CreateFmt(
+      'stream %d is a streaming response with %d byte(s) still unread - drain '
+      + 'it with ReadChunk until it returns 0 before taking the response '
+      + '(Body is empty on a streaming stream; status and headers are not)',
+      [AStreamId, FStreams[LIdx].InboundLen]);
 
   Result := FStreams[LIdx].Response;
   LErr   := FStreams[LIdx].Error;

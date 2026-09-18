@@ -34,6 +34,16 @@ uses
 {$IFEND}
   Nghttp2.OpenSSL;
 
+const
+  { [CL2c] TTlsClientConnection.Read returned this when ReadTimeoutMS elapsed
+    with no bytes and the connection still healthy. Distinct from 0 (peer
+    closed cleanly) and -1 (fatal), because "nothing yet" is neither.
+
+    -3, NOT -2. Nghttp2.Socket already spends -2 on SOCKET_WOULD_BLOCK, and
+    these two units call into each other — a shared value with two meanings is
+    the kind of collision that reads correct right up until it is not. }
+  TLS_READ_TIMED_OUT = -3;
+
 type
   ENghttp2Tls = class(Exception);
 
@@ -283,11 +293,12 @@ type
   // comment there for why OpenSSL is kept away from the socket.
   TTlsClientConnection = class
   strict private
-    FCtx:    TTlsClientContext;
-    FSocket: Integer;
-    FSSL:    PSSL;
-    FBioIn:  PBIO;
-    FBioOut: PBIO;
+    FCtx:           TTlsClientContext;
+    FSocket:        Integer;
+    FSSL:           PSSL;
+    FBioIn:         PBIO;
+    FBioOut:        PBIO;
+    FReadTimeoutMS: Integer;   { [CL2c] 0 = block forever, the old behaviour }
     function FlushOut: Boolean;
     function FeedIn: Integer;
   public
@@ -305,11 +316,26 @@ type
 
     // Same I/O contract as TTlsConnection.Read/Write — bytes returned,
     // negative on error. SSL_ERROR_WANT_READ/WANT_WRITE handled internally.
+    //
+    // [CL2c] Read additionally returns TLS_READ_TIMED_OUT (-3) when
+    // ReadTimeoutMS is set and elapses with no bytes. The connection is still
+    // healthy in that case — call again.
     function Read(ABuf: Pointer; ALen: Integer): Integer;
     function Write(ABuf: Pointer; ALen: Integer): Integer;
 
     // Best-effort SSL_shutdown before socket close.
     procedure Shutdown;
+
+    { [CL2c] Milliseconds FeedIn will wait for the socket to become readable
+      before giving up. 0 (the default, and what every caller got before this
+      existed) means block indefinitely — the previous behaviour, unchanged for
+      anyone who does not set this.
+
+      Client-side only on purpose. TTlsConnection, the server's class, is
+      deliberately untouched: it already drives reads from an engine that owns
+      its own readiness, and changing its contract would reach every accepted
+      connection to fix a client-side hang. }
+    property ReadTimeoutMS: Integer read FReadTimeoutMS write FReadTimeoutMS;
 
     property SSL: PSSL read FSSL;
   end;
@@ -1075,8 +1101,40 @@ end;
 
 function TTlsClientConnection.FeedIn: Integer;
 var
-  LBuf: array[0..16383] of Byte;
+  LBuf:   array[0..16383] of Byte;
+  LReady: Integer;
 begin
+  { [CL2c] Wait for readability before reading, so a silent peer produces a
+    timeout instead of parking here forever. SocketRecv is a blocking recv with
+    no SO_RCVTIMEO anywhere, so without this gate the timeout the caller thinks
+    it set is never evaluated — the call simply does not return.
+
+    Gating at the call site rather than setting SO_RCVTIMEO on the socket is
+    deliberate: SocketRecv is shared with the server and with
+    TTlsConnection, and changing recv semantics under them to fix a client hang
+    would be a far wider blast radius than this.
+
+    KNOWN LIMIT, worth reading before trusting the timeout: SocketWaitImpl
+    returns 1 ("readable") WITHOUT waiting for any fd >= 1024, because select's
+    fd_set cannot represent it and overflowing it is undefined behaviour. In a
+    process holding that many descriptors this gate degrades to a no-op and the
+    blocking read comes back. The timeout is therefore reliable for ordinary
+    client use and NOT a guarantee under heavy fd pressure; a poll/epoll-based
+    waiter would be needed to close that, which is its own change. }
+  if FReadTimeoutMS > 0 then
+  begin
+    LReady := SocketWaitReadable(TSocketHandle(FSocket), FReadTimeoutMS);
+    if LReady = 0 then
+      Exit(TLS_READ_TIMED_OUT);
+    { select reports EINTR as -1, and a signal is not a failed connection.
+      Fold it the same way the rest of this library does and let the caller
+      come round again rather than tearing a healthy socket down. }
+    if (LReady < 0) and (not SocketLastErrorIsWouldBlock) then
+      Exit(-1);
+    if LReady < 0 then
+      Exit(TLS_READ_TIMED_OUT);
+  end;
+
   Result := SocketRecv(TSocketHandle(FSocket), @LBuf[0], SizeOf(LBuf));
   if Result <= 0 then Exit;
   if BIO_write(FBioIn, @LBuf[0], Result) <= 0 then
@@ -1114,6 +1172,14 @@ begin
       SSL_ERROR_WANT_READ:
         begin
           LFed := FeedIn;
+          { [CL2c] A timeout is not a closed peer. FReadTimeoutMS is 0 during a
+            first handshake, so today this cannot fire — but that is an accident
+            of call order, not a guarantee: DoRead arms ReadTimeoutMS on every
+            read, so a reconnect on this same object would reach here with the
+            deadline still set and turn a merely slow handshake into a bogus
+            "peer closed". Keep waiting instead. }
+          if LFed = TLS_READ_TIMED_OUT then
+            Continue;
           if LFed <= 0 then
             RaiseTls('SSL_connect (peer closed during handshake)', LRet, FSSL);
         end;
@@ -1186,6 +1252,11 @@ begin
         begin
           if not FlushOut then Exit(-1);
           LFed := FeedIn;
+          { [CL2c] Propagate a timeout as a timeout. Folding it into -1 here
+            would report a dead connection for a write that merely needed peer
+            bytes it has not received yet — a renegotiation mid-write is
+            exactly that case. }
+          if LFed = TLS_READ_TIMED_OUT then Exit(TLS_READ_TIMED_OUT);
           if LFed <= 0 then Exit(-1);
         end;
     else
