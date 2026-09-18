@@ -139,6 +139,14 @@ var
   SSL_CTX_set_alpn_protos:      function(ctx: PSSL_CTX;
                                          const protos: PByte;
                                          protos_len: Cardinal): Integer; cdecl;
+  // Per-CONNECTION ALPN. Identical wire format and return convention to the
+  // _CTX_ variant above, but writes to the SSL instead of the shared SSL_CTX.
+  // That distinction is load-bearing, not stylistic: see FIX-ALPN-RACE-1 in
+  // TTlsClientConnection.Create. Present since OpenSSL 1.0.2, so it resolves
+  // on both the 3.x and 1.1.x branches this unit loads.
+  SSL_set_alpn_protos:          function(ssl: PSSL;
+                                         const protos: PByte;
+                                         protos_len: Cardinal): Integer; cdecl;
   // Client-side cert verification control. verify_cb can be nil for default
   // (built-in chain verification). Mode is a bitmask of SSL_VERIFY_* flags.
   SSL_CTX_set_verify:           procedure(ctx: PSSL_CTX;
@@ -387,6 +395,7 @@ begin
   if not GetFrom(ALibSsl, 'SSL_CTX_check_private_key',    Pointer(@SSL_CTX_check_private_key))    then Exit;
   if not GetFrom(ALibSsl, 'SSL_CTX_set_alpn_select_cb',   Pointer(@SSL_CTX_set_alpn_select_cb))   then Exit;
   if not GetFrom(ALibSsl, 'SSL_CTX_set_alpn_protos',      Pointer(@SSL_CTX_set_alpn_protos))      then Exit;
+  if not GetFrom(ALibSsl, 'SSL_set_alpn_protos',          Pointer(@SSL_set_alpn_protos))          then Exit;
   if not GetFrom(ALibSsl, 'SSL_get0_alpn_selected',       Pointer(@SSL_get0_alpn_selected))       then Exit;
   if not GetFrom(ALibSsl, 'SSL_CTX_set_verify',                      Pointer(@SSL_CTX_set_verify))                      then Exit;
   if not GetFrom(ALibSsl, 'SSL_CTX_load_verify_locations',           Pointer(@SSL_CTX_load_verify_locations))           then Exit;

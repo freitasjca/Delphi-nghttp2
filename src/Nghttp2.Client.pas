@@ -278,12 +278,16 @@ type
     // creates + configures + frees the TTlsClientContext. Leave nil for
     // cleartext h2c. See Delphi-nghttp2/samples for a full example.
     //
-    // Assigning this implies ALPN 'h2': Connect calls EnableHttp2Alpn on the
-    // context itself, so callers need not. That happens at CONNECT time, not
-    // on assignment — assignment order does not matter, and the list is
-    // re-applied on every Connect. Calling EnableHttp2Alpn yourself is still
-    // fine (it is idempotent); the four call sites that do were written before
-    // this and are left alone.
+    // Assigning this implies ALPN 'h2': the TTlsClientConnection that Connect
+    // allocates sets it on its own SSL, so callers need not. That happens at
+    // CONNECT time, not on assignment — assignment order does not matter, and
+    // it is applied to every connection.
+    //
+    // A context may be SHARED across clients and threads; that is what it is
+    // for. Configure it ONCE, before any thread connects. Calling
+    // EnableHttp2Alpn on it yourself is still permitted and still idempotent,
+    // but it is no longer necessary, and doing it while another thread is
+    // connecting on the same context is not safe (FIX-ALPN-RACE-1).
     property TlsContext: TTlsClientContext  read FTlsContext write FTlsContext;
   end;
 
@@ -542,28 +546,23 @@ begin
   if FTlsContext <> nil then
   begin
     try
-      { [CL2b] Offer 'h2' ourselves rather than trusting the caller to have
-        called EnableHttp2Alpn. This client has no HTTP/1.1 fallback, so there
-        is no configuration in which NOT offering h2 is useful - making it
-        opt-in only created a way to reach the confusing failure below.
+      { [CL2b, corrected by FIX-ALPN-RACE-1] Offering 'h2' is not optional for
+        this client - it has no HTTP/1.1 fallback, so there is no configuration
+        in which NOT offering h2 is useful, and leaving it opt-in only created
+        a way to reach the confusing failure below.
 
-        WHEN this applies is deliberate, and it is here rather than in the
-        TlsContext setter. The ALPN list is (re)applied at CONNECT time, on
-        every Connect, so the behaviour does not depend on the order in which
-        the caller assigns TlsContext and configures it. A setter-side call
-        would be order-sensitive in exactly the way that is hard to see: it
-        would fire once, against whatever state the context happened to be in
-        at assignment, and a later Disconnect/Connect pair would not revisit
-        it. Applying it here means there is a single moment when the list has
-        to be right, and it always is.
+        It is applied inside TTlsClientConnection.Create, on the SSL. CL2b
+        originally called FTlsContext.EnableHttp2Alpn at THIS point, to make
+        the result independent of the order in which the caller assigns
+        TlsContext and configures it. That goal was right and is preserved;
+        the placement was wrong. EnableHttp2Alpn is SSL_CTX_set_alpn_protos,
+        and a TTlsClientContext is designed to be shared - so re-applying it
+        per Connect meant mutating, on every connect, state that other threads
+        were concurrently reading. See FIX-ALPN-RACE-1 for the double-free.
 
-        Calling it twice is harmless: SSL_CTX_set_alpn_protos REPLACES the
-        stored list rather than appending, and all four existing call sites
-        set the same three bytes. Note this does mutate the caller-owned
-        context - acceptable because the only value it can write is the one an
-        h2-only client requires. }
-      FTlsContext.EnableHttp2Alpn;
-
+        Per-connection application keeps every property CL2b wanted: applied on
+        every Connect, independent of assignment order, always exactly 'h2' -
+        and adds the one it lacked, which is that it touches nothing shared. }
       FTlsConn := TTlsClientConnection.Create(FTlsContext, FSocket);
       FTlsConn.DoHandshake;
 

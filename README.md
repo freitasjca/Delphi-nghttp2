@@ -34,10 +34,11 @@ arrived here in **1.0.0**.
 | **Multiplexed client streams** — `BeginRequest` / `PumpAll` / `TakeResponse` | **✓** (MULTISTREAM-1 — N concurrent streams on ONE connection) |
 | Native HTTP/2 test client (115/115, six suite configurations) | **✓** |
 | TLS + ALPN — server side (`TTlsServerContext`, `TTlsConnection`) | **✓** |
-| TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** (1.18.0 — `Connect` offers `h2` itself; a peer that negotiates nothing, or something never offered, is refused with a message that says which) |
+| TLS + ALPN — client side (`TTlsClientContext`, `TTlsClientConnection`) | **✓** (1.18.0 — the client offers `h2` itself; a peer that negotiates nothing, or something never offered, is refused with a message that says which. 1.18.1 — that list is applied to the *connection*, not to the shared context; see the row below) |
 | **Host names + IPv6 in `ConnectToHost`** | **✓** (1.18.0 — `getaddrinfo` on all four platform arms, walking the address list; previously an IPv4 literal only, and two of three branches never checked the parse) |
 | **Request timeout that actually expires** | **✓** (1.18.0 — the deadline was documented and checked, but only *between* reads, so a peer that accepted and went silent parked the client forever) |
 | **Incremental response reads** — `ReadChunk` | **✓** (1.18.0 — opt in per stream with `BeginRequest(…, AStreamResponse := True)`; the body is delivered as it arrives instead of buffered whole, which is what SSE and large downloads need) |
+| **A shared `TTlsClientContext` is safe across threads again** | **✓** (1.18.1, FIX-ALPN-RACE-1 — 1.18.0's `Connect` re-applied ALPN to the *context* on every connect, so two threads connecting on one shared context double-freed OpenSSL's protocol list: 4 aborts in 30 runs of the provider mTLS suite. Now written to the per-connection `SSL` via `SSL_set_alpn_protos`. Note the abort surfaced in *sequential* tests far from the concurrent one that caused it) |
 | OpenSSL 3.x + 1.1.x FFI with auto-detect + `SetDllDirectory` for local libs | **✓** |
 | mTLS (client cert verification) | **✓** |
 | Password-protected private keys (`SSL_CTX_set_default_passwd_cb`) | **implemented, untested** — callback wired, no fixture uses an encrypted key |

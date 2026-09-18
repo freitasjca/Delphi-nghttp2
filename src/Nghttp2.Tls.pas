@@ -1059,6 +1059,8 @@ end;
 // ─── TTlsClientConnection ──────────────────────────────────────────────
 
 constructor TTlsClientConnection.Create(const AContext: TTlsClientContext; ASocket: Integer);
+var
+  LProtos: array[0..2] of Byte;
 begin
   inherited Create;
   if AContext = nil then
@@ -1070,6 +1072,40 @@ begin
   FSSL := SSL_new(AContext.Handle);
   if FSSL = nil then
     RaiseTls('SSL_new (client)', 0, nil);
+
+  { [FIX-ALPN-RACE-1] Offer 'h2' on THIS connection, never on the context.
+
+    TNghttp2Client.Connect used to call TTlsClientContext.EnableHttp2Alpn here
+    instead, which is SSL_CTX_set_alpn_protos. That mutates the SSL_CTX - and a
+    TTlsClientContext is explicitly built to be SHARED: the samples, the smoke
+    tests and the provider suite all hand ONE global context to every client,
+    including clients running on different threads. OpenSSL's implementation
+    frees the stored list and allocates a replacement, with no lock of its own,
+    so two threads connecting at the same instant free the same block twice.
+
+    The symptom is not local to the free. glibc detects the damage at whatever
+    allocation next walks the arena, so it surfaces as "double free or
+    corruption (fasttop)" or "malloc_consolidate(): invalid chunk size" in an
+    unrelated test many steps later - which is exactly how it was mis-attributed
+    when first seen. Measured at 4 aborts in 30 runs of the provider mTLS suite
+    (the fault is the 4-thread test; the abort landed in a sequential one).
+
+    SSL_set_alpn_protos writes to the SSL, which this object owns outright, so
+    there is nothing shared left to race. It also overrides any CTX-level list
+    for this connection, so callers that still call EnableHttp2Alpn themselves
+    get the same 'h2' and are not broken by this change.
+
+    Wire format, as for the context call: length-prefixed names, [0x02,'h','2']. }
+  LProtos[0] := 2;
+  LProtos[1] := Ord('h');
+  LProtos[2] := Ord('2');
+  // 0 = success (same peculiar convention as SSL_CTX_set_alpn_protos).
+  if SSL_set_alpn_protos(FSSL, @LProtos[0], Length(LProtos)) <> 0 then
+  begin
+    SSL_free(FSSL);
+    FSSL := nil;
+    RaiseTls('SSL_set_alpn_protos (client)', 0, nil);
+  end;
 
   FBioIn  := BIO_new(BIO_s_mem());
   FBioOut := BIO_new(BIO_s_mem());
