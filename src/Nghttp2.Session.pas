@@ -950,6 +950,8 @@ begin
 end;
 
 procedure TNghttp2StreamState.PushStreamData(const AData: TBytes);
+var
+  LReadPos: Int64;
 begin
   if (not FStreaming) or FStreamEnded or (Length(AData) = 0) then Exit;
 
@@ -960,9 +962,10 @@ begin
 
   FStreamLock.Enter;
   try
-    FStreamBuf.Seek(0, soEnd);
+    LReadPos := FStreamBuf.Position;    { save the callback's read cursor }
+    FStreamBuf.Seek(0, soEnd);          { append at end }
     FStreamBuf.WriteBuffer(AData[0], Length(AData));
-    FStreamBuf.Seek(0, soBeginning);
+    FStreamBuf.Seek(LReadPos, soBeginning); { restore — do not clobber read cursor }
   finally
     FStreamLock.Leave;
   end;

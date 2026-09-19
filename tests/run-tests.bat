@@ -26,6 +26,12 @@ REM                                       when libnghttp2 is absent.)
 REM    4c Nghttp2AlpnMismatch             build + run   (gates; the only stage
 REM                                       whose PEER is openssl rather than our
 REM                                       own server. Skips LOUDLY without it.)
+REM    4d Nghttp2ReadTimeout              build + run   (gates; cmd has no
+REM                                       watchdog - a hang IS the result)
+REM    4e Nghttp2StreamRead               build + run   (gates) - CL3a
+REM    4f Nghttp2LoaderRace               build + run * (gates) - 20 processes
+REM    4g Nghttp2FloodRead                compile only  (gates on compile fail;
+REM                                       RSS check is Linux-only, skipped here)
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
 REM    6  ProtogenEmitTests               build + run   (gates) - same dir
@@ -366,6 +372,18 @@ echo -- Nghttp2StreamRead ------------------------------------------------------
 echo    SKIP  Nghttp2StreamRead.dpr not present
 
 :after_streamread
+
+REM -- Stage 4g. CL3b compile check (Nghttp2FloodRead). ----------------------
+REM
+REM Proves dcc64 accepts the CL3b gate. The RSS assertion reads VmHWM from
+REM /proc/self/status, which does not exist on Windows, so SelfHwmKb returns 0
+REM and the memory check is skipped at runtime. Running the full gate also
+REM requires HorseNghttp2TestServer (async dispatch, horse-provider-nghttp2
+REM repo) — it is not self-contained like CL3a. The real run and the RSS
+REM measurement live in build-fpc.sh stage 20 on Linux.
+set "STAGE=Nghttp2FloodRead"
+set "STAGEUNITS=..\src"
+call :build_only
 
 REM -- Stage 4f. Loader thread-safety (FIX-LOADRACE-1). ------------------
 REM
