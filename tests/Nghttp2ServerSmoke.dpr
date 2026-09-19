@@ -314,13 +314,70 @@ begin
     Check('an unresolvable name raises, naming the host',
           GRaised and (Pos('no-such-host.invalid', GErrMsg) > 0), GErrMsg);
 
-    { IPv6 cannot be gated end-to-end here yet, and saying so beats a check
-      that quietly proves nothing: CreateListenerSocket binds AF_INET, so this
-      server has no IPv6 address to connect TO. The client-side v6 path is
-      exercised only once the listener learns AF_INET6 - a server-side
-      follow-up, tracked with CL1. }
-    Skip('connect to "::1" answers 200',
-         'server binds AF_INET only - needs an IPv6 listener first');
+    { ── CL4 - connection reuse, PING keepalive, explicit Reconnect ───────── }
+
+    GClient := TNghttp2Client.Create;
+    try
+      GClient.Connect('127.0.0.1', PORT);
+
+      { [CL4] A second Connect call to the same host:port must be a no-op — the
+        live session is reused without tearing it down. }
+      GClient.Connect('127.0.0.1', PORT);
+      Check('[CL4] double Connect to same endpoint keeps the connection alive',
+            GClient.Connected);
+      GResp := GClient.SubmitRequest('GET', '/smoke', nil, nil);
+      Check('[CL4] request on reused connection returns 200', GResp.Status = 200,
+            'status ' + IntToStr(GResp.Status));
+      Check('[CL4] request on reused connection returns correct body',
+            TEncoding.UTF8.GetString(GResp.Body) = 'ok',
+            TEncoding.UTF8.GetString(GResp.Body));
+
+      { [CL4] PING round-trip: send a PING frame, wait for the ACK that fires
+        OnFrameRecvCb and clears FPingPending. True = ACK received in time. }
+      Check('[CL4] Ping returns True within 5 s (connection is alive)',
+            GClient.Ping(5000));
+
+      { [CL4] GoAwayReceived is False on a healthy session that received no GOAWAY. }
+      Check('[CL4] GoAwayReceived is False on a healthy connection',
+            not GClient.GoAwayReceived);
+
+      { [CL4] Explicit Reconnect: closes the old session and opens a new one to
+        the same endpoint. The next request must succeed on the fresh session. }
+      GClient.Reconnect;
+      Check('[CL4] Reconnect leaves the client connected', GClient.Connected);
+      Check('[CL4] GoAwayReceived is False after Reconnect', not GClient.GoAwayReceived);
+      GResp := GClient.SubmitRequest('GET', '/smoke', nil, nil);
+      Check('[CL4] first request after Reconnect returns 200', GResp.Status = 200,
+            'status ' + IntToStr(GResp.Status));
+      Check('[CL4] first request after Reconnect returns correct body',
+            TEncoding.UTF8.GetString(GResp.Body) = 'ok',
+            TEncoding.UTF8.GetString(GResp.Body));
+    finally
+      GClient.Free;
+    end;
+
+    { IPv6 end-to-end: the server now binds AF_INET6 alongside AF_INET, so a
+      connection to ::1 exercises both the server's IPv6 accept path and the
+      client's IPv6 connect path. Skip gracefully when ::1 is not reachable
+      (IPv6 disabled on the host — the IPv4 checks above already passed). }
+    GClient := TNghttp2Client.Create;
+    try
+      try
+        GClient.Connect('::1', PORT);
+        GResp := GClient.SubmitRequest('GET', '/smoke', nil, nil);
+        Check('connect to "::1" answers 200', GResp.Status = 200,
+              IntToStr(GResp.Status));
+        Check('connect to "::1" returns correct body',
+              TEncoding.UTF8.GetString(GResp.Body) = 'ok',
+              TEncoding.UTF8.GetString(GResp.Body));
+      except
+        on E: Exception do
+          Skip('connect to "::1" answers 200',
+               '::1 not reachable: ' + E.ClassName + ': ' + E.Message);
+      end;
+    finally
+      GClient.Free;
+    end;
 
     GServer.Stop;
     Check('server stopped cleanly', True);

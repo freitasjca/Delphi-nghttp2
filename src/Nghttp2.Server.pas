@@ -373,11 +373,14 @@ type
   // ─── Accept-loop thread ───────────────────────────────────────────────
   TNghttp2AcceptThread = class(TThread)
   private
-    FServer: TNghttp2Server;
+    FServer:     TNghttp2Server;
+    FListenSock: TSocketHandle;  { owns no lifetime — server closes it }
+    FIPv6:       Boolean;
   protected
     procedure Execute; override;
   public
-    constructor Create(AServer: TNghttp2Server);
+    constructor Create(AServer: TNghttp2Server; AListenSock: TSocketHandle;
+      AIPv6: Boolean = False);
   end;
 
   // ─── Server ───────────────────────────────────────────────────────────
@@ -394,6 +397,8 @@ type
     FEnableConnectProtocol: Boolean;
     FListener:       TSocketHandle;
     FAcceptThread:   TNghttp2AcceptThread;
+    FListener6:      TSocketHandle;      { INVALID_SOCKET_HANDLE when unavailable }
+    FAcceptThread6:  TNghttp2AcceptThread;
     FConnections:    TList<TNghttp2ConnectionThread>;
     FConnLock:       TCriticalSection;
     // Hard stop. Connection pumps exit as soon as they see this, abandoning
@@ -1455,11 +1460,14 @@ end;
 
 // ─── TNghttp2AcceptThread ────────────────────────────────────────────────
 
-constructor TNghttp2AcceptThread.Create(AServer: TNghttp2Server);
+constructor TNghttp2AcceptThread.Create(AServer: TNghttp2Server;
+  AListenSock: TSocketHandle; AIPv6: Boolean);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
   FServer         := AServer;
+  FListenSock     := AListenSock;
+  FIPv6           := AIPv6;
 end;
 
 procedure TNghttp2AcceptThread.Execute;
@@ -1471,7 +1479,10 @@ begin
   while (not Terminated) and (not FServer.IsStopping)
     and (not FServer.IsDraining) do
   begin
-    LSock := AcceptConnection(FServer.FListener, LPeerAddr);
+    if FIPv6 then
+      LSock := AcceptConnection6(FListenSock, LPeerAddr)
+    else
+      LSock := AcceptConnection(FListenSock, LPeerAddr);
     if LSock = INVALID_SOCKET_HANDLE then
     begin
       // Accept returned error — most commonly the listener was closed by
@@ -1508,6 +1519,7 @@ constructor TNghttp2Server.Create;
 begin
   inherited Create;
   FListener     := INVALID_SOCKET_HANDLE;
+  FListener6    := INVALID_SOCKET_HANDLE;
   FConnections  := TList<TNghttp2ConnectionThread>.Create;
   FConnLock     := TCriticalSection.Create;
   FStopping     := 0;
@@ -1649,6 +1661,8 @@ begin
 end;
 
 procedure TNghttp2Server.Start(const AConfig: TNghttp2Config);
+var
+  LV6Error: string;
 begin
   if FListener <> INVALID_SOCKET_HANDLE then
     raise Exception.Create('TNghttp2Server: already listening');
@@ -1694,14 +1708,26 @@ begin
     // server listener, no accept thread, no handoff queue.
     Exit;
 
-  FListener := CreateListenerSocket(FConfig.Port, FConfig.ListenBacklog);
-  FAcceptThread := TNghttp2AcceptThread.Create(Self);
+  FListener     := CreateListenerSocket(FConfig.Port, FConfig.ListenBacklog);
+  FAcceptThread := TNghttp2AcceptThread.Create(Self, FListener);
   FAcceptThread.Start;
+
+  { Optional IPv6 listener — graceful degradation: if the OS has no IPv6
+    stack (or the port is taken on v6), start on IPv4 only. }
+  FListener6 := CreateListenerSocket6(FConfig.Port, FConfig.ListenBacklog,
+                                      LV6Error);
+  if FListener6 <> INVALID_SOCKET_HANDLE then
+  begin
+    FAcceptThread6 := TNghttp2AcceptThread.Create(Self, FListener6,
+                                                  {AIPv6=}True);
+    FAcceptThread6.Start;
+  end;
 end;
 
 procedure TNghttp2Server.StopAcceptingNewConnections;
 var
-  LListener: TSocketHandle;
+  LListener:  TSocketHandle;
+  LListener6: TSocketHandle;
 begin
   // Draining, NOT stopping. Existing connections must keep pumping so their
   // queued responses actually reach the socket; only the listener closes here.
@@ -1752,6 +1778,19 @@ begin
   begin
     FAcceptThread.WaitFor;
     FreeAndNil(FAcceptThread);
+  end;
+
+  { Mirror the same sequence for the IPv6 listener. FIX-DAEMON-SHUTDOWN-1
+    applies equally: ShutdownSocketHandle unblocks accept() on the IPv6 fd. }
+  LListener6 := FListener6;
+  FListener6 := INVALID_SOCKET_HANDLE;
+  if LListener6 <> INVALID_SOCKET_HANDLE then
+    ShutdownSocketHandle(LListener6);
+
+  if Assigned(FAcceptThread6) then
+  begin
+    FAcceptThread6.WaitFor;
+    FreeAndNil(FAcceptThread6);
   end;
 
   if FDrainDiagnostics then

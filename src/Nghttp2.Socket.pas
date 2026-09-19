@@ -12,7 +12,10 @@ unit Nghttp2.Socket;
 //    Delphi Win → Winapi.WinSock2
 //    Delphi POSIX → Posix.SysSocket + friends
 //
-//  Only IPv4 in v1.
+//  IPv4 listener is always created. An optional AF_INET6 listener is created
+//  alongside it when the OS supports IPv6 (CreateListenerSocket6 returns
+//  INVALID_SOCKET_HANDLE with an AError string when IPv6 is unavailable,
+//  instead of raising, so the server starts cleanly on IPv4-only hosts).
 //
 //  Two I/O modes live here side by side:
 //    - Blocking (SocketRecv / SocketSend / SocketSendAll) — what the
@@ -37,7 +40,7 @@ uses
 {$ELSE}
   System.SysUtils, Posix.Base, Posix.SysSocket, Posix.SysTypes,
   Posix.NetinetIn, Posix.ArpaInet, Posix.Unistd, Posix.Errno,
-  Posix.SysSelect, Posix.SysTime, Posix.Signal,
+  Posix.SysPoll, Posix.Signal,
   Posix.NetDB,   { [CL1] getaddrinfo / freeaddrinfo / addrinfo }
   Posix.Fcntl;   { fcntl + O_NONBLOCK for SetSocketNonBlocking }
 {$IFEND}
@@ -90,6 +93,18 @@ function CreateListenerSocket(APort: Word; ABacklog: Integer;
 // after a peer-side CloseSocketHandle on the listener during Stop).
 // APeerAddr is filled with the client's dotted-quad IPv4 address.
 function AcceptConnection(ALSock: TSocketHandle; out APeerAddr: string): TSocketHandle;
+
+{ Bind + listen on all IPv6 interfaces (::), given port + backlog.
+  Sets SO_REUSEADDR and IPV6_V6ONLY=1 so the AF_INET listener on the same
+  port is not disturbed. Returns INVALID_SOCKET_HANDLE and sets AError when
+  IPv6 is unavailable — never raises — so the caller can start the server
+  on IPv4-only hosts without special-casing. }
+function CreateListenerSocket6(APort: Word; ABacklog: Integer;
+  out AError: string): TSocketHandle;
+
+// Like AcceptConnection but for an AF_INET6 listener socket.
+// APeerAddr is filled with the peer's IPv6 address in colon-hex notation.
+function AcceptConnection6(ALSock: TSocketHandle; out APeerAddr: string): TSocketHandle;
 
 // Client-side TCP connect.
 //
@@ -448,6 +463,257 @@ begin
 end;
 {$IFEND}
 
+// ─── IPv6 types and constants (implementation-local) ─────────────────────
+
+type
+  { Portable sockaddr_in6 layout (28 bytes on every platform).
+    Defined here rather than relying on platform-specific unit types, which
+    differ between FPC versions and Delphi POSIX/Windows SDK headers. }
+  TSockAddr6 = packed record
+    sin6_family:   Word;                     { 2 — AF_INET6 }
+    sin6_port:     Word;                     { 2 — port, network byte order }
+    sin6_flowinfo: LongWord;                 { 4 — flow label + traffic class }
+    sin6_addr:     array [0..15] of Byte;    { 16 — IPv6 address (in6_addr) }
+    sin6_scope_id: LongWord;                 { 4 — scope id }
+  end;                                       { total = 28 }
+
+const
+  { IANA-stable — never changes. }
+  NGH2_IPPROTO_IPV6 = 41;
+{$IF DEFINED(MSWINDOWS) AND NOT DEFINED(FPC)}
+const
+  NGH2_IPV6_V6ONLY = 27;   { ws2def.h }
+{$ELSE}
+const
+  NGH2_IPV6_V6ONLY = 26;   { netinet/in.h (Linux, macOS, BSDs) }
+{$IFEND}
+
+// ─── CreateListenerSocket6 ────────────────────────────────────────────────
+
+function CreateListenerSocket6(APort: Word; ABacklog: Integer;
+  out AError: string): TSocketHandle;
+{$IF DEFINED(FPC)}
+var
+  LSock:   LongInt;
+  LAddr6:  TSockAddr6;
+  LReuse:  LongInt;
+  LV6Only: LongInt;
+begin
+  AError := '';
+
+  LSock := fpSocket(AF_INET6, SOCK_STREAM, 0);
+  if LSock < 0 then
+  begin
+    AError := Format('fpSocket(AF_INET6) failed (errno=%d)', [SocketError]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  LReuse := 1;
+  fpSetSockOpt(LSock, SOL_SOCKET, SO_REUSEADDR, @LReuse, SizeOf(LReuse));
+
+  { IPV6_V6ONLY=1: only pure IPv6 peers connect. Without this the kernel may
+    present IPv4-mapped addresses (::ffff:x.x.x.x) and collide with the
+    AF_INET socket already bound to the same port on dual-stack hosts. }
+  LV6Only := 1;
+  fpSetSockOpt(LSock, NGH2_IPPROTO_IPV6, NGH2_IPV6_V6ONLY,
+               @LV6Only, SizeOf(LV6Only));
+
+  FillChar(LAddr6, SizeOf(LAddr6), 0);
+  LAddr6.sin6_family := AF_INET6;
+  LAddr6.sin6_port   := htons(APort);
+  { sin6_addr all-zeros = in6addr_any ('::') — accept on every interface. }
+
+  if fpBind(LSock, PSockAddr(@LAddr6), SizeOf(LAddr6)) <> 0 then
+  begin
+    CloseSocket(LSock);
+    AError := Format('fpBind(AF_INET6) :%d failed (errno=%d)',
+                     [APort, SocketError]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  if fpListen(LSock, ABacklog) <> 0 then
+  begin
+    CloseSocket(LSock);
+    AError := 'fpListen(AF_INET6) failed';
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  Result := LSock;
+end;
+{$ELSEIF DEFINED(MSWINDOWS)}
+var
+  LSock:   TSocket;
+  LAddr6:  TSockAddr6;
+  LReuse:  Integer;
+  LV6Only: Integer;
+begin
+  AError := '';
+  InitSockets;
+
+  LSock := socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if LSock = INVALID_SOCKET then
+  begin
+    AError := Format('socket(AF_INET6) failed: WSA=%d', [WSAGetLastError]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  LReuse := 1;
+  setsockopt(LSock, SOL_SOCKET, SO_REUSEADDR, @LReuse, SizeOf(LReuse));
+
+  LV6Only := 1;
+  setsockopt(LSock, NGH2_IPPROTO_IPV6, NGH2_IPV6_V6ONLY,
+             @LV6Only, SizeOf(LV6Only));
+
+  FillChar(LAddr6, SizeOf(LAddr6), 0);
+  LAddr6.sin6_family := AF_INET6;
+  LAddr6.sin6_port   := htons(APort);
+
+  { PSockAddr(@LAddr6)^ : pass the address of our 28-byte struct as the
+    16-byte TSockAddr var-param; SizeOf(LAddr6)=28 tells the kernel how
+    many bytes to read — the standard C (struct sockaddr *)&sin6 pattern. }
+  if bind(LSock, PSockAddr(@LAddr6)^, SizeOf(LAddr6)) = SOCKET_ERROR then
+  begin
+    closesocket(LSock);
+    AError := Format('bind(AF_INET6) :%d failed: WSA=%d',
+                     [APort, WSAGetLastError]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  if listen(LSock, ABacklog) = SOCKET_ERROR then
+  begin
+    closesocket(LSock);
+    AError := Format('listen(AF_INET6) failed: WSA=%d', [WSAGetLastError]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  Result := LSock;
+end;
+{$ELSE}
+var
+  LSock:   Integer;
+  LAddr6:  TSockAddr6;
+  LV6Only: Integer;
+begin
+  AError := '';
+
+  LSock := socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  if LSock < 0 then
+  begin
+    AError := Format('socket(AF_INET6) failed: errno=%d', [errno]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  setsockopt(LSock, SOL_SOCKET, SO_REUSEADDR, 1, SizeOf(Integer));
+
+  LV6Only := 1;
+  setsockopt(LSock, NGH2_IPPROTO_IPV6, NGH2_IPV6_V6ONLY,
+             LV6Only, SizeOf(LV6Only));
+
+  FillChar(LAddr6, SizeOf(LAddr6), 0);
+  LAddr6.sin6_family := AF_INET6;
+  LAddr6.sin6_port   := htons(APort);
+
+  { sockaddr(Pointer(@LAddr6)^) : the C (struct sockaddr *)&sin6 idiom for
+    Delphi POSIX, where bind takes 'const addr: sockaddr'. Delphi passes the
+    address of the var we give it; SizeOf(LAddr6)=28 covers the full struct. }
+  if bind(LSock, sockaddr(Pointer(@LAddr6)^), SizeOf(LAddr6)) < 0 then
+  begin
+    __close(LSock);
+    AError := Format('bind(AF_INET6) :%d failed: errno=%d', [APort, errno]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  if listen(LSock, ABacklog) < 0 then
+  begin
+    __close(LSock);
+    AError := Format('listen(AF_INET6) failed: errno=%d', [errno]);
+    Exit(INVALID_SOCKET_HANDLE);
+  end;
+
+  Result := LSock;
+end;
+{$IFEND}
+
+// ─── AcceptConnection6 ────────────────────────────────────────────────────
+//
+// Formats the peer address as eight colon-separated groups of four hex
+// digits (e.g. "0000:0000:0000:0000:0000:0000:0000:0001" for ::1). Not
+// compressed, but unambiguous and requires no inet_ntop FFI binding.
+
+{$IF DEFINED(FPC)}
+function AcceptConnection6(ALSock: TSocketHandle; out APeerAddr: string): TSocketHandle;
+var
+  LAddr6: TSockAddr6;
+  LLen:   LongInt;
+  LSock:  LongInt;
+  I:      Integer;
+  W:      Word;
+begin
+  APeerAddr := '';
+  LLen  := SizeOf(LAddr6);
+  LSock := fpAccept(ALSock, PSockAddr(@LAddr6), @LLen);
+  if LSock < 0 then Exit(INVALID_SOCKET_HANDLE);
+
+  for I := 0 to 7 do
+  begin
+    if I > 0 then APeerAddr := APeerAddr + ':';
+    W := (Word(LAddr6.sin6_addr[I * 2]) shl 8) or LAddr6.sin6_addr[I * 2 + 1];
+    APeerAddr := APeerAddr + LowerCase(IntToHex(Integer(W), 4));
+  end;
+
+  SetSocketNoDelay(LSock);
+  Result := LSock;
+end;
+{$ELSEIF DEFINED(MSWINDOWS)}
+function AcceptConnection6(ALSock: TSocketHandle; out APeerAddr: string): TSocketHandle;
+var
+  LAddr6: TSockAddr6;
+  LLen:   Integer;
+  LSock:  TSocket;
+  I:      Integer;
+  W:      Word;
+begin
+  APeerAddr := '';
+  LLen  := SizeOf(LAddr6);
+  LSock := accept(ALSock, PSockAddr(@LAddr6), @LLen);
+  if LSock = INVALID_SOCKET then Exit(INVALID_SOCKET_HANDLE);
+
+  for I := 0 to 7 do
+  begin
+    if I > 0 then APeerAddr := APeerAddr + ':';
+    W := (Word(LAddr6.sin6_addr[I * 2]) shl 8) or LAddr6.sin6_addr[I * 2 + 1];
+    APeerAddr := APeerAddr + LowerCase(IntToHex(Integer(W), 4));
+  end;
+
+  SetSocketNoDelay(LSock);
+  Result := LSock;
+end;
+{$ELSE}
+function AcceptConnection6(ALSock: TSocketHandle; out APeerAddr: string): TSocketHandle;
+var
+  LAddr6: TSockAddr6;
+  LLen:   socklen_t;
+  LSock:  Integer;
+  I:      Integer;
+  W:      Word;
+begin
+  APeerAddr := '';
+  LLen  := SizeOf(LAddr6);
+  LSock := accept(ALSock, sockaddr(Pointer(@LAddr6)^), LLen);
+  if LSock < 0 then Exit(INVALID_SOCKET_HANDLE);
+
+  for I := 0 to 7 do
+  begin
+    if I > 0 then APeerAddr := APeerAddr + ':';
+    W := (Word(LAddr6.sin6_addr[I * 2]) shl 8) or LAddr6.sin6_addr[I * 2 + 1];
+    APeerAddr := APeerAddr + LowerCase(IntToHex(Integer(W), 4));
+  end;
+
+  SetSocketNoDelay(LSock);
+  Result := LSock;
+end;
+{$IFEND}
+
 {$IF DEFINED(FPC) AND DEFINED(UNIX)}
 { [CL1] libc's resolver, bound here rather than reached through netdb.
 
@@ -737,46 +1003,35 @@ end;
 {$IFEND}
 
 // ─── SocketWaitReadable / SocketWaitWritable ─────────────────────────────
-// select()-based readiness wait. Mirrors the four-branch structure used by
-// CreateListenerSocket above.
+// poll()-based readiness wait with a millisecond timeout. Four platform
+// branches mirror the structure of CreateListenerSocket above.
 //
-// Read and write share one implementation because the four platform branches
-// differ only in which argument slot the fd_set goes into — and because both
-// of the traps below apply identically to each, so they are worth stating in
-// exactly one place.
+// poll() is used instead of select() on every POSIX branch for one reason:
+// POSIX fd_set is a fixed-width bitmask (FD_SETSIZE = 1024 on Linux). An fd
+// at or past that limit would silently corrupt the stack-allocated bitmask,
+// so the old select() code short-circuited to "ready" for high-numbered fds.
+// That bypassed the timeout entirely — DoRead went straight to a blocking
+// recv() with no deadline, which caused ReadChunk to hang indefinitely when
+// the server stalled (e.g. HTTP/2 flow-control window exhausted). poll() has
+// no fd-number limit and always honours the timeout, fixing CL3b.
 //
-// POSIX fd_set is a fixed-width bitmask, so FD_SET on a descriptor at or past
-// FD_SETSIZE writes past the end of the local — silent stack corruption, and
-// exactly the regime this poll loop exists to serve (many open connections).
-// Rather than corrupt, descriptors above the limit report "ready", which sends
-// the caller into a plain blocking recv/send: the pre-timeout behaviour, so
-// such a connection flushes its queued responses on the peer's next byte
-// instead of on the poll tick. Windows needs no such guard — its fd_set is a
-// count plus a handle array, safe for any single handle value.
-//
-// This is also why the epoll engine does not reuse these: select cannot
-// express "many descriptors" without either the FD_SETSIZE cliff or an
-// O(n) rescan per wait.
+// Windows uses select() with its count+handle fd_set — no fd limit there, so
+// that branch is unchanged.
 
 function SocketWaitImpl(ASock: TSocketHandle; AForWrite: Boolean;
   ATimeoutMS: Integer): Integer;
 {$IF DEFINED(FPC) AND DEFINED(UNIX)}
-const
-  MAX_SELECT_FD = 1024;
 var
-  LFDSet:   TFDSet;
-  LTimeVal: TTimeVal;
+  LPollFD: TPollFD;
 begin
   if ASock = INVALID_SOCKET_HANDLE then Exit(-1);
-  if ASock >= MAX_SELECT_FD then Exit(1);
-  LTimeVal.tv_sec  := ATimeoutMS div 1000;
-  LTimeVal.tv_usec := 1000 * (ATimeoutMS mod 1000);
-  fpFD_ZERO(LFDSet);
-  fpFD_SET(ASock, LFDSet);
+  LPollFD.fd := ASock;
   if AForWrite then
-    Result := fpSelect(ASock + 1, nil, @LFDSet, nil, @LTimeVal)
+    LPollFD.events := POLLOUT
   else
-    Result := fpSelect(ASock + 1, @LFDSet, nil, nil, @LTimeVal);
+    LPollFD.events := POLLIN;
+  LPollFD.revents := 0;
+  Result := fpPoll(@LPollFD, 1, ATimeoutMS);
 end;
 {$ELSEIF DEFINED(FPC)}
 var
@@ -817,22 +1072,17 @@ begin
     Result := select(0, @LFDSet, nil, nil, @LTimeVal);
 end;
 {$ELSE}
-const
-  MAX_SELECT_FD = 1024;
 var
-  LFDSet:   fd_set;
-  LTimeVal: timeval;
+  LPollFD: pollfd;
 begin
   if ASock = INVALID_SOCKET_HANDLE then Exit(-1);
-  if ASock >= MAX_SELECT_FD then Exit(1);
-  LTimeVal.tv_sec  := ATimeoutMS div 1000;
-  LTimeVal.tv_usec := 1000 * (ATimeoutMS mod 1000);
-  FD_ZERO(LFDSet);
-  _FD_SET(ASock, LFDSet);
+  LPollFD.fd := ASock;
   if AForWrite then
-    Result := Posix.SysSelect.select(ASock + 1, nil, @LFDSet, nil, @LTimeVal)
+    LPollFD.events := POLLOUT
   else
-    Result := Posix.SysSelect.select(ASock + 1, @LFDSet, nil, nil, @LTimeVal);
+    LPollFD.events := POLLIN;
+  LPollFD.revents := 0;
+  Result := poll(@LPollFD, 1, ATimeoutMS);
 end;
 {$IFEND}
 
