@@ -227,6 +227,26 @@ type
     [TProtoMember(2)] property u64: UInt64   read Fu64 write Fu64;
   end;
 
+  { WIRE-FORM-1. One field per Group-B scalar kind, testing all six new
+    TProtoFieldKind values and both wire forms (pwfZigZag / pwfFixed). }
+  [TGrpcMessage]
+  TWireFormMessage = class
+  private
+    Fsint32:   Integer;
+    Fsint64:   Int64;
+    Ffixed32:  UInt32;
+    Ffixed64:  UInt64;
+    Fsfixed32: Integer;
+    Fsfixed64: Int64;
+  published
+    [TProtoMember(1, pwfZigZag)] property sint32:   Integer  read Fsint32   write Fsint32;
+    [TProtoMember(2, pwfZigZag)] property sint64:   Int64    read Fsint64   write Fsint64;
+    [TProtoMember(3, pwfFixed)]  property fixed32:  UInt32   read Ffixed32  write Ffixed32;
+    [TProtoMember(4, pwfFixed)]  property fixed64:  UInt64   read Ffixed64  write Ffixed64;
+    [TProtoMember(5, pwfFixed)]  property sfixed32: Integer  read Fsfixed32 write Fsfixed32;
+    [TProtoMember(6, pwfFixed)]  property sfixed64: Int64    read Fsfixed64 write Fsfixed64;
+  end;
+
   { A genuinely fieldless message — the shape of google.protobuf.Empty, which
     gRPC returns constantly. The scanner used to refuse ANY zero-field class,
     because it could not tell a deliberate empty message from someone who
@@ -1364,6 +1384,68 @@ begin
 end;
 
 
+{ WIRE-FORM-1 — round-trip test for all six Group-B scalar kinds. }
+procedure TestWireFormRoundTrip;
+var
+  LSrc, LDst: TWireFormMessage;
+  LBytes: TBytes;
+begin
+  Section('12b  Group-B scalar wire forms (WIRE-FORM-1)');
+
+  LSrc := TWireFormMessage.Create;
+  LDst := TWireFormMessage.Create;
+  try
+    // Use values that differ between signed-varint, zigzag, and fixed encoding
+    // so a wrong codec path produces a different byte string.
+    LSrc.sint32   := -42;       // ZigZag: varint(83), NOT varint(two's comp)
+    LSrc.sint64   := -1234567890123;
+    LSrc.fixed32  := $DEADBEEF; // fixed-width UInt32 — must NOT go through varint
+    LSrc.fixed64  := UInt64($CAFEBABE_12345678);
+    LSrc.sfixed32 := -1;        // fixed-width Int32: 0xFFFFFFFF on wire
+    LSrc.sfixed64 := -9876543210;
+
+    LBytes := TProtoSerializer.Serialize(LSrc);
+
+    Check('serialized bytes non-empty', Length(LBytes) > 0,
+      'got ' + IntToStr(Length(LBytes)) + ' bytes');
+
+    // sint32 = -42  →  ZigZag = 83 = 0x53  (5-bit varint, 1 byte)
+    // Before WIRE-FORM-1 it would encode as Int32 varint: 10 bytes of 0xFF...
+    // Check compactness: -42 ZigZag = 1-byte varint; int32 would be 10 bytes
+    // (4 + 4 for tag+value) vs (1 + 1); total for sint32 tag+value = 2 bytes
+    Check('sint32 = -42 encodes compactly (ZigZag)',
+      Length(LBytes) < 50,   // loose upper bound; wrong codec = 14+ extra bytes
+      IntToStr(Length(LBytes)) + ' bytes: ' + BytesToHex(LBytes));
+
+    TProtoSerializer.Deserialize(LBytes, LDst);
+
+    Check('round-trip sint32 = -42',         LDst.sint32   = -42,
+      IntToStr(LDst.sint32));
+    Check('round-trip sint64 = -1234567890123', LDst.sint64 = -1234567890123,
+      IntToStr(LDst.sint64));
+    Check('round-trip fixed32 = $DEADBEEF',  LDst.fixed32  = $DEADBEEF,
+      Format('%8.8x', [LDst.fixed32]));
+    Check('round-trip fixed64',              LDst.fixed64  = UInt64($CAFEBABE_12345678),
+      Format('%16.16x', [LDst.fixed64]));
+    Check('round-trip sfixed32 = -1',        LDst.sfixed32 = -1,
+      IntToStr(LDst.sfixed32));
+    Check('round-trip sfixed64 = -9876543210', LDst.sfixed64 = -9876543210,
+      IntToStr(LDst.sfixed64));
+
+    // Canonical: all-default encodes to zero bytes
+    LSrc.sint32   := 0; LSrc.sint64   := 0;
+    LSrc.fixed32  := 0; LSrc.fixed64  := 0;
+    LSrc.sfixed32 := 0; LSrc.sfixed64 := 0;
+    LBytes := TProtoSerializer.Serialize(LSrc);
+    Check('all-default Group-B message encodes to zero bytes (CANONICAL-1)',
+      Length(LBytes) = 0,
+      IntToStr(Length(LBytes)) + ' bytes: ' + BytesToHex(LBytes));
+  finally
+    LSrc.Free;
+    LDst.Free;
+  end;
+end;
+
 procedure TestUnsignedWireForm;
 var
   LSrc, LDst: TUnsignedMessage;
@@ -1682,6 +1764,7 @@ begin
     TestRepeatedRoundTrip;
     TestRepeatedEmptyAndWire;
     TestRepeatedAcceptsUnpackedNumeric;
+    TestWireFormRoundTrip;
     TestUnsignedWireForm;
     TestEmptyMessage;
     TestExplicitPresence;

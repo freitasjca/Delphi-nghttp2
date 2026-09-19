@@ -205,6 +205,26 @@ type
     [TProtoMember(1)] property v: string read Fv write Fv;
   end;
 
+  { WIRE-FORM-1 message classes — carry the pwfZigZag / pwfFixed annotation so
+    the RTTI layer selects the correct encoding path.  The base Pascal type still
+    determines bit width and sign interpretation within that encoding. }
+
+  [TGrpcMessage]
+  TSInt32Msg = class
+  private
+    Fv: Integer;
+  published
+    [TProtoMember(1, pwfZigZag)] property v: Integer read Fv write Fv;
+  end;
+
+  [TGrpcMessage]
+  TFixed32Msg = class
+  private
+    Fv: UInt32;
+  published
+    [TProtoMember(1, pwfFixed)] property v: UInt32 read Fv write Fv;
+  end;
+
 // ── 01 · uint32 ─────────────────────────────────────────────────────────────
 // The plan's confirmed defect. Nghttp2.Protobuf.Rtti maps tkInteger -> pkInt32
 // with no OrdType inspection, and marshals via TValue.AsInteger — so a Cardinal
@@ -363,21 +383,21 @@ begin
   end;
 end;
 
-// ── 04 · sint32 / sint64 are unreachable ────────────────────────────────────
-// TProtoMemberAttribute.Create takes only a tag, so nothing can ask for zigzag.
-// This probe does not test a bug — it PINS the gap, by showing that the bytes
-// the RTTI path produces for a negative Integer are not the zigzag bytes any
-// sint32 peer will send. If a future attribute overload adds a wire form, this
-// probe should start reporting the two as equal for a zigzag-marked field.
+// ── 04 · sint32 / sint64 — ZigZag via pwfZigZag (WIRE-FORM-1) ───────────────
+// [TProtoMember(N, pwfZigZag)] tells the RTTI layer that this Integer property
+// is a proto3 sint32 and must be ZigZag-encoded. The RTTI layer promotes the
+// base pkInt32 to pkSInt32, which routes Serialize through WriteSInt32Field and
+// Deserialize through ReadZigZag32. Result: the bytes on the wire now match what
+// any conforming proto3 peer sends for sint32.
 
-procedure ProbeZigZagUnreachable;
+procedure ProbeSInt32;
 var
-  LMsg: TI32Msg;
+  LMsg: TSInt32Msg;
   LPayload, LZigZag: TBytes;
 begin
-  Section('04  sint32 / sint64 - zigzag not selectable through RTTI');
+  Section('04  sint32 / sint64 - ZigZag via pwfZigZag (WIRE-FORM-1)');
 
-  LMsg := TI32Msg.Create;
+  LMsg := TSInt32Msg.Create;
   try
     LMsg.v := -1;
     try
@@ -387,7 +407,7 @@ begin
 
       if BytesEqual(LPayload, LZigZag) then
         Conforms('sint32 = -1 encodes as zigzag',
-          'unexpected - the RTTI layer gained a zigzag path')
+          'zigzag, ' + IntToStr(Length(LZigZag)) + ' byte(s): ' + BytesToHex(LZigZag))
       else
         Deviates('sint32 = -1 encodes as zigzag',
           'zigzag, ' + IntToStr(Length(LZigZag)) + ' byte(s): ' + BytesToHex(LZigZag),
@@ -400,29 +420,32 @@ begin
   end;
 end;
 
-// ── 05 · fixed32 / fixed64 are unreachable ──────────────────────────────────
-// Same shape as 04. A fixed32 field is wire type 5 and always four payload
-// bytes; the RTTI path can only produce a varint.
+// ── 05 · fixed32 / fixed64 — fixed-width via pwfFixed (WIRE-FORM-1) ─────────
+// [TProtoMember(N, pwfFixed)] tells the RTTI layer that this UInt32 property is
+// a proto3 fixed32 and must use wire type 5 (I32 — four bytes, little-endian).
+// The RTTI layer promotes pkUInt32 to pkFixed32, routing Serialize through
+// WriteFixed32Field and Deserialize through ReadFixed32.
 
-procedure ProbeFixedUnreachable;
+procedure ProbeFixed32;
 var
-  LMsg: TI32Msg;
+  LMsg: TFixed32Msg;
   LBytes: TBytes;
 begin
-  Section('05  fixed32 / fixed64 - fixed-width not selectable through RTTI');
+  Section('05  fixed32 / fixed64 - fixed-width via pwfFixed (WIRE-FORM-1)');
 
-  LMsg := TI32Msg.Create;
+  LMsg := TFixed32Msg.Create;
   try
     LMsg.v := 1;
     try
       LBytes := TProtoSerializer.Serialize(LMsg);
       // Tag byte for field 1: wire type lives in the low 3 bits.
-      // pwVarint = 0 gives $08; a fixed32 field would be $0D.
+      // pwVarint = 0 gives $08; a fixed32 field must be $0D (wire type 5).
       if Length(LBytes) = 0 then
         Broken('fixed32 selectable',
-          'non-default int32 = 1 serialised to zero bytes - probe cannot read a tag')
+          'non-default uint32 = 1 serialised to zero bytes - probe cannot read a tag')
       else if (LBytes[0] and $07) = 5 then
-        Conforms('fixed32 selectable', 'unexpected - RTTI layer gained a fixed path')
+        Conforms('fixed32 selectable',
+          'wire type 5, tag byte $' + IntToHex(LBytes[0], 2) + ', 4 payload bytes')
       else
         Deviates('fixed32 selectable',
           'wire type 5, tag byte $0D, 4 payload bytes',
@@ -574,8 +597,8 @@ begin
     ProbeUInt32;
     ProbeUInt64;
     ProbeNegativeInt32;
-    ProbeZigZagUnreachable;
-    ProbeFixedUnreachable;
+    ProbeSInt32;
+    ProbeFixed32;
     ProbeDefaultOmission;
     ProbeInt64Control;
 
