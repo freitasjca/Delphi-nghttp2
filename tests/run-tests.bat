@@ -32,6 +32,8 @@ REM    4e Nghttp2StreamRead               build + run   (gates) - CL3a
 REM    4f Nghttp2LoaderRace               build + run * (gates) - 20 processes
 REM    4g Nghttp2FloodRead                compile only  (gates on compile fail;
 REM                                       RSS check is Linux-only, skipped here)
+REM    4h Nghttp2ConnectTimeout           build + run   (gates; cmd has no
+REM                                       watchdog - a hang IS the result)
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
 REM    6  ProtogenEmitTests               build + run   (gates) - same dir
@@ -457,6 +459,62 @@ echo -- Nghttp2LoaderRace ------------------------------------------------------
 echo    SKIP  Nghttp2LoaderRace.dpr not present
 
 :after_loaderrace
+
+REM -- Stage 4h. Connect timeout (CL5). -----------------------------------
+REM
+REM ConnectToHost always used a blocking connect(). A SYN silently dropped
+REM (accept queue full, or a routing black-hole) let the OS TCP retry timer
+REM run -- up to ~127 s on Linux -- with no way to interrupt it. The fix:
+REM when ConnectTimeoutMS > 0, the socket is set non-blocking, connect()
+REM is called, WSAEWOULDBLOCK is expected, and WSAPoll() waits the budget.
+REM
+REM Two sub-tests in one program:
+REM   A. Fast loopback connect WITH timeout set succeeds -- the new non-
+REM      blocking path does not regress the success case.
+REM   B. Connect to a listener whose accept queue is filled by a blocking
+REM      filler. The kernel drops the SYN; our poll() fires after BUDGET_MS
+REM      (2 s) and ENghttp2Socket is raised.
+REM
+REM NOTE: cmd has no watchdog. Unlike the bash harness (where timeout 30
+REM converts a hang into exit 124), here a hang IS the suite stopping.
+REM If the suite stops here, ConnectTimeoutMS is not working -- the socket
+REM is still blocking despite ATimeoutMS > 0. Ctrl+C and read this comment.
+if not exist "Nghttp2ConnectTimeout.dpr" goto :no_connecttimeout
+echo -- Nghttp2ConnectTimeout ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ConnectTimeout.dpr" > "Nghttp2ConnectTimeout.buildlog" 2>&1
+if errorlevel 1 goto :connecttimeout_buildfail
+if not exist "Nghttp2ConnectTimeout.exe" goto :connecttimeout_buildfail
+Nghttp2ConnectTimeout.exe < nul
+set "CT_RC=!errorlevel!"
+echo.
+if "!CT_RC!"=="0" goto :connecttimeout_pass
+if "!CT_RC!"=="3" goto :connecttimeout_skip
+echo    FAIL  Nghttp2ConnectTimeout - the timeout did not behave as specified
+set /a FAILED+=1
+goto :after_connecttimeout
+
+:connecttimeout_pass
+echo    PASS  Nghttp2ConnectTimeout - the deadline fired within budget
+goto :after_connecttimeout
+
+:connecttimeout_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ConnectTimeout - libnghttp2 absent; ConnectTimeoutMS NOT exercised
+goto :after_connecttimeout
+
+:connecttimeout_buildfail
+echo    FAIL  Nghttp2ConnectTimeout did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ConnectTimeout.buildlog"
+echo.
+echo    Full log: Nghttp2ConnectTimeout.buildlog
+set /a FAILED+=1
+goto :after_connecttimeout
+
+:no_connecttimeout
+echo -- Nghttp2ConnectTimeout ---------------------------------------------------------------
+echo    SKIP  Nghttp2ConnectTimeout.dpr not present
+
+:after_connecttimeout
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in

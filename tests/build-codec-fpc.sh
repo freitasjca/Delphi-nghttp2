@@ -822,6 +822,70 @@ else
   fi
 fi
 
+# ── connect timeout (CL5) ─────────────────────────────────────────────────────
+# ConnectToHost always used a blocking connect(). A SYN silently dropped
+# (accept queue full, or a routing black-hole) let the OS TCP retry timer run —
+# up to ~127 s on Linux (tcp_syn_retries=6) — with no way to interrupt it short
+# of SIGKILL. ConnectTimeoutMS sets a poll() deadline: the socket is set
+# non-blocking, connect() returns EINPROGRESS, poll() waits the budget, and
+# SocketWaitConnected reads SO_ERROR to confirm.
+#
+# Two sub-tests in one program:
+#   A. Fast loopback connect WITH timeout set succeeds — the new non-blocking
+#      path does not regress the success case.
+#   B. Connect to a listener whose accept queue is pre-filled: the kernel drops
+#      the SYN, poll() fires after BUDGET_MS (2 s), ENghttp2Socket is raised.
+#      If the kernel rounded backlog=1 up enough that the test connect also
+#      succeeded (possible on some kernels), B is noted rather than failed —
+#      sub-test A is still meaningful.
+#
+# `timeout` is not optional: a regression does not make the program exit 1,
+# it makes it HANG — the same reason it is used for CL2c. Exit 124 = killed
+# by timeout(1), which IS the regression: ConnectToHost is blocking despite
+# ATimeoutMS > 0.
+echo
+echo "── connect timeout (CL5) ─────────────────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ConnectTimeout.dpr" ]]; then
+  echo "  SKIP  Nghttp2ConnectTimeout.dpr not present"
+else
+  CTOUT="$OUT/connect-timeout"
+  mkdir -p "$CTOUT"
+  rm -f "$CTOUT"/*.ppu "$CTOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$CTOUT" -FE"$CTOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ConnectTimeout.dpr" > "$CTOUT/build.log" 2>&1 \
+     && [[ -x "$CTOUT/Nghttp2ConnectTimeout" ]]; then
+
+    if command -v timeout > /dev/null 2>&1; then
+      timeout 30 "$CTOUT/Nghttp2ConnectTimeout" < /dev/null | sed 's/^/  /'
+      CT_RC=${PIPESTATUS[0]}
+    else
+      echo "  note: timeout(1) unavailable - a hang will not be converted to a failure"
+      "$CTOUT/Nghttp2ConnectTimeout" < /dev/null | sed 's/^/  /'
+      CT_RC=${PIPESTATUS[0]}
+    fi
+
+    case "$CT_RC" in
+      0)   echo "  connect timeout: PASSED" ;;
+      3)   echo "  SKIP  libnghttp2 absent - ConnectTimeoutMS was NOT exercised" ;;
+      124) echo "  FAIL  the client HUNG - killed after 30s. That is the CL4"
+           echo "        regression: ConnectToHost is blocking despite ATimeoutMS > 0,"
+           echo "        or poll() is not returning from SocketWaitConnected."
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  connect timeout did not behave as specified"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ConnectTimeout.dpr did not compile"
+    grep -E "Error|Fatal" "$CTOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $CTOUT/build.log"
+    RC=2
+  fi
+fi
+
 # ── samples/grpc-server — compile only ───────────────────────────────────────
 # That sample is this library's claim that the gRPC layer needs no web
 # framework, and a claim nobody compiles is a claim nobody has checked. It is

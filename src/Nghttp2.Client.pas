@@ -163,6 +163,9 @@ type
     FTlsContext:  TTlsClientContext;
     // Per-connection TLS wrapper (allocated by Connect when FTlsContext<>nil).
     FTlsConn:     TTlsClientConnection;
+    // 0 = no timeout; OS TCP retry budget applies (~127 s Linux default).
+    // Set before Connect; applies to every (re)connect including auto-reconnect.
+    FConnectTimeoutMS: Integer;
 
     { MULTISTREAM-1 — per-stream state, indexed by nghttp2 stream id.
 
@@ -312,6 +315,11 @@ type
     // but it is no longer necessary, and doing it while another thread is
     // connecting on the same context is not safe (FIX-ALPN-RACE-1).
     property TlsContext: TTlsClientContext  read FTlsContext write FTlsContext;
+    // TCP connect timeout in milliseconds. 0 (default) = no timeout; the OS
+    // TCP retry budget applies (~127 s on Linux, varies on Windows/macOS).
+    // Set before Connect; applies to every reconnect, including auto-reconnect.
+    property ConnectTimeoutMS: Integer read FConnectTimeoutMS
+                                       write FConnectTimeoutMS;
   end;
 
   // Convenience — one-shot request without holding a TNghttp2Client. Opens,
@@ -608,7 +616,7 @@ begin
   FPort := APort;
 
   // TCP connect (cross-platform, from Nghttp2.Socket).
-  FSocket := ConnectToHost(AHost, APort);
+  FSocket := ConnectToHost(AHost, APort, FConnectTimeoutMS);
 
   // ── TLS handshake (optional) ────────────────────────────────────────────
   // If the caller assigned a TTlsClientContext before calling Connect, wrap

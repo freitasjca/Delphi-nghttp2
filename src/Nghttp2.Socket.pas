@@ -126,7 +126,8 @@ function AcceptConnection6(ALSock: TSocketHandle; out APeerAddr: string): TSocke
 // Raises ENghttp2Socket on resolve, socket or connect failure — the message
 // always names the host. On success returns a connected socket that the caller
 // owns and must eventually CloseSocketHandle.
-function ConnectToHost(const AHost: string; APort: Word): TSocketHandle;
+function ConnectToHost(const AHost: string; APort: Word;
+  ATimeoutMS: Integer = 0): TSocketHandle;
 
 // Waits up to ATimeoutMS for the socket to become readable.
 //   >0 = readable (recv will not block)
@@ -140,6 +141,12 @@ function SocketWaitReadable(ASock: TSocketHandle; ATimeoutMS: Integer): Integer;
 // Same contract, for writability. Needed once a send can come up short: the
 // caller must park until the kernel drains its send buffer rather than spin.
 function SocketWaitWritable(ASock: TSocketHandle; ATimeoutMS: Integer): Integer;
+
+// Used by ConnectToHost when ATimeoutMS > 0. After a non-blocking connect()
+// returns EINPROGRESS (POSIX) or WSAEWOULDBLOCK (Windows), waits up to
+// ATimeoutMS for the socket to become writable and confirms SO_ERROR = 0.
+// Returns True on successful connect; False on timeout or connection error.
+function SocketWaitConnected(ASock: TSocketHandle; ATimeoutMS: Integer): Boolean;
 
 { Disable Nagle's algorithm on a connected socket. False on failure.
 
@@ -774,7 +781,8 @@ function ng_gai_strerror(ACode: Integer): PAnsiChar; cdecl;
 // that entry fails while the IPv4 one behind it works. Taking only the first
 // address is the classic cause of "works in curl, fails in my program".
 
-function ConnectToHost(const AHost: string; APort: Word): TSocketHandle;
+function ConnectToHost(const AHost: string; APort: Word;
+  ATimeoutMS: Integer = 0): TSocketHandle;
 {$IF DEFINED(FPC) AND DEFINED(UNIX)}
 var
   LHints:     TNgAddrInfo;
@@ -782,6 +790,7 @@ var
   LHostAnsi, LPortAnsi: AnsiString;
   LRc:        Integer;
   LSock:      LongInt;
+  LConnected: Boolean;
 begin
   { Same shape as the Delphi branches: ask for AF_UNSPEC and walk the whole
     list, because a dual-stack host commonly returns IPv6 first and that entry
@@ -812,7 +821,17 @@ begin
       LSock := fpSocket(LCur^.ai_family, LCur^.ai_socktype, LCur^.ai_protocol);
       if LSock >= 0 then
       begin
-        if fpConnect(LSock, LCur^.ai_addr, LCur^.ai_addrlen) >= 0 then
+        if ATimeoutMS > 0 then
+        begin
+          SetSocketNonBlocking(LSock, True);
+          LConnected := (fpConnect(LSock, LCur^.ai_addr, LCur^.ai_addrlen) >= 0) or
+                        ((SocketError = ESysEINPROGRESS) and
+                         SocketWaitConnected(LSock, ATimeoutMS));
+          SetSocketNonBlocking(LSock, False);
+        end
+        else
+          LConnected := fpConnect(LSock, LCur^.ai_addr, LCur^.ai_addrlen) >= 0;
+        if LConnected then
         begin
           Result := LSock;
           Break;
@@ -840,6 +859,7 @@ var
   LAddr: TInetSockAddr;
   LHostAnsi: AnsiString;
   LNetAddr: in_addr;
+  LConnected: Boolean;
 begin
   { [CL1] FPC on Windows resolves nothing: netdb is Unix-only (its
     implementation uses BaseUnix unconditionally) and FPC's winsock2 unit
@@ -865,7 +885,17 @@ begin
   LAddr.sin_port        := htons(APort);
   LAddr.sin_addr.s_addr := LNetAddr.s_addr;
 
-  if fpConnect(LSock, psockaddr(@LAddr), SizeOf(LAddr)) < 0 then
+  if ATimeoutMS > 0 then
+  begin
+    SetSocketNonBlocking(LSock, True);
+    LConnected := (fpConnect(LSock, psockaddr(@LAddr), SizeOf(LAddr)) >= 0) or
+                  ((SocketError = WSAEWOULDBLOCK) and
+                   SocketWaitConnected(LSock, ATimeoutMS));
+    SetSocketNonBlocking(LSock, False);
+  end
+  else
+    LConnected := fpConnect(LSock, psockaddr(@LAddr), SizeOf(LAddr)) >= 0;
+  if not LConnected then
   begin
     CloseSocket(LSock);
     raise ENghttp2Socket.CreateFmt('fpConnect(%s:%d) failed', [AHost, APort]);
@@ -883,6 +913,7 @@ var
   LSock:     TSocket;
   LRc:       Integer;
   LWsaErr:   Integer;
+  LConnected: Boolean;
 begin
   InitSockets;
 
@@ -912,16 +943,37 @@ begin
         LWsaErr := WSAGetLastError
       else
       begin
-        if Winapi.WinSock2.connect(LSock, LCur^.ai_addr^,
-             Integer(LCur^.ai_addrlen)) <> SOCKET_ERROR then
+        if ATimeoutMS > 0 then
+        begin
+          SetSocketNonBlocking(LSock, True);
+          LWsaErr := 0;
+          if Winapi.WinSock2.connect(LSock, LCur^.ai_addr^,
+               Integer(LCur^.ai_addrlen)) <> SOCKET_ERROR then
+            LConnected := True
+          else
+          begin
+            // Capture WSA error BEFORE any other socket call clears it.
+            LWsaErr := WSAGetLastError;
+            LConnected := (LWsaErr = WSAEWOULDBLOCK) and
+                          SocketWaitConnected(LSock, ATimeoutMS);
+          end;
+          SetSocketNonBlocking(LSock, False);
+        end
+        else
+        begin
+          // Capture WSA error BEFORE closesocket — closesocket clears the last
+          // WSA error, leaving diagnostic messages like "WSA=0" that hide the
+          // real failure code (typically 10061 ECONNREFUSED or 10060 ETIMEDOUT).
+          LConnected := Winapi.WinSock2.connect(LSock, LCur^.ai_addr^,
+                          Integer(LCur^.ai_addrlen)) <> SOCKET_ERROR;
+          if not LConnected then
+            LWsaErr := WSAGetLastError;
+        end;
+        if LConnected then
         begin
           Result := LSock;
           Break;
         end;
-        // Capture WSA error BEFORE closesocket — closesocket clears the last
-        // WSA error, leaving diagnostic messages like "WSA=0" that hide the
-        // real failure code (typically 10061 ECONNREFUSED or 10060 ETIMEDOUT).
-        LWsaErr := WSAGetLastError;
         closesocket(LSock);
       end;
       LCur := LCur^.ai_next;
@@ -947,6 +999,7 @@ var
   LSock:     Integer;
   LRc:       Integer;
   LErr:      Integer;
+  LConnected: Boolean;
 begin
   { NOTE: Posix.NetDB's declarations could not be checked in the dev container
     (this Delphi install ships Windows RTL sources only). The logic is the same
@@ -978,12 +1031,30 @@ begin
         LErr := errno
       else
       begin
-        if connect(LSock, LCur^.ai_addr^, LCur^.ai_addrlen) >= 0 then
+        if ATimeoutMS > 0 then
+        begin
+          SetSocketNonBlocking(LSock, True);
+          if connect(LSock, LCur^.ai_addr^, LCur^.ai_addrlen) >= 0 then
+            LConnected := True
+          else
+          begin
+            LErr := errno;
+            LConnected := (LErr = EINPROGRESS) and
+                          SocketWaitConnected(LSock, ATimeoutMS);
+          end;
+          SetSocketNonBlocking(LSock, False);
+        end
+        else
+        begin
+          LConnected := connect(LSock, LCur^.ai_addr^, LCur^.ai_addrlen) >= 0;
+          if not LConnected then
+            LErr := errno;
+        end;
+        if LConnected then
         begin
           Result := LSock;
           Break;
         end;
-        LErr := errno;
         __close(LSock);
       end;
       LCur := LCur^.ai_next;
@@ -1095,6 +1166,62 @@ function SocketWaitWritable(ASock: TSocketHandle; ATimeoutMS: Integer): Integer;
 begin
   Result := SocketWaitImpl(ASock, True, ATimeoutMS);
 end;
+
+function SocketWaitConnected(ASock: TSocketHandle; ATimeoutMS: Integer): Boolean;
+{$IF DEFINED(FPC) AND DEFINED(UNIX)}
+var
+  LConnErr: LongInt;
+  LSz:      TSockLen;
+begin
+  if SocketWaitWritable(ASock, ATimeoutMS) <= 0 then
+    Exit(False);
+  LConnErr := 0;
+  LSz := SizeOf(LConnErr);
+  // fpGetSockOpt clears SO_ERROR upon reading — a subsequent call returns 0.
+  Result := (fpGetSockOpt(ASock, SOL_SOCKET, SO_ERROR, @LConnErr, @LSz) = 0)
+            and (LConnErr = 0);
+end;
+{$ELSEIF DEFINED(FPC)}
+{ FPC on Windows — WinSock2.getsockopt takes optlen as var cint }
+var
+  LConnErr: LongInt;
+  LSz:      cint;
+begin
+  if SocketWaitWritable(ASock, ATimeoutMS) <= 0 then
+    Exit(False);
+  LConnErr := 0;
+  LSz := SizeOf(LConnErr);
+  Result := (WinSock2.getsockopt(ASock, SOL_SOCKET, SO_ERROR,
+               PChar(@LConnErr), LSz) <> SOCKET_ERROR)
+            and (LConnErr = 0);
+end;
+{$ELSEIF DEFINED(MSWINDOWS)}
+var
+  LConnErr: Integer;
+  LSz:      Integer;
+begin
+  if SocketWaitWritable(ASock, ATimeoutMS) <= 0 then
+    Exit(False);
+  LConnErr := 0;
+  LSz := SizeOf(LConnErr);
+  Result := (Winapi.WinSock2.getsockopt(ASock, SOL_SOCKET, SO_ERROR,
+               PAnsiChar(@LConnErr), LSz) <> SOCKET_ERROR)
+            and (LConnErr = 0);
+end;
+{$ELSE}
+{ Delphi POSIX — getsockopt takes untyped var for optval and var socklen_t for optlen }
+var
+  LConnErr: Integer;
+  LSz:      socklen_t;
+begin
+  if SocketWaitWritable(ASock, ATimeoutMS) <= 0 then
+    Exit(False);
+  LConnErr := 0;
+  LSz := SizeOf(LConnErr);
+  Result := (getsockopt(ASock, SOL_SOCKET, SO_ERROR, LConnErr, LSz) >= 0)
+            and (LConnErr = 0);
+end;
+{$IFEND}
 
 // ─── SetSocketNonBlocking / SocketLastErrorIsWouldBlock ──────────────────
 
