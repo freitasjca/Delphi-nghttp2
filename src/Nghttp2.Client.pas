@@ -50,6 +50,11 @@ unit Nghttp2.Client;
 //      content decompression, no retries.
 //    - One connection per instance, NOT thread-safe, with no pooling or reuse
 //      across hosts.
+//    - [CL4] Connection reuse: a second Connect to the same host+port reuses
+//      the live session. Calling Connect to a different endpoint disconnects
+//      first. After GOAWAY, BeginRequest reconnects automatically when no
+//      streams are in flight; call Reconnect explicitly to force a new session.
+//      Ping sends an HTTP/2 PING and awaits the ACK — useful for keepalive.
 //    - Cross-platform: reuses Nghttp2.Socket for all platform I/O — no
 //      Winapi.WinSock2 / Posix.* / FPC Sockets references in this unit.
 //
@@ -148,8 +153,10 @@ type
     FCallbacks:   Pnghttp2_session_callbacks;
     FHost:        string;
     FPort:        Word;
-    FConnected:   Boolean;
-    FRecvBuffer:  TBytes;
+    FConnected:      Boolean;
+    FGoAwayReceived: Boolean;   { [CL4] server sent GOAWAY; reconnect before next request }
+    FPingPending:    Boolean;   { [CL4] PING sent, awaiting ACK from server }
+    FRecvBuffer:     TBytes;
     // Optional TLS. Non-owning reference — the caller allocates + configures
     // the TTlsClientContext (SetInsecure, EnableHttp2Alpn) and frees it after
     // this client is done. nil = plain h2c on the socket.
@@ -249,6 +256,19 @@ type
     function  TakeResponse(AStreamId: Int32): TNghttp2Response;
     function  PendingStreams: Integer;
 
+    { [CL4] Reconnects to the same host and port as the most recent Connect call.
+      If still connected, Disconnects first. Resets GOAWAY state so the new
+      session is clean. Raises if Connect was never called. }
+    procedure Reconnect;
+
+    { [CL4] Sends an HTTP/2 PING frame and waits for the server's ACK.
+      Returns True when the ACK arrives within ATimeoutMS milliseconds.
+      Returns False if the deadline expires with no reply (connection suspect).
+      Raises ENghttp2Client if not connected, or if submit_ping fails.
+      PumpOnce exceptions propagate — a raised exception means the connection
+      died rather than merely being slow. }
+    function Ping(ATimeoutMS: Integer = 5000): Boolean;
+
     { [CL3] Read the next piece of a streaming response.
 
         > 0   bytes copied into ABuffer (which is sized to exactly that many)
@@ -271,9 +291,12 @@ type
       ACount: Integer;
       ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS): Integer;
 
-    property Connected:  Boolean            read FConnected;
-    property Host:       string             read FHost;
-    property Port:       Word               read FPort;
+    property Connected:       Boolean            read FConnected;
+    property Host:            string             read FHost;
+    property Port:            Word               read FPort;
+    { [CL4] True after the server sends GOAWAY on this session. Reset to False
+      by Disconnect, Reconnect, and auto-reconnect inside BeginRequest. }
+    property GoAwayReceived:  Boolean            read FGoAwayReceived;
     // Optional TLS. Assign BEFORE calling Connect. Non-owning: caller
     // creates + configures + frees the TTlsClientContext. Leave nil for
     // cleartext h2c. See Delphi-nghttp2/samples for a full example.
@@ -400,6 +423,9 @@ function OnStreamCloseCb(
   stream_id: Int32;
   error_code: UInt32;
   user_data: Pointer): Integer; cdecl;
+const
+  { RFC 7540 §7 protocol-level error codes (distinct from NGHTTP2_ERR_* library codes). }
+  HTTP2_REFUSED_STREAM = 7;
 var
   LClient: TNghttp2Client;
   LIdx:    Integer;
@@ -411,12 +437,50 @@ begin
 
   LClient.FStreams[LIdx].Done := True;
   if error_code <> NGHTTP2_NO_ERROR then
-    LClient.FStreams[LIdx].Error := Format(
-      'stream %d closed with nghttp2 error code %d - received status=%d, %d header(s), %d body byte(s) before close',
-      [stream_id, error_code,
-       LClient.FStreams[LIdx].Response.Status,
-       Length(LClient.FStreams[LIdx].Response.Headers),
-       Length(LClient.FStreams[LIdx].Response.Body)]);
+  begin
+    { [CL4] REFUSED_STREAM means the server's GOAWAY last_stream_id was below
+      this stream_id — the stream was never processed and is safe to retry on
+      a fresh connection. Give a targeted message instead of the generic one. }
+    if error_code = HTTP2_REFUSED_STREAM then
+      LClient.FStreams[LIdx].Error := Format(
+        'stream %d was refused (REFUSED_STREAM / error 7): the server sent GOAWAY '
+        + 'before processing this stream — retry on a new connection (Reconnect)',
+        [stream_id])
+    else
+      LClient.FStreams[LIdx].Error := Format(
+        'stream %d closed with nghttp2 error code %d - received status=%d, '
+        + '%d header(s), %d body byte(s) before close',
+        [stream_id, error_code,
+         LClient.FStreams[LIdx].Response.Status,
+         Length(LClient.FStreams[LIdx].Response.Headers),
+         Length(LClient.FStreams[LIdx].Response.Body)]);
+  end;
+  Result := 0;
+end;
+
+{ [CL4] Receives connection-level frames. Two cases matter here:
+    GOAWAY  — the server will not accept new streams on this session. Set the
+              flag so BeginRequest can reconnect transparently.
+    PING+ACK — we sent a PING and this is the echo. Clear FPingPending so
+              Ping() knows the connection is alive.
+  All other frame types are silently ignored; libnghttp2 handles their
+  protocol semantics (SETTINGS, WINDOW_UPDATE, etc.) internally. }
+function OnFrameRecvCb(
+  session: Pnghttp2_session;
+  const frame: Pnghttp2_frame;
+  user_data: Pointer): Integer; cdecl;
+var
+  LClient: TNghttp2Client;
+begin
+  LClient := TNghttp2Client(user_data);
+  if LClient = nil then Exit(0);
+  case frame^.hd.ftype of
+    NGHTTP2_GOAWAY:
+      LClient.FGoAwayReceived := True;
+    NGHTTP2_PING:
+      if (frame^.hd.flags and NGHTTP2_FLAG_ACK) <> 0 then
+        LClient.FPingPending := False;
+  end;
   Result := 0;
 end;
 
@@ -495,10 +559,12 @@ begin
   FSocket := INVALID_SOCKET_HANDLE;
   FSession        := nil;
   FCallbacks      := nil;
-  FConnected      := False;
+  FConnected       := False;
+  FGoAwayReceived  := False;   { [CL4] }
+  FPingPending     := False;   { [CL4] }
   SetLength(FStreams, 0);   { MULTISTREAM-1 }
-  FTlsContext     := nil;   // caller opts in via TlsContext property
-  FTlsConn        := nil;
+  FTlsContext      := nil;   // caller opts in via TlsContext property
+  FTlsConn         := nil;
 
   LRet := nghttp2_session_callbacks_new(FCallbacks);
   if LRet <> 0 then
@@ -507,13 +573,8 @@ begin
   nghttp2_session_callbacks_set_on_header_callback(FCallbacks, @OnHeaderCb);
   nghttp2_session_callbacks_set_on_data_chunk_recv_callback(FCallbacks, @OnDataChunkRecvCb);
   nghttp2_session_callbacks_set_on_stream_close_callback(FCallbacks, @OnStreamCloseCb);
-
-  // NOTE: on_frame_recv_callback + on_frame_send_callback are intentionally
-  // NOT registered. libnghttp2 handles the SETTINGS/PING/GOAWAY exchanges
-  // internally, and app-level visibility isn't needed for the request/
-  // response flow. If you need wire-level tracing (e.g. investigating a
-  // protocol bug), register those callbacks in a wrapper unit — the FFI
-  // slots and Tnghttp2_* callback types remain declared in Nghttp2.Native.
+  { [CL4] Needed for GOAWAY detection and PING ACK processing. }
+  nghttp2_session_callbacks_set_on_frame_recv_callback(FCallbacks, @OnFrameRecvCb);
 end;
 
 destructor TNghttp2Client.Destroy;
@@ -531,8 +592,17 @@ var
 begin
   // NghttpLoad already fired in Create — see comment there.
 
+  { [CL4] Same endpoint, no GOAWAY: the session is alive and usable. Treat a
+    second Connect call as "ensure connected to X" — reuse silently rather than
+    tearing down a session that may have streams in flight. }
+  if FConnected and not FGoAwayReceived
+     and SameText(FHost, AHost) and (FPort = APort) then
+    Exit;
+
+  { [CL4] Different endpoint, or a GOAWAY was received — tear down the old
+    session first, then open a fresh one below. }
   if FConnected then
-    raise ENghttp2Client.Create('already connected - call Disconnect first');
+    Disconnect;
 
   FHost := AHost;
   FPort := APort;
@@ -700,7 +770,9 @@ begin
     CloseSocketHandle(FSocket);
     FSocket := INVALID_SOCKET_HANDLE;
   end;
-  FConnected := False;
+  FConnected      := False;
+  FGoAwayReceived := False;   { [CL4] fresh slate for the next Connect }
+  FPingPending    := False;   { [CL4] }
 end;
 
 { [CL2c] Reads with a deadline.
@@ -892,6 +964,21 @@ var
   LProvider:    Tnghttp2_data_provider;
   LProviderPtr: Pnghttp2_data_provider;
 begin
+  { [CL4] Transparent post-GOAWAY reconnect. When the server sent GOAWAY and all
+    prior streams have closed, the session cannot accept new streams but the
+    endpoint is known — reconnect automatically so the caller does not have to
+    manage the connection lifecycle explicitly. If streams are still in flight,
+    reconnecting NOW would lose their results; raise so the caller can drain them
+    with PumpAll/TakeResponse first, then submit new requests. }
+  if FGoAwayReceived then
+  begin
+    if AnyPending then
+      raise ENghttp2Client.Create(
+        'server sent GOAWAY with streams still in flight - call PumpAll then '
+        + 'TakeResponse for all open streams before submitting new requests');
+    Reconnect;
+  end;
+
   if not FConnected then
     raise ENghttp2Client.Create('not connected - call Connect first');
 
@@ -1161,6 +1248,54 @@ begin
 
   if LErr <> '' then
     raise ENghttp2Client.Create(LErr);
+end;
+
+{ [CL4] Explicit reconnect. Disconnects if still connected, clears GOAWAY state,
+  then calls Connect with the same host and port. Raises if Connect was never
+  called (FHost is empty). After Reconnect, FGoAwayReceived is False and the
+  new session is ready for requests. }
+procedure TNghttp2Client.Reconnect;
+begin
+  if FHost = '' then
+    raise ENghttp2Client.Create('Reconnect: Connect was never called');
+  if FConnected then
+    Disconnect;   // also resets FGoAwayReceived + FPingPending
+  FGoAwayReceived := False;   // Disconnect already cleared it; set once more for clarity
+  Connect(FHost, FPort);
+end;
+
+{ [CL4] Sends an HTTP/2 PING and waits up to ATimeoutMS milliseconds for the
+  server's ACK. The ACK is detected inside OnFrameRecvCb (which fires during
+  PumpOnce), clearing FPingPending. If the deadline passes with FPingPending
+  still True the connection has not replied — the caller should consider it
+  suspect and call Reconnect. }
+function TNghttp2Client.Ping(ATimeoutMS: Integer): Boolean;
+var
+  LStart:     TDateTime;
+  LRet:       Integer;
+  LRemaining: Int64;
+  LSlice:     Integer;
+begin
+  if not FConnected then
+    raise ENghttp2Client.Create('Ping: not connected');
+
+  FPingPending := True;
+  LRet := nghttp2_submit_ping(FSession, NGHTTP2_FLAG_NONE, nil);
+  if LRet < 0 then
+    raise ENghttp2Client.CreateFmt('nghttp2_submit_ping: %d', [LRet]);
+  FlushSession;   // put the PING on the wire immediately
+
+  LStart := Now;
+  while FPingPending do
+  begin
+    LRemaining := ATimeoutMS - MilliSecondsSince(LStart);
+    if LRemaining <= 0 then Break;
+    LSlice := Integer(LRemaining);
+    if LSlice > 100 then LSlice := 100;   // 100 ms slices; check deadline each time
+    if PumpOnce(LSlice) < 0 then Break;   // session dead (want_read = 0)
+  end;
+
+  Result := not FPingPending;
 end;
 
 { The original one-shot API, now expressed in the three-call form. Behaviour is
