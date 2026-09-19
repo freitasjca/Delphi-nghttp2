@@ -83,19 +83,17 @@ on the wire.
 
 Being explicit, since the table above may read as if it handles everything:
 
-- `sint*`, `fixed*`, `sfixed*` — the wire layer implements them, but
-  `TProtoMemberAttribute` carries only a tag, so no wire form can be requested
 - `google.protobuf.Api` and `DescriptorProto` — protobuf's own reflection
   machinery, describing `.proto` files rather than carrying user data
 - proto2 in any form
 
-`oneof`, `optional`, `map`, and the `Struct` family and `Any` were on this list
-until PRESENCE-1 / ONEOF-1 / MAP-1 / STRUCT-1 / ANY-1.
+`oneof`, `optional`, `map`, the `Struct` family and `Any`, and the Group-B
+scalars (`sint*`, `fixed*`, `sfixed*`) were on this list until PRESENCE-1 /
+ONEOF-1 / MAP-1 / STRUCT-1 / ANY-1 / WIRE-FORM-1.
 
 Against 7301 real googleapis schemas it **parses and emits 7287**, refuses the
-remaining 14 by name, and has never accepted a schema `protoc` rejects. Those 14
-are 7 wanting `sint*`/`fixed*`,
-6 wanting `Api`/`DescriptorProto`, and one enum declaring both `minimal` and
+remaining 7 by name, and has never accepted a schema `protoc` rejects. Those 7
+are 6 wanting `Api`/`DescriptorProto` and one enum declaring both `minimal` and
 `MINIMAL` — legal proto3, impossible in case-insensitive Pascal.
 
 Worth knowing how that number is produced, because it was wrong before

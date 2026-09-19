@@ -55,10 +55,12 @@ ACCEPT  service.proto  (3 message(s), 0 enum(s), 1 service(s))
 or
 
 ```
-REFUSE  service.proto  [sint32]  (12:3) sint32 is not supported. The wire
-layer implements zigzag, but TProtoMemberAttribute carries only a tag, so a
-property has no way to request a wire form. Use int32 - you lose the
-encoding-size optimisation, not correctness.
+REFUSE  service.proto  [google.protobuf.Api]  (12:3) Field 'api' refers to a
+well-known type that is not bundled. Api, Type and DescriptorProto are
+protobuf's own reflection machinery - they describe .proto files rather than
+carrying user data, and a program that needs them wants a descriptor library.
+Everything else IS supported: Timestamp, Duration, FieldMask, Empty, the
+scalar wrappers, Struct, Value, ListValue, NullValue and Any.
 ```
 
 Exit codes: **0** accepted · **1** refused · **2** internal error or bad usage.
@@ -139,18 +141,6 @@ deliberate: a parser that simply did not know the word `sint32` would report
 *"unknown type"*, which names the wrong problem and sends you hunting for a
 typo in your own schema.
 
-**Structural — the wire layer has these, the attribute cannot ask for them**
-
-`sint32` `sint64` `fixed32` `fixed64` `sfixed32` `sfixed64`
-
-`TProtoWriter` implements every one of these encodings. The gap is that
-`TProtoMemberAttribute` carries only a **tag**, so a property has no way to
-request a wire form. Lifting this means an attribute overload — a real change,
-but an additive one.
-
-*Workaround:* use `int32`/`int64`/`uint32`/`uint64`. You lose the encoding-size
-optimisation, not correctness.
-
 **Out of scope**
 
 proto2 syntax, `required`, `group`, `extend`/`extensions`.
@@ -182,6 +172,7 @@ silently deleted, so a reader working from an older copy sees that the answer
 | `import` of another `.proto` | IMPORT-1 | Imports are resolved against `-I` roots, the closure is loaded, and one unit is emitted per file. A cross-file type is named **fully qualified** (`My.Google.Rpc.Status.Messages.TStatus`) because short names collide constantly across packages and a bare name binds to whichever unit is last in the uses clause. |
 | a well-known type as an **rpc parameter** | SVCWKT-1 | The service emitters called `PascalTypeName` directly, so `rpc F(google.protobuf.Empty)` emitted `TGoogleProtobufEmpty` — a type nothing declares. All four emitters now share one resolver. |
 | two enums sharing a **value name** | ENUMCOLLIDE-1 | Pascal enum values share unit scope and proto's do not, so a colliding value is prefixed from its qualified name (`A.E.X` → `A_E_X`). Only the colliding ones; unique values keep their spelling. |
+| **Group-B scalars** — `sint32` `sint64` `fixed32` `fixed64` `sfixed32` `sfixed64` | WIRE-FORM-1 (1.20.0) | `TProtoMemberAttribute` gains a second constructor overload accepting `TProtoMemberWireForm`; protogen emits `[TProtoMember(N, pwfZigZag)]` for `sint*` and `[TProtoMember(N, pwfFixed)]` for the `fixed`/`sfixed` family. `TProtoWriter` always had the encodings; the gap was that the attribute could not request one. The 7 googleapis schemas refused for these types now compile. |
 
 **How the last three were found, because it says something about the numbers
 above.** `ProtogenCheck` used only the parser until 2026-09-07, so the corpus

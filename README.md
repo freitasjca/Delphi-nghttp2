@@ -41,6 +41,10 @@ arrived here in **1.0.0**.
 | **A shared `TTlsClientContext` is safe across threads again** | **✓** (1.18.1, FIX-ALPN-RACE-1 — 1.18.0's `Connect` re-applied ALPN to the *context* on every connect, so two threads connecting on one shared context double-freed OpenSSL's protocol list: 4 aborts in 30 runs of the provider mTLS suite. Now written to the per-connection `SSL` via `SSL_set_alpn_protos`. Note the abort surfaced in *sequential* tests far from the concurrent one that caused it) |
 | **The FFI loaders are thread-safe** | **✓** (1.18.2, FIX-LOADRACE-1 — `NghttpLoad` and `NghttpsslLoad` were check-then-set on a global with no lock, so two threads could each run a full library load. The OpenSSL one was worse than no guard at all: its Boolean re-entry flag reported a spurious "could not be loaded" to the second thread instead of making it wait). Gated by `tests/Nghttp2LoaderRace.dpr` — 8 threads released together into the *first* load, 20 fresh processes; a *mixed* result is the race, all-fail means the library is simply absent |
 | **A no-overlap ALPN refusal explains itself** | **✓** (1.19.0, B5 — a peer that shares no ALPN protocol sends a fatal alert 120, and that used to surface as whatever raw text the local OpenSSL had for reason 1120: `reason(1120)` on 3.0.13, `tlsv1 alert no application protocol` on 3.6.0. The refusal is now matched on the reason **code**, so the diagnosis names ALPN, the host, the port and the alert identically on every version, with the raw text kept as evidence) |
+| **IPv6 listener (AF_INET6) + `poll()` in SocketWaitImpl** | **✓** (1.20.0 — `CreateListenerSocket6` / `AcceptConnection6` start a second accept thread on `::` with `IPV6_V6ONLY=1` so the IPv4 listener is not disturbed; returns `INVALID_SOCKET_HANDLE` + error string on IPv4-only hosts instead of raising. `SocketWaitImpl` replaces `select` with `fpPoll`/`poll` on FPC/UNIX and Delphi POSIX, removing the silent no-timeout fallback for fd ≥ 1024) |
+| **Bounded RSS on large streaming downloads — CL3b** | **✓** (1.20.0 — `PushStreamData` reset `FStreamBuf.Position` to 0 after every append, destroying the read cursor that `ReadResponseBodyCallback` uses; the buffer grew without bound and the worker deadlocked permanently under slow-client conditions. Gate: `tests/Nghttp2FloodRead.dpr` downloads 64 MB in 1024 × 64 KB `ReadChunk` calls with < 8 MB peak client RSS) |
+| **Connection reuse — `Reconnect`, `Ping`, GOAWAY (CL4)** | **✓** (1.20.0 — `Reconnect` opens a fresh session to the same host/port; `Ping(ATimeoutMS)` submits an HTTP/2 PING and pumps until ACK or timeout; `GoAwayReceived` property tracks server GOAWAY; a stream closed with `REFUSED_STREAM` (error 7) gets a targeted error message pointing to `Reconnect`) |
+| **Group-B scalar wire forms — WIRE-FORM-1** | **✓** (1.20.0 — `TProtoMemberWireForm` selects the wire encoding for sint32/sint64 (`pwfZigZag`) and fixed32/fixed64/sfixed32/sfixed64 (`pwfFixed`) via `[TProtoMember(N, pwfZigZag)]` / `[TProtoMember(N, pwfFixed)]`; protogen emits the correct attribute for all six types; the 7 googleapis schemas previously refused for Group-B scalars now compile) |
 | OpenSSL 3.x + 1.1.x FFI with auto-detect + `SetDllDirectory` for local libs | **✓** |
 | mTLS (client cert verification) | **✓** |
 | Password-protected private keys (`SSL_CTX_set_default_passwd_cb`) | **implemented, untested** — callback wired, no fixture uses an encrypted key |
@@ -50,7 +54,7 @@ arrived here in **1.0.0**.
 | **Event-loop I/O** — epoll (`Nghttp2.Engine.Epoll`) + IOCP (`Nghttp2.Engine.Iocp`) | **✓** (both engines' graceful shutdown validated under load 2026-08-22, 3/3 delivery shapes each) |
 | **gRPC layer** — protobuf codec, registry (procedural + `RegisterService<T>`), dispatcher, all four RPC shapes | **✓** (extracted from `horse-provider-nghttp2` 2026-08-23; the units never depended on Horse, only their names did) |
 | **`.proto` tooling** — parser, `ProtogenCheck` verdict CLI, `protoc` differential test (`tools/protogen`) | **✓** (26 cases, 0 disagreements `protoc` would call a defect, vs libprotoc 35.1). See [`doc/protogen.md`](doc/protogen.md) |
-| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **7,230 of 7,301** real googleapis schemas generate code that **compiles** — parsed, emitted, and accepted by the compiler, with **zero** emitter defects remaining (2026-09-11) |
+| **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **7,230 of 7,301** real googleapis schemas generate code that **compiles** — parsed, emitted, and accepted by the compiler, with **zero** emitter defects remaining (2026-09-11, pre-WIRE-FORM-1; re-run `compile-check.sh --all` after 1.20.0 for the updated figure) |
 | **`import` closure** — `protogen` follows imports and emits one unit per file | **✓** (IMPORT-1, 1.16.0 — path-derived unit names, qualified cross-file references) |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
@@ -307,12 +311,16 @@ ProtogenCheck service.proto
 ```
 
 **What is refused**, measured against 7301 real googleapis schemas rather than
-guessed: **14 files**, and they are worth naming individually because there are
-so few. Seven want Group B scalars (`fixed64` ×5, `sint32`, `fixed32`), six want
-`google.protobuf.Api` or `DescriptorProto`, and one is an enum declaring both
-`minimal` and `MINIMAL` — legal proto3, where identifiers are case-sensitive,
-and impossible in Pascal, where they are not. That last one cannot be fixed by
-renaming: both values sit in the same enum, so any prefix lands on both.
+guessed: **7 files**, and they are worth naming individually because there are
+so few. Six want `google.protobuf.Api` or `DescriptorProto`, and one is an enum
+declaring both `minimal` and `MINIMAL` — legal proto3, where identifiers are
+case-sensitive, and impossible in Pascal, where they are not. That last one
+cannot be fixed by renaming: both values sit in the same enum, so any prefix
+lands on both.
+
+Group-B scalars (`sint32`, `sint64`, `fixed32`, `fixed64`, `sfixed32`,
+`sfixed64`) were refused before 1.20.0; since WIRE-FORM-1 they are supported
+via `[TProtoMember(N, pwfZigZag)]` / `[TProtoMember(N, pwfFixed)]`.
 
 Everything else — `map`, `oneof` (with message members), `optional`, the
 `Struct` family, `Any`, and the whole `import` closure — is supported, and a
@@ -324,7 +332,8 @@ now skips rather than rejecting outright.
 figure above is `7230 / 7301` schemas whose generated Pascal *compiles* — the
 strongest of the three measures, and the only one that says the generator
 works. **No schema is rejected because of Pascal we emitted**; the remaining 71
-are 21 deliberate refusals and 50 on which FPC itself crashes.
+are 14 deliberate refusals and 50 on which FPC itself crashes. (The 7,230
+figure predates WIRE-FORM-1; re-run `compile-check.sh --all` after 1.20.0.)
 
 **The 50 crashes are partly a property of the harness, and not in a direction
 that can be optimised away.** FPC dies on some generated units, and how many

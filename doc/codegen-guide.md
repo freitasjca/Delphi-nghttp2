@@ -312,24 +312,24 @@ for years here.
 
 ## Known limits
 
-`sint*`, `fixed*`, `sfixed*` and proto2 are refused at parse time, with a
-message naming the construct and explaining why — [`protogen.md`](protogen.md)
-has the full list and the reasoning. A refusal is the tool working: these would
-otherwise encode to bytes a peer decodes differently, with no error anywhere.
+proto2 is refused at parse time. [`protogen.md`](protogen.md) has the full
+current refusal list and the reasoning. A refusal is the tool working: without
+it the tool would accept a schema that encodes to bytes a peer decodes
+differently, with no error anywhere.
 
-`map`, `oneof` and `optional` **were** on that list and are now supported, as
-are the `Struct` family and `Any`. If you are reading an older copy of this
-guide, that is the paragraph that changed.
+`map`, `oneof` and `optional` **were** on the refusal list and are now
+supported, as are the `Struct` family and `Any`. If you are reading an older
+copy of this guide, that is the paragraph that changed.
 
-Three more came off it on 2026-09-07, and they are the ones most likely to
-affect a real schema: a **message member inside a `oneof`** (the common shape of
-a oneof, and 19% of the googleapis corpus on its own), **`optional` on a message
-field** (a no-op label in proto3), and **two enums sharing a value name**, which
-is now resolved by prefixing rather than refused. `protogen` parses and emits
-7287 of 7301 real googleapis schemas; the 14 it turns away are Group B scalars
-(7), the `Api`/`DescriptorProto` reflection types (6), and one enum that
-declares both `minimal` and `MINIMAL` — legal proto3, impossible in
-case-insensitive Pascal.
+Three more came off it on 2026-09-07: a **message member inside a `oneof`**,
+**`optional` on a message field** (a no-op label in proto3), and **two enums
+sharing a value name**, which is now resolved by prefixing rather than refused.
+`sint*`, `fixed*`, `sfixed*` came off it in 1.20.0 (WIRE-FORM-1) — the wire
+layer always had these encodings; the attribute now has a second constructor
+overload that selects them. `protogen` parses and emits 7287 of 7301 real
+googleapis schemas; the 7 it now turns away are the `Api`/`DescriptorProto`
+reflection types (6) and one enum declaring both `minimal` and `MINIMAL` —
+legal proto3, impossible in case-insensitive Pascal.
 
 Two further points that are easy to miss:
 
