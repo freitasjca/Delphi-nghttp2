@@ -428,10 +428,9 @@ begin
 end;
 
 procedure TestScalarType;
-var
-  LRaised: Boolean;
 begin
   Section('PascalScalarType');
+  // Group A — unchanged
   Check('psInt32  -> Integer', TMessagesEmitter.PascalScalarType(psInt32)  = 'Integer');
   Check('psInt64  -> Int64',   TMessagesEmitter.PascalScalarType(psInt64)  = 'Int64');
   Check('psUInt32 -> UInt32',  TMessagesEmitter.PascalScalarType(psUInt32) = 'UInt32');
@@ -441,23 +440,13 @@ begin
   Check('psFloat  -> Single',  TMessagesEmitter.PascalScalarType(psFloat)  = 'Single');
   Check('psDouble -> Double',  TMessagesEmitter.PascalScalarType(psDouble) = 'Double');
   Check('psBytes  -> TBytes',  TMessagesEmitter.PascalScalarType(psBytes)  = 'TBytes');
-
-  // Group B — structural gap; must raise, not silently emit a wrong type
-  LRaised := False;
-  try
-    TMessagesEmitter.PascalScalarType(psSInt32);
-  except
-    on EEmitError do LRaised := True;
-  end;
-  Check('psSInt32 raises EEmitError', LRaised);
-
-  LRaised := False;
-  try
-    TMessagesEmitter.PascalScalarType(psFixed64);
-  except
-    on EEmitError do LRaised := True;
-  end;
-  Check('psFixed64 raises EEmitError', LRaised);
+  // Group B — WIRE-FORM-1: all six now emit their Pascal property type
+  Check('psSInt32  -> Integer', TMessagesEmitter.PascalScalarType(psSInt32)  = 'Integer');
+  Check('psSInt64  -> Int64',   TMessagesEmitter.PascalScalarType(psSInt64)  = 'Int64');
+  Check('psFixed32 -> UInt32',  TMessagesEmitter.PascalScalarType(psFixed32) = 'UInt32');
+  Check('psFixed64 -> UInt64',  TMessagesEmitter.PascalScalarType(psFixed64) = 'UInt64');
+  Check('psSFixed32 -> Integer', TMessagesEmitter.PascalScalarType(psSFixed32) = 'Integer');
+  Check('psSFixed64 -> Int64',   TMessagesEmitter.PascalScalarType(psSFixed64) = 'Int64');
 end;
 
 procedure TestTypeName;
@@ -966,6 +955,44 @@ begin
     Has(LSrc, 'read Finner write Finner'));
 end;
 
+// ── WIRE-FORM-1: Group-B scalar annotation emission ─────────────────────────
+
+procedure TestEmitWireForm;
+const
+  CProto =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'message M {'#10 +
+    '  sint32   a = 1;'#10 +
+    '  sint64   b = 2;'#10 +
+    '  fixed32  c = 3;'#10 +
+    '  fixed64  d = 4;'#10 +
+    '  sfixed32 e = 5;'#10 +
+    '  sfixed64 f = 6;'#10 +
+    '}';
+var
+  LSrc: string;
+begin
+  WriteLn;
+  WriteLn('-- WIRE-FORM-1: Group-B scalar annotation emission');
+  LSrc := EmitSource(CProto);
+
+  // Property types
+  Check('sint32  -> Integer', Has(LSrc, 'property a: Integer'));
+  Check('sint64  -> Int64',   Has(LSrc, 'property b: Int64'));
+  Check('fixed32 -> UInt32',  Has(LSrc, 'property c: UInt32'));
+  Check('fixed64 -> UInt64',  Has(LSrc, 'property d: UInt64'));
+  Check('sfixed32 -> Integer', Has(LSrc, 'property e: Integer'));
+  Check('sfixed64 -> Int64',   Has(LSrc, 'property f: Int64'));
+
+  // Annotation wire-form args
+  Check('sint32  emits pwfZigZag on tag 1',  Has(LSrc, '[TProtoMember(1, pwfZigZag)]'));
+  Check('sint64  emits pwfZigZag on tag 2',  Has(LSrc, '[TProtoMember(2, pwfZigZag)]'));
+  Check('fixed32 emits pwfFixed on tag 3',   Has(LSrc, '[TProtoMember(3, pwfFixed)]'));
+  Check('fixed64 emits pwfFixed on tag 4',   Has(LSrc, '[TProtoMember(4, pwfFixed)]'));
+  Check('sfixed32 emits pwfFixed on tag 5',  Has(LSrc, '[TProtoMember(5, pwfFixed)]'));
+  Check('sfixed64 emits pwfFixed on tag 6',  Has(LSrc, '[TProtoMember(6, pwfFixed)]'));
+end;
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 begin
@@ -978,6 +1005,7 @@ begin
   TestEnumValueCollision;
   TestEmitOneofMessageMember;
   TestCompilerFoundDefects;
+  TestEmitWireForm;
   TestEmitEcho;
   TestEmitGreeter;
   WriteLn;

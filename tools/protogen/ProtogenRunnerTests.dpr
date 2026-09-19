@@ -132,9 +132,13 @@ const
     'message HelloReply   { string message = 1; }' +
     'service Greeter { rpc SayHello (HelloRequest) returns (HelloReply); }';
 
+  { BAD_PROTO must be refused by the parser even after WIRE-FORM-1 (which
+    accepted sint32/sint64/fixed32/fixed64/sfixed32/sfixed64).  The `required`
+    label is a proto2-only construct that the parser always refuses (section 06
+    of ProtogenParserTests pins this).  TProtogenRunner.Run must return 1. }
   BAD_PROTO =
     'syntax = "proto3"; package x;' +
-    'message M { sint32 v = 1; }';
+    'message M { required int32 v = 1; }';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

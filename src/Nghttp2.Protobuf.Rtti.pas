@@ -21,19 +21,16 @@ unit Nghttp2.Protobuf.Rtti;
 //    nested class        — pkSubmessage
 //    TArray<T>           — repeated, for any T above  (M1c.2)
 //
-//  NOT supported, and the reason is structural rather than an omission:
-//    sint32/sint64 (zigzag) and the fixed32/64/sfixed32/64 family. The wire
-//    layer implements all of them — TProtoWriter.WriteSInt32Field and friends
-//    exist — but TProtoMemberAttribute carries only a TAG, so a property has
-//    no way to ask for a wire form. Selecting them needs an attribute
-//    overload; see plans/horse-grpc-codegen.md section 6.1.
-//
 //  TBytes is proto3 `bytes` (a scalar), NOT `repeated uint8` — so TArray<Byte>
 //  is deliberately excluded from repeated handling. Changing that would
 //  re-frame every existing bytes field on the wire.
 //
-//  Still deferred:
-//    ZigZag (sint32/sint64), fixed/sfixed, unsigned (uint32/uint64), maps
+//  WIRE-FORM-1 (2026-09-18) added Group-B scalar support via TProtoMemberWireForm:
+//    sint32 / sint64  — [TProtoMember(N, pwfZigZag)] on Integer / Int64
+//    fixed32 / fixed64  — [TProtoMember(N, pwfFixed)] on UInt32 / UInt64
+//    sfixed32 / sfixed64 — [TProtoMember(N, pwfFixed)] on Integer / Int64
+//
+//  Still deferred: maps
 //
 //  ── Design decisions ─────────────────────────────────────────────────────
 //
@@ -90,10 +87,10 @@ type
   //   Nothing in the wire layer was missing: WriteUInt32Field /
   //   ReadVarintAsUInt32 and their 64-bit twins already existed in
   //   Nghttp2.Protobuf. Only this layer never selected them.
-  // Still deferred: ZigZag variants (SInt32/SInt64), fixed variants
-  //   (Fixed32/64/SFixed32/64), and maps. Those genuinely cannot be expressed —
-  //   TProtoMemberAttribute carries only a tag, so no wire form can be
-  //   requested. Adding them means an attribute overload.
+  // WIRE-FORM-1 (2026-09-18) added Group-B scalar kinds. Selected via
+  //   TProtoMemberWireForm on the [TProtoMember] attribute; the base Pascal
+  //   type (Integer vs UInt32 etc.) continues to determine the bit width and
+  //   the sign interpretation within the chosen wire form.
   TProtoFieldKind = (
     pkInt32,
     pkInt64,
@@ -105,7 +102,14 @@ type
     pkDouble,
     pkEnum,       // encoded as int32 varint on the wire
     pkBytes,      // TBytes property
-    pkSubmessage  // nested TObject class instance
+    pkSubmessage, // nested TObject class instance
+    // WIRE-FORM-1 — Group-B scalar kinds (require TProtoMemberWireForm)
+    pkSInt32,     // sint32  — ZigZag-encoded Int32 varint
+    pkSInt64,     // sint64  — ZigZag-encoded Int64 varint
+    pkFixed32,    // fixed32 — 4-byte little-endian UInt32
+    pkFixed64,    // fixed64 — 8-byte little-endian UInt64
+    pkSFixed32,   // sfixed32 — 4-byte little-endian Int32
+    pkSFixed64    // sfixed64 — 8-byte little-endian Int64
   );
 
   // ── Cached info about ONE annotated property ─────────────────────────────
@@ -172,7 +176,8 @@ type
       otherwise indistinguishable from one on the property itself. }
     class procedure InferScalarKind(ARttiType: TRttiType; const ADesc: string;
       out AKind: TProtoFieldKind; out ASubmessageClass: TClass);
-    class procedure InferProtoKind(AProp: TRttiProperty; var AField: TProtoFieldInfo);
+    class procedure InferProtoKind(AProp: TRttiProperty;
+      AWireForm: TProtoMemberWireForm; var AField: TProtoFieldInfo);
   public
     (* GetTypeInfo returns cached info for AClass, building it on first call.
        Raises EProtoRttiError if AClass has NO ProtoMember-annotated
@@ -421,6 +426,38 @@ begin
   end;
 end;
 
+{ WIRE-FORM-1 — Promotes AKind from the base kind (determined by Pascal type)
+  to the wire-form-specific kind selected by the [TProtoMember] attribute.
+  pwfDefault is a no-op and leaves AKind unchanged — backward-compatible. }
+procedure ApplyWireForm(AForm: TProtoMemberWireForm; const APropName: string;
+  var AKind: TProtoFieldKind);
+begin
+  case AForm of
+    pwfDefault: ;
+    pwfZigZag:
+      case AKind of
+        pkInt32: AKind := pkSInt32;
+        pkInt64: AKind := pkSInt64;
+      else
+        raise EProtoRttiError.CreateFmt(
+          'ProtoMember property "%s": pwfZigZag requires an Integer property '
+          + '(sint32) or an Int64 property (sint64).', [APropName]);
+      end;
+    pwfFixed:
+      case AKind of
+        pkUInt32: AKind := pkFixed32;
+        pkUInt64: AKind := pkFixed64;
+        pkInt32:  AKind := pkSFixed32;
+        pkInt64:  AKind := pkSFixed64;
+      else
+        raise EProtoRttiError.CreateFmt(
+          'ProtoMember property "%s": pwfFixed requires Integer (sfixed32), '
+          + 'UInt32 (fixed32), Int64 (sfixed64) or UInt64 (fixed64).',
+          [APropName]);
+      end;
+  end;
+end;
+
 { Peels one level of "repeated" off the property type, then defers to
   InferScalarKind for the element.
 
@@ -430,7 +467,7 @@ end;
   the alternative would silently re-frame every one of them and break the wire
   compatibility the 52/52 codec suite locks in. }
 class procedure TProtobufRtti.InferProtoKind(AProp: TRttiProperty;
-  var AField: TProtoFieldInfo);
+  AWireForm: TProtoMemberWireForm; var AField: TProtoFieldInfo);
 var
   LDynArrType: TRttiDynamicArrayType;
   LElemType:   TRttiType;
@@ -456,12 +493,14 @@ begin
       InferScalarKind(LElemType,
         Format('element type of property "%s"', [AProp.Name]),
         AField.Kind, AField.SubmessageClass);
+      ApplyWireForm(AWireForm, AProp.Name, AField.Kind);
       Exit;
     end;
   end;
 
   InferScalarKind(AProp.PropertyType, Format('property "%s"', [AProp.Name]),
     AField.Kind, AField.SubmessageClass);
+  ApplyWireForm(AWireForm, AProp.Name, AField.Kind);
 end;
 
 { Is this property a Pascal Boolean?
@@ -626,7 +665,7 @@ begin
       LField.Tag  := LMember.Tag;
       LField.Name := LProp.Name;
       LField.Prop := LProp;
-      InferProtoKind(LProp, LField);
+      InferProtoKind(LProp, LMember.WireForm, LField);
 
       LList.Add(LField);
     end;
@@ -718,9 +757,14 @@ begin
     pkBool:   Result := not AValue.AsBoolean;
     pkString: Result := AValue.AsString = '';
     pkBytes:  Result := Length(AValue.AsType<TBytes>) = 0;
-    pkFloat:  Result := AValue.AsType<Single> = 0;
-    pkDouble: Result := AValue.AsType<Double> = 0;
-    pkEnum:   Result := AValue.AsOrdinal = 0;
+    pkFloat:   Result := AValue.AsType<Single> = 0;
+    pkDouble:  Result := AValue.AsType<Double> = 0;
+    pkEnum:    Result := AValue.AsOrdinal = 0;
+    // WIRE-FORM-1 — Group-B scalars share the same default (0) as their base kinds
+    pkSInt32, pkSFixed32: Result := AValue.AsInteger = 0;
+    pkSInt64, pkSFixed64: Result := AValue.AsInt64 = 0;
+    pkFixed32:            Result := AValue.AsOrdinal = 0;
+    pkFixed64:            Result := AValue.AsType<UInt64> = 0;
   else
     { pkSubmessage and anything added later: NOT default, so it is emitted.
       Erring toward emitting keeps an unforeseen kind on the wire rather than
@@ -741,7 +785,9 @@ end;
 function IsPackableKind(AKind: TProtoFieldKind): Boolean;
 begin
   Result := AKind in [pkInt32, pkInt64, pkUInt32, pkUInt64,
-                      pkBool, pkEnum, pkFloat, pkDouble];
+                      pkBool, pkEnum, pkFloat, pkDouble,
+                      pkSInt32, pkSInt64,
+                      pkFixed32, pkFixed64, pkSFixed32, pkSFixed64];
 end;
 
 { One packed element, tagless, into AWriter. Mirrors the body of the matching
@@ -775,6 +821,29 @@ begin
       begin
         LDouble := AValue.AsType<Double>;
         Move(LDouble, LU64, 8);
+        AWriter.WriteFixed64(LU64);
+      end;
+    // WIRE-FORM-1 — Group-B scalar packed elements
+    pkSInt32: AWriter.WriteVarint(ZigZagEncode32(AValue.AsInteger));
+    pkSInt64: AWriter.WriteVarint(ZigZagEncode64(AValue.AsInt64));
+    pkFixed32:
+      begin
+        LU32 := UInt32(AValue.AsOrdinal);
+        AWriter.WriteFixed32(LU32);
+      end;
+    pkFixed64:
+      begin
+        LU64 := AValue.AsType<UInt64>;
+        AWriter.WriteFixed64(LU64);
+      end;
+    pkSFixed32:
+      begin
+        LU32 := UInt32(AValue.AsInteger);
+        AWriter.WriteFixed32(LU32);
+      end;
+    pkSFixed64:
+      begin
+        LU64 := UInt64(AValue.AsInt64);
         AWriter.WriteFixed64(LU64);
       end;
   else
@@ -901,7 +970,7 @@ begin
         pkFloat:   LWriter.WriteFloatField(LField.Tag, LValue.AsExtended);
         pkDouble:  LWriter.WriteDoubleField(LField.Tag, LValue.AsExtended);
         pkEnum:    LWriter.WriteEnumField(LField.Tag, LValue.AsOrdinal);
-        pkBytes:   LWriter.WriteBytesField(LField.Tag, LValue.AsType<TBytes>);
+        pkBytes:    LWriter.WriteBytesField(LField.Tag, LValue.AsType<TBytes>);
         pkSubmessage:
           begin
             // Nested message — recurse.  Nil submessage means "field absent"
@@ -911,6 +980,13 @@ begin
             LSubBytes := TProtoSerializer.Serialize(LSubObj);
             LWriter.WriteSubmessageField(LField.Tag, LSubBytes);
           end;
+        // WIRE-FORM-1 — Group-B scalars
+        pkSInt32:   LWriter.WriteSInt32Field(LField.Tag, LValue.AsInteger);
+        pkSInt64:   LWriter.WriteSInt64Field(LField.Tag, LValue.AsInt64);
+        pkFixed32:  LWriter.WriteFixed32Field(LField.Tag, UInt32(LValue.AsOrdinal));
+        pkFixed64:  LWriter.WriteFixed64Field(LField.Tag, LValue.AsType<UInt64>);
+        pkSFixed32: LWriter.WriteSFixed32Field(LField.Tag, LValue.AsInteger);
+        pkSFixed64: LWriter.WriteSFixed64Field(LField.Tag, LValue.AsInt64);
       else
         raise EProtoRttiError.CreateFmt(
           'Serialize: field "%s" (tag %d) - unhandled ProtoKind %d.',
@@ -957,6 +1033,13 @@ begin
           Make carries the declared class through. }
         TValue.Make(@LSubObj, AElemTypeInfo, Result);
       end;
+    // WIRE-FORM-1 — Group-B scalar element reads
+    pkSInt32:   Result := TValue.From<Integer>(AReader.ReadZigZag32);
+    pkSInt64:   Result := TValue.From<Int64>(AReader.ReadZigZag64);
+    pkFixed32:  Result := TValue.From<UInt32>(AReader.ReadFixed32);
+    pkFixed64:  Result := TValue.From<UInt64>(AReader.ReadFixed64);
+    pkSFixed32: Result := TValue.From<Integer>(Integer(AReader.ReadFixed32));
+    pkSFixed64: Result := TValue.From<Int64>(Int64(AReader.ReadFixed64));
   else
     raise EProtoRttiError.CreateFmt(
       'ReadScalarElement: unhandled kind %d.', [Ord(AKind)]);
@@ -1148,6 +1231,37 @@ begin
                   LField.Prop.SetValue(AObj, LSubObj);
                 end;
                 TProtoSerializer.Deserialize(LSubBytes, LSubObj);
+              end;
+            // WIRE-FORM-1 — Group-B scalar field reads
+            pkSInt32:
+              begin
+                LValue := TValue.From<Integer>(LReader.ReadZigZag32);
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkSInt64:
+              begin
+                LValue := TValue.From<Int64>(LReader.ReadZigZag64);
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkFixed32:
+              begin
+                LValue := TValue.From<UInt32>(LReader.ReadFixed32);
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkFixed64:
+              begin
+                LValue := TValue.From<UInt64>(LReader.ReadFixed64);
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkSFixed32:
+              begin
+                LValue := TValue.From<Integer>(Integer(LReader.ReadFixed32));
+                LField.Prop.SetValue(AObj, LValue);
+              end;
+            pkSFixed64:
+              begin
+                LValue := TValue.From<Int64>(Int64(LReader.ReadFixed64));
+                LField.Prop.SetValue(AObj, LValue);
               end;
           else
             raise EProtoRttiError.CreateFmt(

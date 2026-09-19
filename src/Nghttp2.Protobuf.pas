@@ -60,6 +60,19 @@ type
     pwFixed32  = 5    // fixed32, sfixed32, float
   );
 
+  // ── Wire-form selector for the RTTI codec (WIRE-FORM-1) ──────────────────
+  // Controls how the RTTI codec encodes/decodes a property whose proto3 type
+  // uses a non-default wire encoding.  The Pascal property type determines the
+  // bit width; this selects the encoding scheme within that width.
+  //
+  //   pwfDefault  varint — the existing default; omit for all Group-A fields
+  //   pwfZigZag   ZigZag varint — proto3 sint32/sint64
+  //               Use Integer (sint32) or Int64 (sint64) as the property type
+  //   pwfFixed    Fixed-width little-endian — proto3 fixed/sfixed family
+  //               UInt32/UInt64 property → unsigned (proto3 fixed32/fixed64)
+  //               Integer/Int64 property → signed  (proto3 sfixed32/sfixed64)
+  TProtoMemberWireForm = (pwfDefault, pwfZigZag, pwfFixed);
+
   // ── Attributes for message-class annotation (RTTI scanner uses these) ─────
   // The scanner itself is deferred to M1b — declaring the attributes now so
   // downstream code (Horse.Grpc.Rtti in M3) can be written against a stable
@@ -87,10 +100,17 @@ type
       [ProtoMember(2)] property name: string read Fname write Fname; }
   TProtoMemberAttribute = class(TCustomAttribute)
   private
-    FTag: Integer;
+    FTag:      Integer;
+    FWireForm: TProtoMemberWireForm;
   public
-    constructor Create(ATag: Integer);
-    property Tag: Integer read FTag;
+    { AWireForm selects the wire encoding for Group-B scalars (pwfZigZag for
+      sint32/sint64; pwfFixed for fixed32/fixed64/sfixed32/sfixed64).  Omit it
+      for all Group-A types — it defaults to pwfDefault, which is a no-op and
+      backward-compatible with existing [TProtoMember(N)] annotations. }
+    constructor Create(ATag: Integer;
+      AWireForm: TProtoMemberWireForm = pwfDefault);
+    property Tag:      Integer              read FTag;
+    property WireForm: TProtoMemberWireForm read FWireForm;
   end;
 
   { Marks a published Boolean as the has-bit for the proto field carrying the
@@ -297,13 +317,15 @@ end;
 
 // ── TProtoMemberAttribute ────────────────────────────────────────────────────
 
-constructor TProtoMemberAttribute.Create(ATag: Integer);
+constructor TProtoMemberAttribute.Create(ATag: Integer;
+  AWireForm: TProtoMemberWireForm);
 begin
   inherited Create;
   if (ATag < 1) or (ATag > 536870911) or ((ATag >= 19000) and (ATag <= 19999)) then
     raise EProtoEncodeError.CreateFmt(
       'ProtoMember tag %d is out of range (must be 1..2^29-1 excluding the 19000-19999 reserved range).', [ATag]);
-  FTag := ATag;
+  FTag      := ATag;
+  FWireForm := AWireForm;
 end;
 
 constructor TProtoHasAttribute.Create(ATag: Integer);

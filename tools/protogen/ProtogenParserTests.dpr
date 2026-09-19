@@ -540,18 +540,10 @@ const
 begin
   Section('06  unsupported features must be refused, WITH a reason');
 
-  ExpectRefusal('sint32',
-    HDR + 'message M { sint32 v = 1; }', 'sint32');
-  ExpectRefusal('sint64',
-    HDR + 'message M { sint64 v = 1; }', 'sint64');
-  ExpectRefusal('fixed32',
-    HDR + 'message M { fixed32 v = 1; }', 'fixed32');
-  ExpectRefusal('fixed64',
-    HDR + 'message M { fixed64 v = 1; }', 'fixed64');
-  ExpectRefusal('sfixed32',
-    HDR + 'message M { sfixed32 v = 1; }', 'sfixed32');
-  ExpectRefusal('sfixed64',
-    HDR + 'message M { sfixed64 v = 1; }', 'sfixed64');
+  { sint32/sint64/fixed32/fixed64/sfixed32/sfixed64 are now ACCEPTED
+    (WIRE-FORM-1, section 10). CheckScalarSupported is a no-op for all scalars;
+    the emitter annotates each with [TProtoMember(N, pwfZigZag)] or
+    [TProtoMember(N, pwfFixed)]. }
 
   { `map` itself is now ACCEPTED (MAP-1, section 09). What stays refused are
     the shapes proto3 does not allow. }
@@ -840,6 +832,45 @@ begin
   end;
 end;
 
+// ── 10 · Group-B scalars accepted (WIRE-FORM-1) ─────────────────────────────
+
+procedure TestGroupBAccepted;
+const
+  HDR = 'syntax = "proto3";'#10'package t;'#10;
+var
+  LFile: TProtoFileNode;
+  LMsg:  TProtoMessageNode;
+begin
+  Section('10  Group-B scalars accepted (WIRE-FORM-1)');
+  { All six Group-B scalars are now parsed and recorded with the correct
+    TProtoScalar value. The emitter produces [TProtoMember(N, pwfZigZag)] for
+    the zigzag family and [TProtoMember(N, pwfFixed)] for the fixed family. }
+  LFile := Parse(HDR +
+    'message M {'#10 +
+    '  sint32   a = 1;'#10 +
+    '  sint64   b = 2;'#10 +
+    '  fixed32  c = 3;'#10 +
+    '  fixed64  d = 4;'#10 +
+    '  sfixed32 e = 5;'#10 +
+    '  sfixed64 f = 6;'#10 +
+    '}');
+  try
+    LMsg := LFile.FindMessage('M');
+    Check('Group-B message parsed without raising', LMsg <> nil);
+    if LMsg <> nil then
+    begin
+      Check('sint32  scalar = psSInt32',    LMsg.Fields[0].Scalar = psSInt32);
+      Check('sint64  scalar = psSInt64',    LMsg.Fields[1].Scalar = psSInt64);
+      Check('fixed32 scalar = psFixed32',   LMsg.Fields[2].Scalar = psFixed32);
+      Check('fixed64 scalar = psFixed64',   LMsg.Fields[3].Scalar = psFixed64);
+      Check('sfixed32 scalar = psSFixed32', LMsg.Fields[4].Scalar = psSFixed32);
+      Check('sfixed64 scalar = psSFixed64', LMsg.Fields[5].Scalar = psSFixed64);
+    end;
+  finally
+    LFile.Free;
+  end;
+end;
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 begin
@@ -855,6 +886,7 @@ begin
     TestOptionalAccepted;
     TestOneofAccepted;
     TestMapAccepted;
+    TestGroupBAccepted;
 
     WriteLn;
     WriteLn(Format('[Protogen] %d passed, %d failed', [GPass, GFail]));

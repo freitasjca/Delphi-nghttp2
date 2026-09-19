@@ -26,16 +26,16 @@ uses
 {$IFEND}
 
 type
-  { The proto3 scalar set, complete — including the ones the RTTI serializer
-    cannot express. The parser must RECOGNISE every scalar in order to reject
-    the unsupported ones by name; a parser that only knew the supported subset
-    would report "unknown type sint32", which names the wrong problem. }
+  { The proto3 scalar set, complete. The parser recognises every scalar so that
+    unknown types get a helpful message rather than "unknown type sint32".
+    WIRE-FORM-1 (2026-09-18): all scalars below are now emittable — Group-B
+    (sint32/sint64/fixed32/fixed64/sfixed32/sfixed64) via TProtoMemberWireForm. }
   TProtoScalar = (
     psNone,        // not a scalar — TypeName refers to a message or enum
     psDouble, psFloat,
     psInt32, psInt64, psUInt32, psUInt64,
-    psSInt32, psSInt64,                       // zigzag — unsupported downstream
-    psFixed32, psFixed64, psSFixed32, psSFixed64,  // fixed  — unsupported
+    psSInt32, psSInt64,                       // zigzag — [TProtoMember(N, pwfZigZag)]
+    psFixed32, psFixed64, psSFixed32, psSFixed64,  // fixed — [TProtoMember(N, pwfFixed)]
     psBool, psString, psBytes
   );
 

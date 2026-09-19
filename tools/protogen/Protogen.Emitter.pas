@@ -1021,6 +1021,21 @@ begin
     Result[1] := UpCase(Result[1]);
 end;
 
+{ WIRE-FORM-1 — Returns the TProtoMemberWireForm argument for Group-B scalars,
+  or '' for Group-A scalars that need no wire-form override.
+  Example: psSInt32 → ', pwfZigZag'; psFixed32 → ', pwfFixed'; psInt32 → ''. }
+function ScalarWireFormArg(AScalar: TProtoScalar): string;
+begin
+  case AScalar of
+    psSInt32, psSInt64:
+      Result := ', pwfZigZag';
+    psFixed32, psFixed64, psSFixed32, psSFixed64:
+      Result := ', pwfFixed';
+  else
+    Result := '';
+  end;
+end;
+
 { Distinct oneof group names, in first-appearance order. Field order rather
   than sorted, so generated output is stable against the .proto's own layout. }
 function TMessagesEmitter.OneofGroups(AMsg: TProtoMessageNode): TArray<string>;
@@ -1392,7 +1407,7 @@ begin
       W('    // proto3: ' + LField.TypeName + ' ' + LRenamedFrom + ' = ' +
         IntToStr(LField.Number) + '; renamed to ''' + LPropName +
         ''' because ''' + LRenamedFrom + ''' is a Delphi keyword');
-    W('    [TProtoMember(' + IntToStr(LField.Number) + ')]');
+    W('    [TProtoMember(' + IntToStr(LField.Number) + ScalarWireFormArg(LField.Scalar) + ')]');
     if NeedsHasBit(LField) then
     begin
       W('    property ' + LPropName + ': ' + LFieldType +
@@ -1910,23 +1925,24 @@ end;
 class function TMessagesEmitter.PascalScalarType(AScalar: TProtoScalar): string;
 begin
   case AScalar of
-    psInt32:  Result := 'Integer';
-    psInt64:  Result := 'Int64';
-    psUInt32: Result := 'UInt32';
-    psUInt64: Result := 'UInt64';
-    psBool:   Result := 'Boolean';
-    psString: Result := 'string';
-    psFloat:  Result := 'Single';
-    psDouble: Result := 'Double';
-    psBytes:  Result := 'TBytes';
+    psInt32:   Result := 'Integer';
+    psInt64:   Result := 'Int64';
+    psUInt32:  Result := 'UInt32';
+    psUInt64:  Result := 'UInt64';
+    psBool:    Result := 'Boolean';
+    psString:  Result := 'string';
+    psFloat:   Result := 'Single';
+    psDouble:  Result := 'Double';
+    psBytes:   Result := 'TBytes';
+    // WIRE-FORM-1 — Group-B scalars (TProtoMemberWireForm selects the encoding)
+    psSInt32, psSFixed32: Result := 'Integer';
+    psSInt64, psSFixed64: Result := 'Int64';
+    psFixed32:            Result := 'UInt32';
+    psFixed64:            Result := 'UInt64';
   else
-    // Group B (plan 6.1): wire layer has these, but TProtoMemberAttribute
-    // carries only a tag, so no property can select an alternate wire form.
-    { BLOCKED-BY: no-wire-form-selector }
+    { BLOCKED-BY: internal-invariant }
     raise EEmitError.CreateFmt(
-      'Cannot emit %s: no wire-form selector in TProtoMemberAttribute. ' +
-      'Structural gap -- see plans/horse-grpc-codegen.md section 6.1.',
-      [ScalarName(AScalar)]);
+      'PascalScalarType: unhandled scalar %s.', [ScalarName(AScalar)]);
   end;
 end;
 

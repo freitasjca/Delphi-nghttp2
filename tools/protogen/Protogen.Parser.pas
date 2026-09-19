@@ -255,33 +255,10 @@ end;
 procedure TProtoParser.CheckScalarSupported(AScalar: TProtoScalar;
   const AFieldName: string; ALine, ACol: Integer);
 begin
-  case AScalar of
-    psSInt32, psSInt64:
-      { BLOCKED-BY: no-wire-form-selector }
-      RefuseAt(ALine, ACol, ScalarName(AScalar),
-        Format('Field %s uses zigzag encoding, which cannot be requested: ' +
-               'TProtoMemberAttribute carries only a tag, so a property has ' +
-               'no way to select a wire form. The codec DOES implement ' +
-               'zigzag — the gap is in the attribute. Use int32/int64 if ' +
-               'negative values are rare, or wait for the attribute overload.',
-               [QuotedStr(AFieldName)]));
-
-    psFixed32, psFixed64, psSFixed32, psSFixed64:
-      { BLOCKED-BY: no-wire-form-selector }
-      RefuseAt(ALine, ACol, ScalarName(AScalar),
-        Format('Field %s uses a fixed-width wire type, which cannot be ' +
-               'requested: TProtoMemberAttribute carries only a tag. The ' +
-               'codec implements fixed32/fixed64 — the gap is in the ' +
-               'attribute. Use int32/int64/uint32/uint64 instead.',
-               [QuotedStr(AFieldName)]));
-  else
-    { Everything else is supported, INCLUDING psUInt32/psUInt64 since
-      FIX-PROTO-UINT32-1. psNone lands here too — a message or enum
-      reference, which this function has no opinion about.
-      An explicit else rather than a bare `end`: FPC warns that the case is
-      non-exhaustive otherwise, and silencing that by listing every supported
-      scalar would mean editing this whenever a scalar is added. }
-  end;
+  { WIRE-FORM-1 (2026-09-18): all Group-B scalars (sint32, sint64, fixed32,
+    fixed64, sfixed32, sfixed64) are now supported via TProtoMemberWireForm on
+    TProtoMemberAttribute. Nothing to refuse. Parameters retained because this
+    procedure is called at every field-type parse site. }
 end;
 
 procedure TProtoParser.CheckTypeNameSupported(const ATypeName: string;
