@@ -667,6 +667,105 @@ begin
     Has(LMsg, 'same enum'), LMsg);
 end;
 
+// ── ENUMRTTI-1: a non-contiguous enum cannot be a published property ────────
+{ The defect this gates is SILENT and invisible to a compile check: a published
+  property of an enum whose values are not contiguous gets no RTTI, so the
+  compiler drops it with a warning and the codec - which discovers fields by
+  walking published RTTI - never sees the field. It is neither encoded nor
+  decoded and nothing is raised. 1405 of 7301 googleapis schemas were affected,
+  and all 1405 still reported COMPILED.
+
+  So this asserts the emitted TYPE, which a compile check cannot: compiling
+  proves nothing here, because the broken form compiles perfectly. }
+procedure TestEnumRttiSurrogate;
+const
+  { Contiguous SET, declared out of order - exactly the googleapis habit of
+    appending a later number in the middle. Ordering alone makes this one
+    publishable, so it keeps its own enum type. }
+  CUnordered =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum E { A = 0; C = 2; B = 1; }'#10 +
+    'message M { E e = 1; }';
+  { Real gaps. No ordering makes 0,5 contiguous, so this one needs Int32. }
+  CHoles =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum E { A = 0; B = 5; }'#10 +
+    'message M { E e = 1; }';
+  { The control, and it carries the weight: a change that blanket-converted
+    every enum field to Int32 would pass every other check here. }
+  CContiguous =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum E { A = 0; B = 1; }'#10 +
+    'message M { E e = 1; }';
+  CRepeatedHoles =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum E { A = 0; B = 7; }'#10 +
+    'message M { repeated E e = 1; }';
+  { SHADOW-4. An enum value spelled INT32 sits at unit scope, and Pascal is
+    case-insensitive, so it shadows the TYPE Int32 for every unit that can see
+    it. googleads' GoogleAdsFieldDataType really does declare INT32 = 7, and an
+    unqualified surrogate cost 13 corpus schemas: "Type identifier expected" on
+    a field declaration that reads perfectly. }
+  CShadowedInt32 =
+    'syntax = "proto3";'#10'package t;'#10 +
+    'enum DataType { DATA_TYPE_UNSPECIFIED = 0; INT32 = 7; }'#10 +
+    'enum E { A = 0; B = 5; }'#10 +
+    'message M { E e = 1; }';
+var
+  LSrc: string;
+begin
+  WriteLn;
+  WriteLn('-- ENUMRTTI-1: non-contiguous enums cannot be published');
+
+  LSrc := EmitSource(CUnordered);
+  Check('an out-of-order enum is emitted ASCENDING',
+    (Pos('B = 1', LSrc) > 0) and (Pos('C = 2', LSrc) > 0) and
+    (Pos('B = 1', LSrc) < Pos('C = 2', LSrc)));
+  { Reordering must not RENUMBER. Each value keeps the number the .proto gave
+    it - that number is the wire format, and renumbering would silently change
+    what every encoder and decoder agrees on. }
+  Check('  and every value keeps its own number',
+    Has(LSrc, 'A = 0') and Has(LSrc, 'B = 1') and Has(LSrc, 'C = 2'));
+  { Absence of the SURROGATE, not of one spelling of it. Checking for
+    'property e: Int32' would pass against the qualified System.Int32 and
+    quietly stop testing anything. }
+  Check('  so ordering alone leaves it publishable as its own enum type',
+    not Has(LSrc, 'System.Int32'));
+
+  LSrc := EmitSource(CHoles);
+  Check('an enum with real gaps is published as System.Int32',
+    Has(LSrc, 'property e: System.Int32'));
+  Check('  and its backing field matches, or the unit will not compile',
+    Has(LSrc, 'Fe: System.Int32;'));
+  Check('  and the output says WHY, so the type is not a mystery',
+    Has(LSrc, 'values are not contiguous'));
+  { The enum type itself is still emitted and still usable - only the published
+    property changes, so callers keep a named constant to compare against. }
+  Check('  while the enum type itself is still declared',
+    Has(LSrc, 'B = 5'));
+
+  LSrc := EmitSource(CContiguous);
+  Check('a CONTIGUOUS enum is left alone',
+    not Has(LSrc, 'System.Int32'));
+  Check('  and gains no surrogate comment',
+    not Has(LSrc, 'values are not contiguous'));
+
+  LSrc := EmitSource(CRepeatedHoles);
+  Check('a REPEATED field of a gapped enum becomes TArray<System.Int32>',
+    Has(LSrc, 'TArray<System.Int32>'));
+
+  { SHADOW-4. The qualifier is the whole point, so assert the BARE form is
+    absent rather than only that the qualified one is present - emitting both
+    somewhere would pass a presence-only check while still not compiling. }
+  LSrc := EmitSource(CShadowedInt32);
+  Check('the surrogate is QUALIFIED, so an INT32 enum value cannot shadow it',
+    Has(LSrc, 'property e: System.Int32'));
+  Check('  and the bare type name is never emitted',
+    not Has(LSrc, 'property e: Int32') and not Has(LSrc, ': Int32;'));
+  Check('  while the colliding enum value itself is still emitted',
+    Has(LSrc, 'INT32 = 7'));
+end;
+
 procedure TestEmitOneofMessageMember;
 const
   CProto =
@@ -1003,6 +1102,7 @@ begin
   TestEmitOptional;
   TestEmitForwardDecls;
   TestEnumValueCollision;
+  TestEnumRttiSurrogate;
   TestEmitOneofMessageMember;
   TestCompilerFoundDefects;
   TestEmitWireForm;

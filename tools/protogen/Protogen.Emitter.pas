@@ -60,6 +60,19 @@ type
     // IMPORT-1 — the instance-level counterpart of the class function
     // PascalFieldType, which cannot see the file set.
     function  FieldType(AField: TProtoFieldNode): string;
+    // The type ENUMRTTI-1 starts from. Split out so the surrogate rule applies
+    // in ONE place and cannot miss one of the two resolution paths below.
+    function  DeclaredFieldType(AField: TProtoFieldNode): string;
+    { ENUMRTTI-1. A Pascal enum whose values are not contiguous has no RTTI.
+      The compiler then drops a published property of that type - saying so,
+      as `Warning: This property will not be published` - and because the codec
+      discovers fields by walking published RTTI, the field is neither encoded
+      nor decoded and nothing is raised. These four decide when to publish an
+      Int32 surrogate instead. }
+    function  SortedEnumIndexes(AEnum: TProtoEnumNode): TArray<Integer>;
+    function  EnumNodeOf(AField: TProtoFieldNode): TProtoEnumNode;
+    function  EnumIsContiguous(AEnum: TProtoEnumNode): Boolean;
+    function  NeedsEnumSurrogate(AField: TProtoFieldNode): Boolean;
     procedure NoteExternUnit(const AUnitName: string);
     procedure ScanForWKT;
     procedure ScanForBytes;
@@ -414,6 +427,40 @@ begin
     Result := AField.Owner.QualifiedName;
 end;
 
+{ ENUMRTTI-1. Every consumer of a field's Pascal type reaches it through here -
+  the backing field, the setter parameter, the published property, the oneof
+  Clear's Default(), and MapValueType - so applying the surrogate in this ONE
+  place is what keeps all of them naming the same type. Applying it per call
+  site would leave any missed one declaring a field of a type its own property
+  no longer has.
+
+  It runs AFTER DeclaredFieldType rather than short-cutting past it, because
+  that function also notes the extern unit for the uses clause. Returning early
+  would drop the `uses` entry for a file whose only cross-unit reference is the
+  enum. An entry that is now unused costs a compiler hint; a missing one costs
+  a unit that does not compile.
+
+  SHADOW-4. The surrogate is `System.Int32`, QUALIFIED, and the qualifier is
+  load-bearing. A Pascal enum value lives at unit scope and Pascal is
+  case-insensitive, so an imported enum declaring INT32 shadows the bare type
+  name: the field then reads as a constant and the compiler answers "Type
+  identifier expected" on a line that looks perfectly ordinary. Not
+  hypothetical — googleads' GoogleAdsFieldDataType declares INT32 = 7, and it
+  reaches any unit that imports it, which cost 13 corpus schemas.
+
+  Same hazard and same answer as System.High / System.Length above, and it
+  rests on the same guarantee: SHADOW-3 keeps an enum value from taking
+  `system`, without which this qualifier would be shadowable in turn. }
+function TMessagesEmitter.FieldType(AField: TProtoFieldNode): string;
+begin
+  Result := DeclaredFieldType(AField);
+  if not NeedsEnumSurrogate(AField) then Exit;
+  if AField.IsRepeated then
+    Result := 'TArray<System.Int32>'
+  else
+    Result := 'System.Int32';
+end;
+
 { IMPORT-1. The Pascal type for a field, resolved across files.
 
   A cross-file reference is emitted FULLY QUALIFIED — Demo.Google.Rpc.Status.
@@ -423,7 +470,7 @@ end;
   silently and possibly wrongly. tests/qualref/ProtoQualRefProbe.dpr pins both
   halves of that: the qualified form resolves to the right unit, and the bare
   form really does bind to the last one. }
-function TMessagesEmitter.FieldType(AField: TProtoFieldNode): string;
+function TMessagesEmitter.DeclaredFieldType(AField: TProtoFieldNode): string;
 var
   LBase:  string;
   LExtern: string;
@@ -786,22 +833,38 @@ begin
     EmitMessage(FFile.Messages[I]);
 end;
 
+{ ENUMRTTI-1, the ordering half. proto declares enum values in whatever order
+  the author wrote them, and googleapis routinely appends a later number in the
+  middle. Pascal needs them ASCENDING; out of order, the type gets no RTTI and
+  every published property of it is dropped silently.
+
+  Reordering is semantically free - each value keeps its own number, and proto
+  attaches no meaning to declaration order - so this is a pure gain for any
+  enum whose value SET is already contiguous.
+
+  It is NOT sufficient by itself. On the googleapis corpus it fixes 51 of 596
+  affected properties; the other 545 have real gaps (one spans 0..100000) and
+  no ordering makes those contiguous, which is what the Int32 surrogate in
+  FieldType is for. }
 procedure TMessagesEmitter.EmitEnum(AEnum: TProtoEnumNode);
 var
-  I: Integer;
+  I, LIdx: Integer;
+  LOrder: TArray<Integer>;
   LLine: string;
 begin
+  LOrder := SortedEnumIndexes(AEnum);
   W('  ' + TypeNameIn(FFile, AEnum.QualifiedName) + ' = (');
-  for I := 0 to AEnum.Values.Count - 1 do
+  for I := 0 to High(LOrder) do
   begin
-    LLine := '    ' + EnumValueName(AEnum, I) + ' = ' +
-      IntToStr(AEnum.Values[I].Number);
+    LIdx  := LOrder[I];
+    LLine := '    ' + EnumValueName(AEnum, LIdx) + ' = ' +
+      IntToStr(AEnum.Values[LIdx].Number);
     { A renamed value is called out where it is declared, so the difference
       from the .proto spelling is visible at the point of use. }
-    if not SameText(EnumValueName(AEnum, I), AEnum.Values[I].Name) then
-      W('    // proto3: ' + AEnum.Values[I].Name +
+    if not SameText(EnumValueName(AEnum, LIdx), AEnum.Values[LIdx].Name) then
+      W('    // proto3: ' + AEnum.Values[LIdx].Name +
         ' - prefixed, another enum in this file declares that name too');
-    if I < AEnum.Values.Count - 1 then
+    if I < High(LOrder) then
       LLine := LLine + ',';
     W(LLine);
   end;
@@ -892,6 +955,99 @@ begin
     was wrong. ONEOF-2 was the first. Cost here: ~370 of 7301 googleapis
     schemas. }
   Result := False;
+end;
+
+{ ENUMRTTI-1. The value indexes of an enum ordered by proto NUMBER, as a
+  permutation of the declaration order - so a caller still addresses values by
+  their original index and EnumValueName keeps naming the right one.
+
+  ONE source for the ordering, because EmitEnum has to emit ascending values
+  and EnumIsContiguous has to test them, and computing the order twice is how
+  the two would come to disagree.
+
+  Insertion sort: proto enums are small, it is stable (so `allow_alias`
+  duplicates keep declaration order), and it avoids pulling
+  Generics.Collections into an emitter that otherwise does not need it. }
+function TMessagesEmitter.SortedEnumIndexes(AEnum: TProtoEnumNode): TArray<Integer>;
+var
+  I, J, LTmp: Integer;
+begin
+  SetLength(Result, AEnum.Values.Count);
+  for I := 0 to AEnum.Values.Count - 1 do
+    Result[I] := I;
+  for I := 1 to High(Result) do
+  begin
+    LTmp := Result[I];
+    J    := I - 1;
+    while (J >= 0) and
+          (AEnum.Values[Result[J]].Number > AEnum.Values[LTmp].Number) do
+    begin
+      Result[J + 1] := Result[J];
+      Dec(J);
+    end;
+    Result[J + 1] := LTmp;
+  end;
+end;
+
+{ The enum a field names, or nil. Mirrors IsEnumField's resolution order for
+  the reason that predicate gives - ask the file set first, fall back to the
+  simple-name lookup - and returns the NODE because the surrogate rule needs
+  the values, not just the yes/no.
+
+  A bundled well-known enum resolves to no node. That is deliberate: it answers
+  nil, the caller treats it as needing no surrogate, and google.protobuf.
+  NullValue is single-valued so it is contiguous anyway. }
+function TMessagesEmitter.EnumNodeOf(AField: TProtoFieldNode): TProtoEnumNode;
+var
+  LRef: TProtoTypeRef;
+begin
+  Result := nil;
+  if AField.Scalar <> psNone then
+    Exit;
+
+  if (FFileSet <> nil) and (FEntry <> nil) then
+  begin
+    LRef := FFileSet.ResolveType(FEntry, AField.TypeName, ScopeOf(AField));
+    if LRef.Found then
+      Exit(LRef.Enum);
+  end;
+
+  Result := FFile.FindEnum(AField.TypeName);
+end;
+
+{ Contiguous means the values form an unbroken run once ordered - 0,1,2 yes,
+  0,2,3 no, and 0,1,1 no. That last case matters: `option allow_alias` permits
+  duplicate numbers in proto and Pascal forbids them outright, so a gap test
+  written as (Max - Min + 1 = Count) would call an aliased enum contiguous and
+  emit a type that cannot compile. Comparing each neighbour catches it. }
+function TMessagesEmitter.EnumIsContiguous(AEnum: TProtoEnumNode): Boolean;
+var
+  LOrder: TArray<Integer>;
+  I: Integer;
+begin
+  Result := True;
+  if (AEnum = nil) or (AEnum.Values.Count <= 1) then
+    Exit;
+  LOrder := SortedEnumIndexes(AEnum);
+  for I := 1 to High(LOrder) do
+    if AEnum.Values[LOrder[I]].Number <>
+       AEnum.Values[LOrder[I - 1]].Number + 1 then
+      Exit(False);
+end;
+
+{ Publish Int32 instead of the enum? Only when the enum genuinely cannot carry
+  RTTI. An enum that IS contiguous keeps its own type, so the common case is
+  untouched and existing code that assigns a value to such a field still
+  compiles - the surrogate costs the typed property, and paying that for every
+  enum field to buy uniformity would break far more than it fixes.
+
+  Int32 rather than the enum is also what makes an UNKNOWN value survive a
+  round trip, which proto3 requires: the wire can carry a number the schema
+  has never heard of, and it has to fit somewhere. A Pascal enum is sized to
+  its declared range and would truncate it. }
+function TMessagesEmitter.NeedsEnumSurrogate(AField: TProtoFieldNode): Boolean;
+begin
+  Result := IsEnumField(AField) and (not EnumIsContiguous(EnumNodeOf(AField)));
 end;
 
 { PROTOGEN-DTOR. Does this field hold MESSAGE instance(s) the class must free?
@@ -1407,6 +1563,17 @@ begin
       W('    // proto3: ' + LField.TypeName + ' ' + LRenamedFrom + ' = ' +
         IntToStr(LField.Number) + '; renamed to ''' + LPropName +
         ''' because ''' + LRenamedFrom + ''' is a Delphi keyword');
+    { ENUMRTTI-1. Say so in the output. Typed as the enum this property would
+      compile and then not exist: the values of the enum are not contiguous, so
+      it carries no RTTI, and a published property of it is dropped with only a
+      compiler warning to say the field is gone from the wire. }
+    if NeedsEnumSurrogate(LField) then
+    begin
+      W('    // proto3: ' + LField.TypeName + ' - values are not contiguous, so');
+      W('    // that enum has no RTTI. Published as Int32 (the same varint on');
+      W('    // the wire) because a property typed as the enum is not published');
+      W('    // at all, and the codec would never see this field.');
+    end;
     W('    [TProtoMember(' + IntToStr(LField.Number) + ScalarWireFormArg(LField.Scalar) + ')]');
     if NeedsHasBit(LField) then
     begin
