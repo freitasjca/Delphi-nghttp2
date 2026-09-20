@@ -42,6 +42,38 @@
 #  the list above; three here). That is why phase 3 exists: every guess a human
 #  made about this crash has been wrong, so the compiler gets to answer instead.
 #
+#  ── ANSWERED 2026-09-20: cumulative IDENTIFIER VOLUME ──
+#
+#  Phase 3 on the smallest crasher (S6854, 180 lines, the EListError arm) cut it
+#  to 60 lines in 543 compiles. Four one-line variants of that, all else
+#  byte-identical, located the cause:
+#
+#    (ALLOW)                              CRASH   implicit zero
+#    (ALLOW = 0)                          CRASH   explicit zero
+#    (UNSPECIFIED = 0, ALLOW = 1)         CRASH   the real emitted form
+#    TE = (ALLOW = 1)                     CLEAN   <- only the NAME changed
+#
+#  Enum shape is irrelevant. It is the names. And it is CUMULATIVE rather than
+#  one symbol crossing a line: three unrelated edits each give CLEAN, with
+#  everything else identical -
+#
+#    shorten the unit name 74 -> 69 chars (crash-namelen.sh; clean at 69 and below)
+#    delete the enum
+#    delete TPrincipalAccessBoundaryPolicyRule, an EMPTY class nothing references
+#
+#  That last one is why ddmin kept declarations that look like dead weight: they
+#  were not dead, they were adding to the total. The `uses` clause is innocent -
+#  removing it still crashes, so the reproducer needs no project unit at all.
+#
+#  BOTH SIGNATURES ARE ONE BUG. This unit's baseline is EListError; the phase-1
+#  `published -> public` variant of the SAME file reports Internal error
+#  2015071503. The 34 + 16 split in crashes.txt is one defect surfacing two ways.
+#
+#  The 56-line dependency-free reproducer is kept in fpc-bug/ - see its README.
+#  Upstream FPC bug; MAX_IDENT in Protogen.Emitter.pas bounds a SOURCE identifier
+#  and so never fires here (the crashing type name is 41 chars), which is the
+#  shape any local mitigation would have to change.
+#
 #  ── THREE outcomes, never two ──
 #
 #  The trap in any reducer is reading "no longer crashes" as progress when the

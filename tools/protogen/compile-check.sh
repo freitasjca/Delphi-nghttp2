@@ -304,8 +304,10 @@ while IFS=$'\t' read -r N proto; do
     # what we generate - "Internal error 2015071505", "Compilation raised
     # exception internally", "List index exceeds bounds" - and counting those
     # as emitter defects overstated the number by 3.5x on the first full sweep
-    # (76 reported, 22 real). Long identifiers correlate with it; see MAX_IDENT
-    # in Protogen.Emitter.pas, which exists because of this same FPC behaviour.
+    # (76 reported, 22 real). Long identifiers CAUSE it — established 2026-09-20,
+    # see crash-reduce.sh's header. MAX_IDENT in Protogen.Emitter.pas exists for
+    # this same FPC behaviour but bounds a SOURCE identifier, which is not the
+    # string that overflows, so it never fires on these.
     if grep -qE "Internal error|raised exception internally|List index exceeds bounds" \
          "$D/build.log"; then
       CRASH=$(( CRASH + 1 ))
@@ -357,9 +359,12 @@ if [[ $CRASH -gt 0 ]]; then
   echo
   echo "-- FPC crashed on these ----------------------------------"
   echo "   Counted apart because the compiler DIED rather than"
-  echo "   reporting our output invalid. Still worth reading: long"
-  echo "   generated identifiers correlate with it, and IMPORT-1"
-  echo "   made both unit names and qualified references longer."
+  echo "   reporting our output invalid. CAUSE ESTABLISHED"
+  echo "   2026-09-20: cumulative identifier volume, not any"
+  echo "   construct - shortening the unit name, deleting an enum"
+  echo "   or deleting an UNREFERENCED empty class each fix it."
+  echo "   Upstream FPC bug; 56-line reproducer in fpc-bug/."
+  echo "   See crash-reduce.sh's header for the full derivation."
   head -12 "$OUT/crashes.txt" | sed 's/^/  /'
   echo "   full list: $OUT/crashes.txt"
 fi

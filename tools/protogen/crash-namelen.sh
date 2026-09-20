@@ -40,6 +40,31 @@
 #  remaining suspects are the sparse enum (EXCLUDE = 2) and the forward-declared
 #  class -- both still present in the minimal file.
 #
+#  ── RESULT 2026-09-20: a clean THRESHOLD. Length is the cause. ──
+#
+#  Swept on S6854's 60-line reduction. One crossing, nothing ragged:
+#
+#    74 chars  CRASH        69 / 48 / 19 / 10 / 1 chars   CLEAN
+#
+#  So the theory this script exists to test is CORRECT, and the "disproved"
+#  verdict recorded above was wrong for exactly the reason it suspected: it
+#  measured the wrong string.
+#
+#  But the cause is CUMULATIVE, not one symbol crossing a limit. Holding the
+#  unit name at its original 74, deleting the enum ALSO gives CLEAN -- and so
+#  does deleting an empty class that nothing references. Every route that lowers
+#  total identifier volume works. That matters for any fix: bounding a single
+#  identifier cannot be sufficient, because no single identifier here exceeds
+#  MAX_IDENT's 120 to begin with (the crashing type name is 41 chars).
+#
+#  STILL UNEXPLAINED, and the reason not to reach for a fix yet: releasing.md's
+#  corpus A/B has the SHORTER --unit-prefix C<N> producing MORE crashes (88 vs
+#  50). Shortening one term of a sum cannot raise the sum, so something beyond
+#  volume is at work ACROSS units even though volume is decisive WITHIN one.
+#  Reconcile that before shipping an emitter mitigation, and validate any
+#  attempt on a FULL sweep -- tuning on the crashing subset is what produced the
+#  C<N> revert and 81 new failures.
+#
 #  USAGE
 #    crash-namelen.sh <minimal-crash-NNNN.pas>
 # =============================================================================
