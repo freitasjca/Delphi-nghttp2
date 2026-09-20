@@ -361,6 +361,12 @@ echo "                     (7266/7301, 35 refusals, 1 of them emit-side)"
 echo "    99.8%  2026-09-10  after IMPORT-1 + SkipExtendBlock"
 echo "                     (7287/7301, 14 refusals, 1 of them emit-side)"
 echo "                     The 21 that went away were ALL proto2 'extend'."
+echo "    99.9%  2026-09-20  at 1.21.0 (7294/7301, 7 refusals, 1 emit-side)"
+echo "                     NOT one stage: the 7 accumulated across 1.17.0-"
+echo "                     1.20.0 and this line had simply not been re-earned"
+echo "                     since 2026-09-10. Ten days of drift is how a list"
+echo "                     of RECORDED RESULTS quietly becomes a list of"
+echo "                     targets nobody is measuring against."
 echo
 echo "  The one remaining emit refusal is bigquery/v2/job.proto: an enum"
 echo '  declaring both minimal and MINIMAL. Legal proto3 - identifiers are'

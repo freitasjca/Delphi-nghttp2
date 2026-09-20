@@ -63,6 +63,13 @@ with it — in both directions. Measured over the full corpus on 2026-09-11:
 | DID NOT COMPILE | 0 | 0 |
 | refused | 21 | 21 |
 
+That table is a 2026-09-11 **A/B between prefixes**, kept for the comparison
+rather than as a current baseline — do not quote its absolutes. Current figures,
+default prefix, at 1.21.0 (2026-09-20): COMPILED **7,239**, `compiler crashed`
+**50**, DID NOT COMPILE **0**, refused **12**. Nine schemas moved from refused
+to compiled as WIRE-FORM-1 and friends landed, which is why the two rows differ
+by the same nine.
+
 The short prefix was adopted briefly on the strength of re-running only the 50
 crashing schemas, where it looked like a 43-schema win. **That sample was
 selected on the outcome** — it could not contain a schema that started crashing

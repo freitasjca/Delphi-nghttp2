@@ -13,6 +13,7 @@ The project has been on `1.x` since its first public tag.
 
 | Version | Date | Headline |
 |---|---|---|
+| [1.21.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.21.0) | 2026-09-20 | enum fields that were never on the wire |
 | [1.20.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.20.0) | 2026-09-19 | |
 | [1.19.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.19.0) | 2026-09-18 | |
 | [1.18.2](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.18.2) | 2026-09-18 | |
