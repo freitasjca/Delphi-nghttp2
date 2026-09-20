@@ -15,9 +15,11 @@
 #
 #    protoc ACCEPT + us ACCEPT   fine
 #    protoc ACCEPT + us REFUSE   a DOCUMENTED GAP - valid proto3 we choose not
-#                                to emit (map, oneof, sint32...). Must be
-#                                declared by the case, or it is an accidental
-#                                refusal wearing a deliberate one's clothes.
+#                                to emit (proto2 syntax, google.protobuf.Api).
+#                                Must be declared by the case, or it is an
+#                                accidental refusal wearing a deliberate one's
+#                                clothes. This list shrinks: map, oneof and the
+#                                Group-B scalars were all once named here.
 #    protoc REJECT + us REFUSE   fine - both saw an invalid schema
 #    protoc REJECT + us ACCEPT   **BUG**. We would generate Pascal from a
 #                                schema protoc will not compile, so our output
@@ -190,13 +192,26 @@ message M {
 }
 EOF
 
-# --- valid proto3 that we deliberately refuse (expect cell 2) ---------------
-add_case sint32   refuse "Group B - zigzag not selectable via TProtoMember" <<EOF
+# Were `refuse` until WIRE-FORM-1. Group-B scalars never had a framing problem
+# - each is an ordinary tagged field - so what was missing was a way to SELECT
+# the wire form, which TProtoMemberAttribute.WireForm supplied (pwfZigZag,
+# pwfFixed). Now `ok` rows.
+#
+# These two expectations outlived the feature by three releases: WIRE-FORM-1
+# landed in 0d05f7e with its gates in 4c3be70, and the README and codegen docs
+# were corrected in 7e79366, but nothing updated this file - so the oracle went
+# on failing with two UNDECLARED rows that named a limitation which no longer
+# existed. Flipped only after confirming the capability holds in four other
+# suites (codec stage 12b round-trips all six Group-B types, the conformance
+# probe reports CONFORMS for zigzag and fixed, ProtogenEmitTests asserts
+# pwfZigZag/pwfFixed reach the attribute, and the parser accepts them), which
+# is what this file means by "do not just update the expectation".
+add_case sint32   accept "WIRE-FORM-1 - zigzag selectable via pwfZigZag" <<EOF
 $HDR
 message M { sint32 v = 1; }
 EOF
 
-add_case fixed32  refuse "Group B - fixed width not selectable" <<EOF
+add_case fixed32  accept "WIRE-FORM-1 - fixed width selectable via pwfFixed" <<EOF
 $HDR
 message M { fixed32 v = 1; }
 EOF
