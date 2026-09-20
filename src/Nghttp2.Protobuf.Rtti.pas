@@ -5,7 +5,8 @@ unit Nghttp2.Protobuf.Rtti;
 // ============================================================================
 //  Nghttp2.Protobuf.Rtti
 //  RTTI-driven bridge between message classes and Nghttp2.Protobuf wire codec.
-//  M1b of the horse-provider-nghttp2 gRPC plan (2026-08-07).
+//  Originally M1b of the gRPC plan (a horse-provider-nghttp2 planning
+//  document dated 2026-08-07, not part of this repository).
 //
 //  Enumerates `[ProtoMember(N)]`-annotated published properties on a message
 //  class, caches the tag→property map per class, and orchestrates

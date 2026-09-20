@@ -29,7 +29,8 @@ unit Nghttp2.Server;
 //  the limit as thread-creation failures.
 //
 //  Graceful shutdown protocol (used by the provider entry point's
-//  StopListenGraceful — framework contract from horse/.agents/AGENTS.md):
+//  StopListenGraceful — a framework contract defined by the Horse project,
+//  in its own .agents/AGENTS.md, not by this library):
 //    1) StopAcceptingNewConnections — closes the listener and raises the
 //       DRAINING flag. Existing connections keep pumping; each sends the
 //       first GOAWAY (last_stream_id = 2^31-1, NO_ERROR) so the peer stops

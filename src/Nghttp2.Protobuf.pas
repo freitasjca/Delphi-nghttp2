@@ -6,7 +6,8 @@ unit Nghttp2.Protobuf;
 // ============================================================================
 //  Nghttp2.Protobuf
 //  Proto3 wire-format encoder/decoder — minimal focused implementation for
-//  gRPC-over-HTTP/2 support (M1 of the horse-provider-nghttp2 gRPC plan).
+//  gRPC-over-HTTP/2 support (originally M1 of the gRPC plan, a
+//  horse-provider-nghttp2 planning document not part of this repository).
 //
 //  Scope (proto3 subset — the 90% that gRPC actually uses):
 //    Scalar types: int32, int64, uint32, uint64, sint32, sint64 (ZigZag),

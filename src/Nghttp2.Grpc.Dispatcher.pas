@@ -7,7 +7,8 @@ unit Nghttp2.Grpc.Dispatcher;
 //  Intercepts application/grpc requests, decodes the 5-byte-prefixed
 //  protobuf body, invokes the registered handler, encodes the response,
 //  and emits the grpc-status trailer.
-//  M4a of the horse-provider-nghttp2 gRPC plan (2026-08-07).
+//  Originally M4a of the gRPC plan (a horse-provider-nghttp2 planning
+//  document dated 2026-08-07, not part of this repository).
 //
 //  Wire format per gRPC-over-HTTP/2 spec:
 //    Request/Response body   = [1B compressed flag][4B BE length][protobuf]

@@ -5,7 +5,8 @@ unit Nghttp2.Grpc.Registry;
 // ============================================================================
 //  Nghttp2.Grpc.Registry
 //  Process-wide registry of gRPC methods → handler dispatch info.
-//  M4a of the horse-provider-nghttp2 gRPC plan (2026-08-07).
+//  Originally M4a of the gRPC plan (a horse-provider-nghttp2 planning
+//  document dated 2026-08-07, not part of this repository).
 //  M4c ergonomic layer added 2026-08-09 — RegisterService<T> generic.
 //
 //  Two registration styles, both routed to the same internal storage:

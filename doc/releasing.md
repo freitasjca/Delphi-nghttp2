@@ -15,7 +15,7 @@ bash build-codec-fpc.sh 2>&1 | grep -nE "FAIL|Fatal:|Error:" | head
 
 ```cmd
 REM Windows
-cd C:\lang\Repo\Delphi-nghttp2\tests
+cd Delphi-nghttp2\tests
 run-tests.bat
 ```
 

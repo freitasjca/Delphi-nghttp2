@@ -2,6 +2,8 @@
 
 **Server + client bindings for [libnghttp2](https://nghttp2.org/) in Object Pascal (Delphi + FPC).**
 
+[![Ask DeepWiki](https://devin.ai/assets/askdeepwiki.png)](https://deepwiki.com/freitasjca/Delphi-nghttp2)
+
 HTTP/2 transport primitives — session state, HPACK, streams, callbacks — packaged as a standalone library, plus a **framework-agnostic gRPC layer** on top: protobuf codec, service registry, dispatcher, and streaming readers and writers. Use it directly to build HTTP/2 or gRPC servers and clients in Delphi, or via the higher-level [`horse-provider-nghttp2`](https://github.com/freitasjca/horse-provider-nghttp2) glue for the [Horse](https://github.com/HashLoad/horse) web framework.
 
 The gRPC layer takes an `INghttp2Stream` and nothing else — no web framework is involved on either side, so any host that owns a stream can serve gRPC with it. `horse-provider-nghttp2` is one such host, not a prerequisite. [`samples/grpc-server`](samples/grpc-server) is a working server that proves it: two RPCs and a plain HTTP/2 route on one port, in about sixty lines, with no framework in the uses clause.
@@ -13,6 +15,61 @@ Parallels the ecosystem's proven pattern:
 | [`Delphi-Cross-Socket`](https://github.com/winddriver/Delphi-Cross-Socket) | `horse-provider-crosssocket` |
 | [`mORMot2`](https://github.com/synopse/mORMot2) | `horse-provider-mormot` |
 | **`Delphi-nghttp2`** *(this repo)* | [`horse-provider-nghttp2`](https://github.com/freitasjca/horse-provider-nghttp2) |
+
+How the pieces fit. Unit names drop the `Nghttp2.` prefix; the full file
+tree is under [Layout](#layout).
+
+```mermaid
+flowchart TB
+    APP["Your application"]
+
+    subgraph GRPC["gRPC layer — framework-agnostic"]
+        DISP["Grpc.Dispatcher<br/>application/grpc interception, framing, trailers"]
+        REG["Grpc.Registry<br/>service + method lookup"]
+        STRM["Grpc.StreamReader / Grpc.StreamWriter<br/>client-, server- and bidi-streaming"]
+        CODEC["Protobuf + Protobuf.Rtti<br/>wire codec, RTTI field mapping"]
+    end
+
+    subgraph CORE["HTTP/2 core"]
+        SERVER["Server<br/>accept loop, graceful shutdown"]
+        CLIENT["Client<br/>TNghttp2Client, ReadChunk"]
+        SESSION["Session<br/>session wrapper + per-stream state machine"]
+        TYPES["Types<br/>INghttp2Connection / INghttp2Stream"]
+    end
+
+    subgraph TRANSPORT["Transport"]
+        TLS["Tls<br/>memory-BIO, ALPN h2"]
+        SOCK["Socket<br/>Winsock2 / POSIX / FPC Sockets"]
+        EPOLL["Engine.Epoll<br/>opt-in"]
+        IOCP["Engine.Iocp<br/>opt-in"]
+    end
+
+    subgraph FFI["FFI bindings"]
+        NATIVE["Native<br/>libnghttp2"]
+        OSSL["OpenSSL<br/>auto-detect 3.x / 1.1.x"]
+    end
+
+    PROTOGEN["tools/protogen<br/>.proto to message, interface,<br/>service and registration units"]
+
+    APP --> SERVER
+    APP --> CLIENT
+    APP --> DISP
+    DISP --> REG
+    DISP --> STRM
+    DISP --> CODEC
+    DISP --> TYPES
+    SERVER --> SESSION
+    CLIENT --> SESSION
+    SESSION --> TYPES
+    SESSION --> NATIVE
+    SESSION --> TLS
+    SERVER --> EPOLL
+    SERVER --> IOCP
+    SERVER --> SOCK
+    CLIENT --> SOCK
+    TLS --> OSSL
+    PROTOGEN -. generates .-> CODEC
+```
 
 ---
 
