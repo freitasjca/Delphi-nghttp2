@@ -62,6 +62,60 @@ program ProtoOptionalProbe;
 //       is about records specifically or about generics generally. That answer
 //       shapes far more than this feature.
 //
+//  ROUND 3 - may a NON-CONTIGUOUS enum be a published property? (ENUMRTTI-1)
+//
+//  A Pascal enum with gaps in its values has no RTTI. FPC trunk says so out
+//  loud - "This property will not be published" - and then omits the property,
+//  so the codec never sees the field: it is neither encoded nor decoded and
+//  nothing is raised. On the googleapis corpus that was 1405 schemas and 5633
+//  properties, every one of which still reported COMPILED, because compiling
+//  was never what was broken. ENUMRTTI-1 answers it by publishing Int32
+//  instead, for EVERY compiler.
+//
+//  What is NOT known is whether dcc64 needed that. Three possible answers and
+//  they do not mean the same thing:
+//
+//    drops it silently (like FPC)  the defect was equally bad on both, and
+//                                  ENUMRTTI-1 is right as written.
+//    refuses to COMPILE            then those 1405 schemas never built on
+//                                  Delphi at all, and ENUMRTTI-1 is a BUILD
+//                                  fix there, not merely a data-loss one.
+//                                  Per the note below, that failure is the
+//                                  answer - record it here, do not route
+//                                  around it.
+//    publishes it fine             the defect is FPC-only, and the surrogate
+//                                  costs Delphi a well-typed property it did
+//                                  not need. The generated .pas is ONE file
+//                                  compiled by both, so the likely conclusion
+//                                  is still "surrogate everywhere" - but then
+//                                  chosen knowingly rather than by accident.
+//
+//  `dense` is the control and it GATES: a contiguous enum must be publishable
+//  on both compilers, or the probe is measuring nothing. `gappy` REPORTS only
+//  - on FPC its absence is the expected, already-measured result, so gating it
+//  would fail a compiler that is behaving exactly as documented.
+//
+//  ROUND 3 RESULT (2026-09-20) - BOTH compilers drop it. Answered, settled:
+//
+//      FPC trunk 3.3.1        dense DISCOVERED, gappy ABSENT
+//      Delphi 12 (Studio 23)  dense DISCOVERED, gappy ABSENT
+//
+//  Neither refuses the declaration - both COMPILE it and then omit the
+//  property from RTTI. The first of the three possibilities above, and the
+//  one with the widest blast radius: the silent field loss was never
+//  FPC-specific, so every Delphi user of a sparse-enum schema was losing
+//  fields on the wire too, with nothing to tell them.
+//
+//  That retires the open question against ENUMRTTI-1: the Int32 surrogate is
+//  REQUIRED on both, not a lowest-common-denominator concession to FPC, and
+//  it costs Delphi no well-typed property because Delphi was not publishing
+//  one either.
+//
+//  NOT established: whether dcc64 emits any diagnostic. FPC says "This
+//  property will not be published"; run-tests.bat does not surface compiler
+//  output for a passing stage, so the Delphi side is unknown. If it is
+//  silent, the defect was strictly harder to notice there.
+//
 //  Build (Windows):
 //    dcc64 -CC -B -U"..\src" ProtoOptionalProbe.dpr
 //
@@ -120,6 +174,28 @@ type
     FValue: T;
   public
     property Value: T read FValue write FValue;
+  end;
+
+  { ROUND 3. Contiguous from zero - the shape every ordinary proto enum has,
+    and the control: if THIS is not discovered, the compiler has withdrawn
+    published enums entirely and nothing below it means anything. }
+  TProbeDenseEnum = (pdeZero = 0, pdeOne = 1, pdeTwo = 2);
+
+  { Gaps. The shape googleapis produces constantly - 0,1,2,13,14 and
+    0,100,150,200 - and the one FPC will not publish. Values spelled out
+    rather than left implicit, because it is the VALUES that decide this. }
+  TProbeGappyEnum = (pgaZero = 0, pgaFive = 5);
+
+  [TGrpcMessage]
+  TProbeEnumMsg = class
+  private
+    Fdense: TProbeDenseEnum;
+    Fgappy: TProbeGappyEnum;
+  published
+    { Consecutive on purpose, as with the four candidates above: if a compiler
+      refuses one, the error names the line and localises itself. }
+    [TProtoMember(1)] property dense: TProbeDenseEnum read Fdense write Fdense;
+    [TProtoMember(2)] property gappy: TProbeGappyEnum read Fgappy write Fgappy;
   end;
 
   [TGrpcMessage]
@@ -185,15 +261,25 @@ var
   GSeen:  Integer;
   GObj:   TProbeMsg;
   GVal:   TValue;
+  { ROUND 3 }
+  GEnumType:  TRttiType;
+  GEnumObj:   TProbeEnumMsg;
+  GDenseSeen: Boolean;
+  GGappySeen: Boolean;
 
 begin
   WriteLn('ProtoOptionalProbe round 2 - paired has-field vs class box');
   WriteLn('(round 1 settled it: published RECORDS are Delphi-only)');
   WriteLn;
 
-  GObj  := TProbeMsg.Create;
-  GCtx  := TRttiContext.Create;
-  GSeen := 0;
+  GObj := TProbeMsg.Create;
+  { Constructed although round 3 only inspects the TYPE. A class that is never
+    instantiated can be stripped by smart linking, and GetType would then
+    return nil - which reads as "no RTTI for a gappy enum", the exact false
+    negative this probe exists to avoid. Do not delete it as unused. }
+  GEnumObj := TProbeEnumMsg.Create;
+  GCtx     := TRttiContext.Create;
+  GSeen    := 0;
   try
     GType := GCtx.GetType(TProbeMsg);
     if GType = nil then
@@ -272,8 +358,74 @@ begin
     WriteLn('candidate B - the design where the has-bit cannot be desynced.');
     if GSeen < 7 then
       ExitCode := 1;
+
+    { ── ROUND 3 · ENUMRTTI-1 ─────────────────────────────────────────────
+      Reaching this line is itself half the result: if a compiler refuses a
+      published non-contiguous enum outright, the unit does not build and the
+      answer arrives as a compile error naming the `gappy` line. }
+    WriteLn;
+    WriteLn('-- round 3: may a NON-CONTIGUOUS enum be published? (ENUMRTTI-1)');
+    GDenseSeen := False;
+    GGappySeen := False;
+
+    GEnumType := GCtx.GetType(TProbeEnumMsg);
+    if GEnumType = nil then
+    begin
+      WriteLn('  FAIL: no RTTI for TProbeEnumMsg at all.');
+      ExitCode := 2;
+    end
+    else
+    begin
+      for GProp in GEnumType.GetProperties do
+      begin
+        if GProp.Visibility <> mvPublished then Continue;
+        if GProp.PropertyType = nil then
+          GKind := '<nil PropertyType>'
+        else
+          GKind := GetEnumName(TypeInfo(TTypeKind),
+                               Ord(GProp.PropertyType.TypeKind));
+        WriteLn(Format('  %-6s kind=%-18s DISCOVERED', [GProp.Name, GKind]));
+        if SameText(GProp.Name, 'dense') then GDenseSeen := True;
+        if SameText(GProp.Name, 'gappy') then GGappySeen := True;
+      end;
+
+      if not GDenseSeen then WriteLn('  dense  ABSENT');
+      if not GGappySeen then WriteLn('  gappy  ABSENT');
+
+      WriteLn;
+      if GGappySeen then
+      begin
+        WriteLn('  VERDICT: this compiler DOES publish a non-contiguous enum.');
+        WriteLn('  So the silent field loss ENUMRTTI-1 fixes is NOT present here,');
+        WriteLn('  and the Int32 surrogate costs this compiler a well-typed');
+        WriteLn('  property it did not need. That is a known price, not a bug:');
+        WriteLn('  one generated .pas is compiled by BOTH, so the surrogate has');
+        WriteLn('  to be applied on the lowest common denominator.');
+      end
+      else
+      begin
+        WriteLn('  VERDICT: this compiler does NOT publish a non-contiguous enum.');
+        WriteLn('  A field typed as one is absent from RTTI, so the codec never');
+        WriteLn('  sees it - neither encoded nor decoded, nothing raised. The');
+        WriteLn('  ENUMRTTI-1 Int32 surrogate is REQUIRED on this compiler.');
+      end;
+
+      { The control gates, the question does not. `gappy` being absent is the
+        expected, already-measured FPC result; failing on it would fail a
+        compiler for behaving exactly as documented. `dense` absent means
+        published enums are gone altogether and the run measured nothing. }
+      if not GDenseSeen then
+      begin
+        WriteLn;
+        WriteLn('  FAIL: the CONTIGUOUS control was not published either, so this');
+        WriteLn('        run cannot distinguish "gaps are the problem" from');
+        WriteLn('        "enums are not publishable at all".');
+        ExitCode := 1;
+      end;
+    end;
   finally
     GCtx.Free;
     GObj.Free;
+    GEnumObj.Free;
   end;
 end.
