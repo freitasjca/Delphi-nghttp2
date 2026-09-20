@@ -2,7 +2,17 @@
 
 **Server + client bindings for [libnghttp2](https://nghttp2.org/) in Object Pascal (Delphi + FPC).**
 
-[![Ask DeepWiki](https://devin.ai/assets/askdeepwiki.png)](https://deepwiki.com/freitasjca/Delphi-nghttp2)
+![Delphi-nghttp2](assets/logos/delphi-nghttp2-logo-480x270.png)
+
+[![Delphi](https://img.shields.io/badge/Delphi-10.4%20Sydney+-E62027?style=flat-square&logo=delphi&logoColor=white)](#requirements)
+[![Free Pascal](https://img.shields.io/badge/Free%20Pascal-3.2.2%20%7C%20trunk%203.3.1-0066CC?style=flat-square)](#requirements)
+[![Lazarus](https://img.shields.io/badge/Lazarus-matching%20FPC-6E4C9E?style=flat-square)](#requirements)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-555555?style=flat-square)](#requirements)
+[![libnghttp2](https://img.shields.io/badge/libnghttp2-%E2%89%A5%201.59-2EA043?style=flat-square)](https://nghttp2.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+[![GitHub Release](https://img.shields.io/github/v/release/freitasjca/Delphi-nghttp2?display_name=release)](https://github.com/freitasjca/Delphi-nghttp2/releases)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/freitasjca/Delphi-nghttp2)
 
 HTTP/2 transport primitives — session state, HPACK, streams, callbacks — packaged as a standalone library, plus a **framework-agnostic gRPC layer** on top: protobuf codec, service registry, dispatcher, and streaming readers and writers. Use it directly to build HTTP/2 or gRPC servers and clients in Delphi, or via the higher-level [`horse-provider-nghttp2`](https://github.com/freitasjca/horse-provider-nghttp2) glue for the [Horse](https://github.com/HashLoad/horse) web framework.
 
