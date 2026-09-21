@@ -299,11 +299,23 @@ while (( CHUNK >= 1 )); do
 done
 printf '\r%*s\r' 60 ''
 
-MIN="$GENDIR/minimal-crash-$CODE.pas"
+# $CODE is a human-readable verdict, and for the EListError arm it is the phrase
+# "raised exception internally" -- spaces and all. Interpolated raw it produced
+# `minimal-crash-raised exception internally.pas`, which every downstream use
+# then had to quote, and one that forgot would silently operate on the wrong
+# path. Slug it: non-alphanumerics to dashes, runs collapsed, ends trimmed.
+SLUG="${CODE//[^A-Za-z0-9]/-}"
+while [[ "$SLUG" == *--* ]]; do SLUG="${SLUG//--/-}"; done
+SLUG="${SLUG#-}"; SLUG="${SLUG%-}"
+
+MIN="$GENDIR/minimal-crash-$SLUG.pas"
 cp "$CUR" "$MIN" 2>/dev/null || MIN="$WORK/minimal.pas"
 echo "  reduced $N0 -> $(wc -l < "$CUR") lines in $TRIES compiles"
 echo "  minimal crashing unit written to:"
 echo "    $MIN"
+echo "  to compile it directly, rename it to the UNIT's own name -- FPC"
+echo "  requires the match and otherwise stops at 'Illegal unit name'"
+echo "  before reaching the bug, which reads like a pass. See fpc-bug/."
 echo ""
 echo "  --- it is this that still crashes ---"
 sed 's/^/    /' "$CUR" | head -60
