@@ -6,6 +6,23 @@ Attach `Corpus.S6854.Google.Iam.V3.PrincipalAccessBoundaryPolicyResources.Messag
 from this directory — do not paste it inline, since a transcription slip would
 change the identifier lengths and the reproducer would stop reproducing.
 
+**Compiling it here needs the trunk RTL units passed explicitly**, because this
+machine also has a system FPC 3.2.2 and trunk's `ppcx64` otherwise resolves
+against it and dies on `PPU Invalid Version 207 expecting 208` — which looks
+like the reproducer failing when it is really a void run that never compiled:
+
+```bash
+TU=/usr/local/fpc-trunk/lib/fpc/3.3.1/units/x86_64-linux
+/usr/local/fpc-trunk/bin/fpc -MDelphi -O1 -FU/tmp/fpcchk \
+  -Fu"$TU/rtl" -Fu"$TU/rtl-objpas" -Fu"$TU/rtl-console" \
+  -Fu"$TU/rtl-generics" -Fu"$TU/fcl-base" \
+  Corpus.S6854.Google.Iam.V3.PrincipalAccessBoundaryPolicyResources.Messages.pas
+```
+
+That `-Fu` list is a local artefact and is deliberately NOT in the report: a
+maintainer with a clean trunk install has matching RTL units on their default
+path and needs none of it.
+
 Record the issue URL here once it exists, so the next person reading
 `crash-reduce.sh` can find the upstream status without re-deriving anything.
 
@@ -53,6 +70,20 @@ fpc -MDelphi -O1 Corpus.S6854.Google.Iam.V3.PrincipalAccessBoundaryPolicyResourc
 ```
 
 Optimisation level is irrelevant: no `-O`, `-O1` and `-O2` all fail.
+
+Observed:
+
+```
+Corpus.S6854.…Messages.pas(57) Error: Compilation raised exception internally
+Fatal: Compilation aborted
+An unhandled exception occurred at $000000000047D9C7:
+EListError: List index exceeds bounds (2)
+  $000000000047D9C7
+```
+
+Line 57 of a 56-line file. The preceding "Function result does not seem to be
+set" warnings and unused-`I` notes are expected — every method body is empty by
+construction and none of them is related to the failure.
 
 ---
 
