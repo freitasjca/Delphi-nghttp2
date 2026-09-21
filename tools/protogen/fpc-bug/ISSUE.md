@@ -26,7 +26,7 @@ path and needs none of it.
 Record the issue URL here once it exists, so the next person reading
 `crash-reduce.sh` can find the upstream status without re-deriving anything.
 
-**Issue URL:** <PASTE-URL>
+**Issue URL:** https://gitlab.com/freepascal.org/fpc/source/-/issues/41921
 
 ---
 
