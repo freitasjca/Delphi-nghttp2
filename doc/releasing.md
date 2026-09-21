@@ -70,6 +70,25 @@ default prefix, at 1.21.0 (2026-09-20): COMPILED **7,239**, `compiler crashed`
 to compiled as WIRE-FORM-1 and friends landed, which is why the two rows differ
 by the same nine.
 
+**The `C<N>` column's crash count is SUSPECT and should be re-measured before it
+is used to decide anything** (2026-09-21). The lesson above — never tune against
+the crashing subset — stands and is not in question. The *number* is. Once the
+crash mechanism was established (see `crash-reduce.sh`), 88 stopped being
+explicable:
+
+- The trigger is the SUM of unit + type/class/method name lengths. A shorter
+  `--unit-prefix` lowers one term for every unit, so the total strictly falls
+  and crashes should fall with it.
+- It is length, not spelling: five unit names of identical length but sharing no
+  substring (`Corpus.S6854…`, `Zzzzzz.Y9999…`, `Aaaaaa.Bbbbb…`) all crash
+  identically, so there is no hash or collision effect that a rename could
+  re-roll.
+
+No mechanism we can find makes shorter names worse, which points at the two runs
+not having been the controlled comparison they look like. Re-run both halves at
+one commit before treating 88 as real — and until then do not cite it as the
+reason an emitter-side mitigation cannot work.
+
 The short prefix was adopted briefly on the strength of re-running only the 50
 crashing schemas, where it looked like a 43-schema win. **That sample was
 selected on the outcome** — it could not contain a schema that started crashing
