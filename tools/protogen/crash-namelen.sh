@@ -57,13 +57,35 @@
 #  identifier cannot be sufficient, because no single identifier here exceeds
 #  MAX_IDENT's 120 to begin with (the crashing type name is 41 chars).
 #
-#  STILL UNEXPLAINED, and the reason not to reach for a fix yet: releasing.md's
-#  corpus A/B has the SHORTER --unit-prefix C<N> producing MORE crashes (88 vs
-#  50). Shortening one term of a sum cannot raise the sum, so something beyond
-#  volume is at work ACROSS units even though volume is decisive WITHIN one.
-#  Reconcile that before shipping an emitter mitigation, and validate any
-#  attempt on a FULL sweep -- tuning on the crashing subset is what produced the
-#  C<N> revert and 81 new failures.
+#  ── EXPLAINED 2026-09-22 by FPC upstream (#41921). It is a COLLISION. ──
+#
+#  "Cumulative volume" was a good approximation of the wrong model. The real
+#  mechanism: rtti_mangledname() hashes a name down to fit 127 chars, then
+#  ncgrtti.pas prepends a 9-char prefix into another 127-char TIDString, and
+#  THAT truncation has no hash. Two defs in one unit whose mangled names share a
+#  long common prefix - the same long unit name - truncate to the same string,
+#  and the compiler reuses one type's RTTI record for the other.
+#
+#  So the variable is not "how much total name", it is "do two names collide
+#  after truncation". That predicts everything measured here, including the
+#  thing I had filed as unexplainable:
+#
+#    releasing.md's A/B has the SHORTER --unit-prefix C<N> producing MORE
+#    crashes (88 vs 50). Under a volume model that is impossible; under a
+#    collision model it is expected. Changing the prefix LENGTH moves where
+#    truncation cuts, so it relocates the cut into different type names and
+#    yields a DIFFERENT collision set - not a smaller one. I recorded that A/B
+#    as "suspect, re-measure" on 2026-09-21; that call was wrong, and the
+#    measurement was most likely fine.
+#
+#  It also explains why shortening the unit name fixes a given unit (the shared
+#  prefix stops eating the budget) while 498 of 1687 clean units have LONGER
+#  names (their type names do not collide after the cut).
+#
+#  NO EMITTER MITIGATION. Fixed upstream by widening two locals from TIDString
+#  to TSymStr. Nothing protogen emits could have avoided it reliably, because
+#  the overflowing string is assembled by the compiler after our identifiers
+#  are already hashed.
 #
 #  USAGE
 #    crash-namelen.sh <minimal-crash-NNNN.pas>

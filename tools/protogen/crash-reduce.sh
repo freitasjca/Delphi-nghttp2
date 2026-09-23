@@ -27,7 +27,13 @@
 #  Every 2015071503 is reported at exactly <total lines> + 1 — one line PAST
 #  end of file, in all 16 cases. FPC is dying at UNIT CLOSE.
 #
-#  ── RTTI was the obvious reading of that, and it is WRONG (2026-09-11) ──
+#  ── RTTI DIRECTIVES are not it (2026-09-11) - but see the correction below ──
+#
+#  CORRECTED 2026-09-22: the ablations here are sound and the heading this
+#  section used to carry ("RTTI ... is WRONG") was not. The directives genuinely
+#  do not control it - enum type RTTI is emitted whatever {$M+} says - but going
+#  from "these directives do not matter" to "RTTI does not matter" was a leap.
+#  Upstream's root cause is squarely in the RTTI writer. See ROOT CAUSE below.
 #
 #  Unit close is when RTTI tables are emitted, so phase 1 aimed there. On
 #  SubpropertyEventFilter every single ablation still crashed:
@@ -70,9 +76,32 @@
 #  2015071503. The 34 + 16 split in crashes.txt is one defect surfacing two ways.
 #
 #  The 56-line dependency-free reproducer is kept in fpc-bug/ - see its README.
-#  Upstream FPC bug; MAX_IDENT in Protogen.Emitter.pas bounds a SOURCE identifier
-#  and so never fires here (the crashing type name is 41 chars), which is the
-#  shape any local mitigation would have to change.
+#
+#  ── ROOT CAUSE, from FPC upstream (#41921, 2026-09-22) ──
+#
+#  Reported as freepascal.org/fpc/source#41921; a maintainer diagnosed it and
+#  posted a fix the same week. It is an RTTI-NAME COLLISION, not a size limit:
+#
+#    rtti_mangledname() already hashes its result down to fit maxidlen (127).
+#    ncgrtti.pas then PREPENDS a 9-character itp_rttidef prefix and stores the
+#    result in a TIDString - also capped at 127. That second truncation has no
+#    hash protection, so it can cut off the disambiguating hash suffix the first
+#    step added. Two defs in one unit whose mangled names share a long common
+#    prefix - i.e. the same long namespaced UNIT NAME - then truncate to the
+#    SAME string, and begin_anonymous_record() reuses one def's cached RTTI
+#    record for the other. An enum's, for a class's. Hence EListError.
+#
+#  Fix: two locals (TRTTIWriter.write_rtti, enumdef_rtti_extrasyms) changed from
+#  TIDString to TSymStr, removing the second truncation.
+#
+#  This explains every observation above - the pair that collides is why
+#  deleting EITHER the enum OR an unreferenced empty class fixes it, and why
+#  unit-name length matters (it is the shared prefix that eats the budget).
+#
+#  NO LOCAL MITIGATION. It is fixed upstream, and MAX_IDENT was never the right
+#  lever: it bounds a SOURCE identifier, while the string that overflows is the
+#  mangled name plus a prefix the compiler adds afterwards. Record the affected
+#  FPC versions instead of trying to emit around it.
 #
 #  ── THREE outcomes, never two ──
 #

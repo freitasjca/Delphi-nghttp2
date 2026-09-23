@@ -70,24 +70,31 @@ default prefix, at 1.21.0 (2026-09-20): COMPILED **7,239**, `compiler crashed`
 to compiled as WIRE-FORM-1 and friends landed, which is why the two rows differ
 by the same nine.
 
-**The `C<N>` column's crash count is SUSPECT and should be re-measured before it
-is used to decide anything** (2026-09-21). The lesson above — never tune against
-the crashing subset — stands and is not in question. The *number* is. Once the
-crash mechanism was established (see `crash-reduce.sh`), 88 stopped being
-explicable:
+**Why `C<N>` crashes MORE (88 vs 50), explained 2026-09-22.** This looked like a
+contradiction for a week and briefly got recorded here as a suspect measurement.
+It is neither: FPC upstream diagnosed the crash (freepascal.org/fpc/source#41921)
+and it is an RTTI-name COLLISION, not a size limit.
 
-- The trigger is the SUM of unit + type/class/method name lengths. A shorter
-  `--unit-prefix` lowers one term for every unit, so the total strictly falls
-  and crashes should fall with it.
-- It is length, not spelling: five unit names of identical length but sharing no
-  substring (`Corpus.S6854…`, `Zzzzzz.Y9999…`, `Aaaaaa.Bbbbb…`) all crash
-  identically, so there is no hash or collision effect that a rename could
-  re-roll.
+`rtti_mangledname()` hashes a name down to fit 127 characters; `ncgrtti.pas` then
+prepends a 9-character prefix into another 127-character `TIDString`, and that
+second truncation has no hash. Two types in one unit whose mangled names share a
+long common prefix — the same long unit name — truncate to the same string, and
+the compiler reuses one type's RTTI record for the other.
 
-No mechanism we can find makes shorter names worse, which points at the two runs
-not having been the controlled comparison they look like. Re-run both halves at
-one commit before treating 88 as real — and until then do not cite it as the
-reason an emitter-side mitigation cannot work.
+So the variable is **whether two names collide after truncation**, not how much
+name there is. Changing `--unit-prefix` length moves where the cut falls, which
+relocates it into different type names and produces a **different** collision
+set — bigger or smaller, unpredictably. 88 vs 50 is exactly what that predicts,
+and the measurement was fine.
+
+The lesson above — never tune against the crashing subset — stands, and is now
+better founded than when it was written: with a collision mechanism, the crashing
+subset is not even a stable population between runs.
+
+Fixed upstream by widening two locals to `TSymStr`. **No emitter-side mitigation
+is possible or needed**: the string that overflows is assembled by the compiler
+after our identifiers have already been hashed, so nothing protogen emits could
+avoid it reliably. Record the affected FPC versions instead.
 
 The short prefix was adopted briefly on the strength of re-running only the 50
 crashing schemas, where it looked like a 43-schema win. **That sample was

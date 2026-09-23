@@ -28,6 +28,52 @@ Record the issue URL here once it exists, so the next person reading
 
 **Issue URL:** https://gitlab.com/freepascal.org/fpc/source/-/issues/41921
 
+## RESOLVED upstream (2026-09-22) — root cause and fix
+
+A maintainer diagnosed it and posted a patch within days. It is an **RTTI-name
+collision**, not a size limit:
+
+> `rtti_mangledname()` already hashes its result down to fit `maxidlen` (127).
+> `ncgrtti.pas` then prepends a 9-character `itp_rttidef` prefix and stores the
+> result in a `TIDString` — also capped at 127. That second truncation has **no
+> hash protection**, so it can cut off the disambiguating hash the first step
+> added. Two defs in one unit whose mangled names share a long common prefix —
+> the same long namespaced unit name — truncate to an identical string, and
+> `begin_anonymous_record()` reuses one def's cached RTTI record for the other.
+> An enum's, for a class's.
+
+Fix: two locals — `TRTTIWriter.write_rtti` and `enumdef_rtti_extrasyms` — changed
+from `TIDString` to `TSymStr` (255), removing the second truncation.
+
+**Affected:** FPC 3.3.1 trunk up to and including build 2026/07/15, which is what
+we measured on. Any trunk build predating the fix will still show it.
+
+### What this confirmed, and what it corrected
+
+Confirmed: cumulative unit + type name length as the driver; enum *shape*
+irrelevant; both error codes one bug; and that deleting **either** the enum
+**or** an unreferenced empty class fixes it — those are the two halves of the
+colliding pair.
+
+Corrected, and both were ours:
+
+- **"It is not RTTI"** (`crash-reduce.sh` header). The ablations were sound —
+  `{$M+}` and `{$RTTI EXPLICIT}` really do not control it, because enum type RTTI
+  is emitted regardless — but concluding RTTI was uninvolved was a leap. It is
+  squarely the RTTI writer.
+- **"The 88-vs-50 A/B is suspect"** (`releasing.md`, recorded 2026-09-21). Under a
+  volume model a shorter prefix cannot produce more crashes; under a collision
+  model it is expected, because prefix length moves where truncation cuts and so
+  yields a different collision set rather than a smaller one. The measurement was
+  fine; the reasoning was not.
+
+### No local mitigation
+
+`MAX_IDENT` was never the right lever. The string that overflows is assembled by
+the compiler *after* our identifiers are hashed, so nothing protogen emits could
+avoid the collision reliably. The 50 crashes stay in the `compiler crashed`
+bucket until the toolchain moves past the fix.
+
 ---
 
 ## Title
