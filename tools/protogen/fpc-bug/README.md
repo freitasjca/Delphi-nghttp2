@@ -26,8 +26,20 @@ It needs no project unit: the `uses` clause was removed and it still crashes.
 
 ## What it establishes
 
-The cause is **cumulative identifier volume**, not any construct. Three
-unrelated edits each make it compile, everything else byte-identical:
+**ROOT CAUSE (FPC upstream #41921, diagnosed and fixed 2026-09-22): an RTTI-name
+collision.** `rtti_mangledname()` already hashes a name down to fit 127
+characters; `ncgrtti.pas` then prepends a 9-character prefix and stores the
+result in a `TIDString` — also capped at 127 — and *that* truncation has no hash
+protection. Two types in one unit whose mangled names share a long common prefix
+(the same long namespaced unit name) truncate to an identical string, and
+`begin_anonymous_record()` reuses one type's cached RTTI record for the other:
+an enum's, for a class's. Fixed by widening two locals to `TSymStr`.
+
+The observations below were how it was narrowed down before upstream answered.
+"Cumulative identifier volume" was a good approximation of the wrong model — the
+real variable is whether two names *collide* after truncation, which is why
+deleting **either** member of the colliding pair fixes it. Three unrelated edits
+each make it compile, everything else byte-identical:
 
 - shorten the unit name from 74 characters to 69
 - delete the enum
@@ -48,15 +60,20 @@ only `published` to `public` reports `Internal error 2015071503` instead. The
 Full derivation in `crash-reduce.sh`'s header; the length sweep is in
 `crash-namelen.sh`.
 
-## Why there is no local workaround yet
+## Why there is no local workaround — settled, not pending
 
 `MAX_IDENT` in `Protogen.Emitter.pas` bounds a *source* identifier at 120. The
 type name that triggers this is 41 characters, so it never fires — the limit
 measures a string that is never the one overflowing.
 
-A mitigation would have to bound combined volume instead, and that is not a
-change to make casually: `releasing.md` records a corpus A/B where the *shorter*
-`--unit-prefix` produced *more* crashes (88 vs 50), which no volume model
-explains. Reconcile that first, and validate on a full
-`compile-check.sh --all` — tuning against the crashing subset is what produced
-the `C<N>` revert and 81 new failures.
+And no emitter change can help, because the string that overflows is assembled
+by the compiler *after* our identifiers have already been hashed. There is
+nothing protogen could emit differently. The crashes clear when the toolchain
+moves past the upstream fix.
+
+This also explains the one observation that looked impossible: `releasing.md`
+records a corpus A/B where the *shorter* `--unit-prefix` produced *more* crashes
+(88 vs 50). Under a volume model that cannot happen; under a collision model it
+is expected, because prefix length moves where truncation cuts and so yields a
+*different* collision set rather than a smaller one. That A/B was briefly filed
+as a suspect measurement on 2026-09-21 — it was not; the model was.
