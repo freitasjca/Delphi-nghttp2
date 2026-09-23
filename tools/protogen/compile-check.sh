@@ -304,10 +304,11 @@ while IFS=$'\t' read -r N proto; do
     # what we generate - "Internal error 2015071505", "Compilation raised
     # exception internally", "List index exceeds bounds" - and counting those
     # as emitter defects overstated the number by 3.5x on the first full sweep
-    # (76 reported, 22 real). Long identifiers CAUSE it — established 2026-09-20,
-    # see crash-reduce.sh's header. MAX_IDENT in Protogen.Emitter.pas exists for
-    # this same FPC behaviour but bounds a SOURCE identifier, which is not the
-    # string that overflows, so it never fires on these.
+    # (76 reported, 22 real). Root cause is an RTTI-name collision in FPC itself
+    # — freepascal.org/fpc/source#41921, fixed 2026-09-22; see crash-reduce.sh's
+    # header. MAX_IDENT in Protogen.Emitter.pas exists for a related limit but
+    # bounds a SOURCE identifier, which is not the string that overflows, so it
+    # never fires on these and no emitter change can.
     if grep -qE "Internal error|raised exception internally|List index exceeds bounds" \
          "$D/build.log"; then
       CRASH=$(( CRASH + 1 ))
@@ -359,12 +360,18 @@ if [[ $CRASH -gt 0 ]]; then
   echo
   echo "-- FPC crashed on these ----------------------------------"
   echo "   Counted apart because the compiler DIED rather than"
-  echo "   reporting our output invalid. CAUSE ESTABLISHED"
-  echo "   2026-09-20: cumulative identifier volume, not any"
-  echo "   construct - shortening the unit name, deleting an enum"
-  echo "   or deleting an UNREFERENCED empty class each fix it."
-  echo "   Upstream FPC bug; 56-line reproducer in fpc-bug/."
-  echo "   See crash-reduce.sh's header for the full derivation."
+  echo "   reporting our output invalid. ROOT CAUSE, from FPC"
+  echo "   upstream (#41921, diagnosed and fixed 2026-09-22): an"
+  echo "   RTTI-NAME COLLISION. rtti_mangledname() hashes a name"
+  echo "   to fit 127 chars; ncgrtti.pas then prepends a 9-char"
+  echo "   prefix into another 127-char TIDString, and THAT"
+  echo "   truncation has no hash - so two types in one unit"
+  echo "   sharing a long unit-name prefix truncate alike, and"
+  echo "   one reuses the other's RTTI record."
+  echo "   NOT fixable from here: the string that overflows is"
+  echo "   assembled after our identifiers are already hashed."
+  echo "   Clears when the toolchain moves past the fix."
+  echo "   Reproducer and the full report in fpc-bug/."
   head -12 "$OUT/crashes.txt" | sed 's/^/  /'
   echo "   full list: $OUT/crashes.txt"
 fi
