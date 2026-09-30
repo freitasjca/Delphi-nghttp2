@@ -366,7 +366,14 @@ var
   LResult: TValue;
 begin
   SetLength(LArgs, 1);
-  LArgs[0] := TValue.From<TObject>(ARequest);
+  { FIX-GRPC-FPC-INVOKE-1: TValue.Make with the declared parameter TypeInfo,
+    not TValue.From<TObject>.  FPC's TRttiMethod.Invoke validates argument
+    TValue types strictly — a TObject-typed TValue where the method expects
+    TGreetRequest raises an exception, caught by the dispatcher as grpc-status
+    13.  Exact same rule that required TValue.From<T> (not <IInterface>) for
+    the instance value below.  RegisterService<T> already validates that
+    GetParameters[0].ParamType is non-nil and tkClass. }
+  TValue.Make(@ARequest, FMethod.GetParameters[0].ParamType.Handle, LArgs[0]);
 
   { Invoke on the interface reference — RTTI dispatches through the vtable.
     `_AddRef`/`_Release` returning -1 on the impl prevents ARC from
