@@ -115,6 +115,7 @@ arrived here in **1.0.0**.
 | **Group-B scalar wire forms — WIRE-FORM-1** | **✓** (1.20.0 — `TProtoMemberWireForm` selects the wire encoding for sint32/sint64 (`pwfZigZag`) and fixed32/fixed64/sfixed32/sfixed64 (`pwfFixed`) via `[TProtoMember(N, pwfZigZag)]` / `[TProtoMember(N, pwfFixed)]`; protogen emits the correct attribute for all six types; the 7 googleapis schemas previously refused for Group-B scalars now compile) |
 | OpenSSL 3.x + 1.1.x FFI with auto-detect + `SetDllDirectory` for local libs | **✓** |
 | mTLS (client cert verification) | **✓** |
+| **TLS 1.2 and TLS 1.3 cipher configuration** (`SetTls12CipherRules`, `SetTls13CipherSuites` on `TTlsServerContext`) | **✓** (1.22.0, TLSCIPHER-1 — OpenSSL configures the two generations through separate calls, and the TLS 1.2 rule list never affects TLS 1.3, so there are two setters. `SetTls13CipherSuites` reads the effective list back and raises naming any suite that is missing: OpenSSL returns success and **silently drops** a misspelled or wrongly-cased name sitting next to a valid one. The cipher symbols are optional at load time, so an OpenSSL older than 1.1.1 fails only the TLS 1.3 setter, not all of TLS) |
 | Password-protected private keys (`SSL_CTX_set_default_passwd_cb`) | **implemented, untested** — callback wired, no fixture uses an encrypted key |
 | **Async dispatch** — host answers `OnRequest` off the connection thread | **✓** |
 | **Graceful shutdown** — drain contract + two-stage GOAWAY (RFC 9113 §6.8) | **✓** |

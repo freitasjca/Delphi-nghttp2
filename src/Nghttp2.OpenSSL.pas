@@ -64,6 +64,8 @@ type
   PSSL        = Pointer;
   PBIO        = Pointer;
   PSSL_METHOD = Pointer;
+  PSSL_CIPHER = Pointer;      // const SSL_CIPHER * — owned by OpenSSL, never freed
+  POPENSSL_STACK = Pointer;   // STACK_OF(...) — opaque; walk with OPENSSL_sk_*
 
   // ─── ALPN server-side callback signature (openssl/ssl.h) ─────────────────
   // Returns SSL_TLSEXT_ERR_* to indicate whether a protocol was selected.
@@ -212,6 +214,34 @@ var
   // ─── Error introspection ─────────────────────────────────────────────────
   ERR_get_error:      function: Cardinal; cdecl;
   ERR_error_string_n: procedure(e: Cardinal; buf: PAnsiChar; len: NativeUInt); cdecl;
+
+  // ─── Cipher configuration + read-back (TLSCIPHER-1, 1.22.0) ─────────────
+  // OPTIONAL symbols. Everything above is REQUIRED - one missing symbol fails
+  // the whole load, and with it every TLS connection. These six serve only
+  // the cipher setters on TTlsServerContext, so a runtime lacking one must
+  // fail THAT feature, not all of TLS. The concrete case: this unit accepts
+  // any 1.1.x, and SSL_CTX_set_ciphersuites only exists from 1.1.1, so
+  // making it required would turn a TLS 1.3 cipher feature into a load
+  // failure on a 1.1.0 runtime. Callers test Assigned() before use. They are
+  // reset to nil on unload, so Assigned() never sees a stale pointer.
+  //
+  // Two calls because OpenSSL configures the two protocol generations
+  // separately, with different syntax:
+  //   set_cipher_list  - TLS <= 1.2 only, OpenSSL rule language
+  //                      (aliases, '!' exclusions, @SECLEVEL). Never affects
+  //                      TLS 1.3 - but an @SECLEVEL in it changes the
+  //                      context-wide security level, which TLS 1.3 obeys.
+  //   set_ciphersuites - TLS 1.3 only (1.1.1+), exact names, colon list.
+  SSL_CTX_set_cipher_list:  function(ctx: PSSL_CTX; const str: PAnsiChar): Integer; cdecl;
+  SSL_CTX_set_ciphersuites: function(ctx: PSSL_CTX; const str: PAnsiChar): Integer; cdecl;
+  // Read-back: the context's effective list, TLS 1.3 suites first. Returns
+  // OpenSSL's internal stack - do NOT free it.
+  SSL_CTX_get_ciphers:      function(ctx: PSSL_CTX): POPENSSL_STACK; cdecl;
+  SSL_CIPHER_get_name:      function(c: PSSL_CIPHER): PAnsiChar; cdecl;
+  // libcrypto. sk_SSL_CIPHER_num/_value are macros over these (1.1.0+).
+  // OPENSSL_sk_num returns -1 for a nil stack.
+  OPENSSL_sk_num:           function(st: POPENSSL_STACK): Integer; cdecl;
+  OPENSSL_sk_value:         function(st: POPENSSL_STACK; i: Integer): Pointer; cdecl;
 
 // Bytes buffered in a memory BIO and not yet read out. OpenSSL exposes this
 // as a macro over BIO_ctrl, so it has to be written out by hand here.
@@ -458,6 +488,39 @@ begin
   Result := True;
 end;
 
+// TLSCIPHER-1: the optional symbols declared after ERR_error_string_n. Runs
+// only after ResolveSymbols succeeded, and assigns every pointer - nil when
+// the symbol is absent - so a reload against a different OpenSSL cannot
+// inherit a pointer from the previous library.
+procedure ResolveOptionalSymbols(ALibSsl, ALibCrypto: TDllHandle);
+
+  // Same shape as ResolveSymbols.GetFrom - the `out ADest: Pointer` +
+  // Pointer(@var) idiom already compiles on both Delphi and FPC - but the
+  // result is ignored: nil simply means "not available".
+  procedure GetOptional(AHandle: TDllHandle; const AName: string; out ADest: Pointer);
+  begin
+    ADest := DoGetSym(AHandle, AName);
+  end;
+
+begin
+  GetOptional(ALibSsl,    'SSL_CTX_set_cipher_list',  Pointer(@SSL_CTX_set_cipher_list));
+  GetOptional(ALibSsl,    'SSL_CTX_set_ciphersuites', Pointer(@SSL_CTX_set_ciphersuites));
+  GetOptional(ALibSsl,    'SSL_CTX_get_ciphers',      Pointer(@SSL_CTX_get_ciphers));
+  GetOptional(ALibSsl,    'SSL_CIPHER_get_name',      Pointer(@SSL_CIPHER_get_name));
+  GetOptional(ALibCrypto, 'OPENSSL_sk_num',           Pointer(@OPENSSL_sk_num));
+  GetOptional(ALibCrypto, 'OPENSSL_sk_value',         Pointer(@OPENSSL_sk_value));
+end;
+
+procedure ClearOptionalSymbols;
+begin
+  SSL_CTX_set_cipher_list  := nil;
+  SSL_CTX_set_ciphersuites := nil;
+  SSL_CTX_get_ciphers      := nil;
+  SSL_CIPHER_get_name      := nil;
+  OPENSSL_sk_num           := nil;
+  OPENSSL_sk_value         := nil;
+end;
+
 function OsLoadError: string;
 begin
 {$IF DEFINED(MSWINDOWS)}
@@ -519,6 +582,8 @@ begin
     GLibCrypto := HANDLE_ZERO;
     Exit;
   end;
+
+  ResolveOptionalSymbols(GLibSSL, GLibCrypto);
 
   GVersion := ALabel;
   Result   := True;
@@ -594,6 +659,7 @@ begin
   GLoadLock.Enter;
   try
     if not GLoaded then Exit;
+    ClearOptionalSymbols;
     DoUnloadLib(GLibSSL);
     DoUnloadLib(GLibCrypto);
     GLibSSL    := HANDLE_ZERO;

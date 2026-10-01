@@ -126,6 +126,38 @@ type
     // before serving.
     procedure EnableClientCertVerification(const ACaFile: string);
 
+    // [TLSCIPHER-1, 1.22.0] Cipher configuration. OpenSSL configures the
+    // two protocol generations through separate calls with separate syntax,
+    // so there are two setters. Neither affects the other's list.
+    // Shared contract:
+    //   - Call before serving: the first accepted connection snapshots the
+    //     context.
+    //   - Empty string = no call: the OpenSSL default stays. It never
+    //     resets or disables anything.
+    //   - Raises ENghttp2Tls when the loaded OpenSSL lacks the call, or the
+    //     value can't be applied. After a raise the context is partly
+    //     configured - discard it, don't serve from it.
+    //
+    // TLS <= 1.2 rule string -> SSL_CTX_set_cipher_list, in OpenSSL rule
+    // syntax, e.g. 'ECDHE+AESGCM:!aNULL'. Raises if NO TLS 1.2 cipher
+    // matches. Limitation: an unknown name next to a valid one is silently
+    // dropped (measured on OpenSSL 3.0.13), and rule strings use aliases
+    // and exclusions, so they can't be checked name by name. An
+    // '@SECLEVEL=n' here sets the context-wide security level, which TLS 1.3
+    // handshakes obey too. For h2 over TLS 1.2, keep at least one cipher
+    // RFC 7540 9.2.2 permits (an ECDHE AEAD suite), or clients may refuse
+    // with INADEQUATE_SECURITY.
+    procedure SetTls12CipherRules(const ARules: string);
+
+    // TLS 1.3 suites -> SSL_CTX_set_ciphersuites (OpenSSL 1.1.1+). Exact,
+    // case-sensitive names, colon-separated, in priority order, e.g.
+    // 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256'. OpenSSL drops
+    // an unknown name SILENTLY when a valid one is next to it, so after the
+    // call this reads the effective list back and raises naming every
+    // requested suite that is absent: a typo, a wrong case, or a suite this
+    // OpenSSL build lacks.
+    procedure SetTls13CipherSuites(const ASuites: string);
+
     property Handle: PSSL_CTX read GetHandle;
   end;
 
@@ -592,6 +624,120 @@ begin
   SSL_CTX_set_verify(FCtx,
     SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
     nil);
+end;
+
+// ─── Cipher configuration (TLSCIPHER-1) ─────────────────────────────────
+
+// The context's effective cipher names, as ':NAME1:NAME2:...:' so that a
+// whole-name membership test is Pos(':' + Name + ':'). The stack belongs to
+// OpenSSL and is not freed. Includes the TLS 1.2 names too; harmless, since
+// it is only searched for TLS 1.3 names.
+function ContextCipherNames(ACtx: PSSL_CTX): string;
+var
+  LStack: POPENSSL_STACK;
+  LName:  PAnsiChar;
+  I, N:   Integer;
+begin
+  Result := ':';
+  LStack := SSL_CTX_get_ciphers(ACtx);
+  N := OPENSSL_sk_num(LStack);   // -1 for a nil stack, so the loop is skipped
+  for I := 0 to N - 1 do
+  begin
+    LName := SSL_CIPHER_get_name(OPENSSL_sk_value(LStack, I));
+    if LName <> nil then
+      Result := Result + string(AnsiString(LName)) + ':';
+  end;
+end;
+
+// Requested names (colon-separated, spaces trimmed - OpenSSL trims them too)
+// that are missing from AHave, joined with ', '. Case-sensitive on purpose:
+// OpenSSL is, and silently drops 'tls_aes_256_gcm_sha384' (measured).
+function MissingCipherNames(const ARequested, AHave: string): string;
+var
+  LRest, LName: string;
+  P: Integer;
+begin
+  Result := '';
+  LRest := ARequested;
+  while LRest <> '' do
+  begin
+    P := Pos(':', LRest);
+    if P = 0 then
+    begin
+      LName := LRest;
+      LRest := '';
+    end
+    else
+    begin
+      LName := Copy(LRest, 1, P - 1);
+      Delete(LRest, 1, P);
+    end;
+    LName := Trim(LName);
+    if (LName <> '') and (Pos(':' + LName + ':', AHave) = 0) then
+    begin
+      if Result <> '' then
+        Result := Result + ', ';
+      Result := Result + LName;
+    end;
+  end;
+end;
+
+procedure TTlsServerContext.SetTls12CipherRules(const ARules: string);
+var
+  LAnsi: AnsiString;
+begin
+  if ARules = '' then Exit;
+  if not Assigned(SSL_CTX_set_cipher_list) then
+    raise ENghttp2Tls.CreateFmt(
+      'SetTls12CipherRules: the loaded OpenSSL (%s) does not export ' +
+      'SSL_CTX_set_cipher_list; TLS 1.2 cipher rules cannot be applied.',
+      [NghttpsslVersion]);
+  LAnsi := AnsiString(ARules);
+  // Return code is a sufficient check here, and the only one possible:
+  // OpenSSL fails with "no cipher match" when no TLS 1.2 cipher survives
+  // the rules (measured, 3.0.13), and rule strings can't be compared by
+  // name. See the interface comment for what this does NOT catch.
+  if SSL_CTX_set_cipher_list(FCtx, PAnsiChar(LAnsi)) <> 1 then
+    raise ENghttp2Tls.CreateFmt(
+      'SSL_CTX_set_cipher_list("%s") failed - no TLS 1.2 cipher matched ' +
+      'these rules: %s', [ARules, NghttpsslLastError]);
+end;
+
+procedure TTlsServerContext.SetTls13CipherSuites(const ASuites: string);
+var
+  LAnsi:    AnsiString;
+  LMissing: string;
+begin
+  if ASuites = '' then Exit;
+  if not Assigned(SSL_CTX_set_ciphersuites) then
+    raise ENghttp2Tls.CreateFmt(
+      'SetTls13CipherSuites: the loaded OpenSSL (%s) does not export ' +
+      'SSL_CTX_set_ciphersuites, which needs OpenSSL 1.1.1 or later. ' +
+      'TLS 1.3 cipher suites cannot be applied.', [NghttpsslVersion]);
+  // The read-back is part of the contract, not an extra: without it a typo
+  // next to a valid name goes through silently. All four exist wherever
+  // set_ciphersuites does (1.1.0+ vs 1.1.1+), so this guards a broken
+  // runtime, not a supported one - and refuses rather than skipping.
+  if not (Assigned(SSL_CTX_get_ciphers) and Assigned(SSL_CIPHER_get_name)
+          and Assigned(OPENSSL_sk_num) and Assigned(OPENSSL_sk_value)) then
+    raise ENghttp2Tls.CreateFmt(
+      'SetTls13CipherSuites: the loaded OpenSSL (%s) lacks the symbols ' +
+      'needed to verify the suites were applied; refusing to configure ' +
+      'them unverified.', [NghttpsslVersion]);
+
+  LAnsi := AnsiString(ASuites);
+  if SSL_CTX_set_ciphersuites(FCtx, PAnsiChar(LAnsi)) <> 1 then
+    raise ENghttp2Tls.CreateFmt(
+      'SSL_CTX_set_ciphersuites("%s") failed - no TLS 1.3 suite matched: %s',
+      [ASuites, NghttpsslLastError]);
+
+  LMissing := MissingCipherNames(ASuites, ContextCipherNames(FCtx));
+  if LMissing <> '' then
+    raise ENghttp2Tls.CreateFmt(
+      'SetTls13CipherSuites: OpenSSL accepted "%s" but silently dropped: %s. ' +
+      'Each is unknown, wrongly cased, or unavailable in this OpenSSL build ' +
+      '(%s). Names are exact and case-sensitive, e.g. TLS_AES_256_GCM_SHA384.',
+      [ASuites, LMissing, NghttpsslVersion]);
 end;
 
 // ─── TTlsConnection ─────────────────────────────────────────────────────

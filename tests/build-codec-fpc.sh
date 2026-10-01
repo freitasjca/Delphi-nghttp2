@@ -27,6 +27,11 @@
 #    3c Nghttp2ServerSmoke              build + run   (gates; the only stage
 #                                       that STARTS a server. Skips LOUDLY
 #                                       when libnghttp2 is absent.)
+#    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
+#                                       TLS 1.2/1.3 cipher setters read back
+#                                       from OpenSSL. Skips LOUDLY when
+#                                       OpenSSL is absent. Same name as the
+#                                       run-tests.bat stage.)
 #    3b Nghttp2ProtobufConformance      build + run   (reports; gates only on
 #                                                      a BROKEN probe)
 #    4  samples/grpc-server             compile only  (gates)
@@ -625,6 +630,46 @@ else
     echo "    full log: $AOUT/build.log"
     RC=2
   fi
+fi
+
+# ── 4i · TLS 1.2 / 1.3 cipher setters (TLSCIPHER-1) ─────────────────────────
+# SetTls12CipherRules / SetTls13CipherSuites on a real TTlsServerContext, every
+# result READ BACK from OpenSSL's effective list — "did not raise" is never
+# taken as success, since a setter that silently did nothing passes that.
+# Needs OpenSSL only: no libnghttp2, no socket, no cert. Exit 3 = OpenSSL
+# absent, a LOUD skip. The CONTROL line is informational: whether this OpenSSL
+# silently drops a typo next to a valid suite name (3.0.13 does), which is why
+# the TLS 1.3 setter reads back. Covers three of the four levels (API, applied,
+# kept); the wire level is the provider TLS suite's job.
+echo
+echo "── TLS cipher setters (TLSCIPHER-1) ──────────────────────────────────"
+if [[ -f "$HERE/Nghttp2CipherConfig.dpr" ]]; then
+  CCOUT="$OUT/cipher-config"
+  mkdir -p "$CCOUT"
+  rm -f "$CCOUT"/*.ppu "$CCOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$CCOUT" -FE"$CCOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2CipherConfig.dpr" > "$CCOUT/build.log" 2>&1 \
+     && [[ -x "$CCOUT/Nghttp2CipherConfig" ]]; then
+    "$CCOUT/Nghttp2CipherConfig" < /dev/null | sed 's/^/  /'
+    CC_RC=${PIPESTATUS[0]}
+    case "$CC_RC" in
+      0) echo "  cipher setters: PASSED" ;;
+      3) echo "  SKIP  OpenSSL absent - the cipher setters were NOT exercised by"
+         echo "        this run. Every other stage passes without it." ;;
+      *) echo "  FAIL  TLS cipher setters"
+         [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2CipherConfig.dpr did not compile"
+    grep -E "Error|Fatal" "$CCOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $CCOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2CipherConfig.dpr not present"
 fi
 
 # ── read timeout (CL2c) — the one stage that can HANG instead of failing ─────

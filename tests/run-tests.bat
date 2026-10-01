@@ -34,6 +34,10 @@ REM    4g Nghttp2FloodRead                compile only  (gates on compile fail;
 REM                                       RSS check is Linux-only, skipped here)
 REM    4h Nghttp2ConnectTimeout           build + run   (gates; cmd has no
 REM                                       watchdog - a hang IS the result)
+REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
+REM                                       TLS 1.2/1.3 cipher setters, read
+REM                                       back from OpenSSL. Skips LOUDLY
+REM                                       when OpenSSL is absent.)
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
 REM    6  ProtogenEmitTests               build + run   (gates) - same dir
@@ -515,6 +519,20 @@ echo -- Nghttp2ConnectTimeout --------------------------------------------------
 echo    SKIP  Nghttp2ConnectTimeout.dpr not present
 
 :after_connecttimeout
+
+REM -- Stage 4i. TLS 1.2 / 1.3 cipher setters (TLSCIPHER-1). ----------------
+REM
+REM SetTls12CipherRules / SetTls13CipherSuites on a real TTlsServerContext,
+REM every result READ BACK from OpenSSL's effective list. "Did not raise" is
+REM never taken as success: a setter that silently did nothing passes that.
+REM Needs OpenSSL only - no libnghttp2, no socket, no cert. Exit 3 = OpenSSL
+REM absent, a loud skip. The CONTROL line is informational: it shows whether
+REM this OpenSSL silently drops a typo next to a valid suite name (3.0.13
+REM does), which is why the TLS 1.3 setter reads back.
+set "STAGE=Nghttp2CipherConfig"
+set "GATES=1"
+set "SKIPRC=3"
+call :build_run
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in

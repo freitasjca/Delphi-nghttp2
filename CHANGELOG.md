@@ -13,6 +13,8 @@ The project has been on `1.x` since its first public tag.
 
 | Version | Date | Headline |
 |---|---|---|
+| [1.22.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.22.0) | 2026-10-01 | TLS 1.2 and TLS 1.3 cipher configuration, verified by read-back |
+| [1.21.1](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.21.1) | 2026-09-30 | |
 | [1.21.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.21.0) | 2026-09-20 | enum fields that were never on the wire |
 | [1.20.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.20.0) | 2026-09-19 | |
 | [1.19.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.19.0) | 2026-09-18 | |
