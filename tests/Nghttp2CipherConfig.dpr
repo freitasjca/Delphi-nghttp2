@@ -10,7 +10,9 @@ program Nghttp2CipherConfig;
 //
 //  ASKS: do TTlsServerContext.SetTls12CipherRules / SetTls13CipherSuites
 //  apply what they are given, refuse what they cannot apply, and leave the
-//  other generation's list alone?
+//  other generation's list alone? And (MINVER-1, 1.23.0, cases 25-31) does
+//  SetMinProtocolVersion set the minimum, leave the cipher lists alone, and
+//  refuse when the minimum does not take?
 //
 //  Every assertion reads back the context's EFFECTIVE cipher list through
 //  OpenSSL. "The setter did not raise" is never accepted as success on its
@@ -62,6 +64,9 @@ type
 
 var
   GPass: Integer = 0;
+  // MINVER-1 case 31: the real SSL_CTX_ctrl, restored after the fault test.
+  GRealCtrl: function(ctx: PSSL_CTX; cmd: Integer; larg: LongInt;
+                      parg: Pointer): LongInt; cdecl = nil;
   GFail: Integer = 0;
   GControlSilent: Boolean = False;
 
@@ -126,6 +131,41 @@ begin
       AMsg   := E.Message;
     end;
   end;
+end;
+
+// The test's OWN read of the minimum, through the raw call, so it does not
+// agree with the library's read-back by construction.
+function MinVersionOf(ACtx: TTlsServerContext): LongInt;
+begin
+  Result := SSL_CTX_ctrl(ACtx.Handle, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, nil);
+end;
+
+// Same shape as ApplyCatch, for SetMinProtocolVersion.
+function ApplyMin(ACtx: TTlsServerContext; AVersion: TNghttp2TlsMinVersion;
+  out AMsg: string): string;
+begin
+  Result := '';
+  AMsg   := '';
+  try
+    ACtx.SetMinProtocolVersion(AVersion);
+  except
+    on E: Exception do
+    begin
+      Result := E.ClassName;
+      AMsg   := E.Message;
+    end;
+  end;
+end;
+
+// Case 31's fault: reports success for SET_MIN_PROTO_VERSION but changes
+// nothing, which only a read-back can notice. Everything else passes through.
+function IgnoringCtrl(ctx: PSSL_CTX; cmd: Integer; larg: LongInt;
+  parg: Pointer): LongInt; cdecl;
+begin
+  if cmd = SSL_CTRL_SET_MIN_PROTO_VERSION then
+    Result := 1
+  else
+    Result := GRealCtrl(ctx, cmd, larg, parg);
 end;
 
 var
@@ -302,6 +342,41 @@ begin
       Has(LNames, S_CHACHA) and not Has(LNames, S_AES256), LNames);
   finally
     LCtx.Free;
+  end;
+
+  // ── MINVER-1 · minimum protocol version ───────────────────────────────
+  Check('25 SSL_CTX_ctrl resolved (minimum-version symbol)',
+    Assigned(SSL_CTX_ctrl), NghttpsslVersion);
+  if Assigned(SSL_CTX_ctrl) then
+  begin
+    LCtx := TTlsServerContext.Create;
+    try
+      LNames := EffectiveNames(LCtx);
+      LCls := ApplyMin(LCtx, ntmTls13, LMsg);
+      Check('26 minimum TLS 1.3: accepted', LCls = '', LCls + ': ' + LMsg);
+      Check('27 ... the context REPORTS minimum TLS 1.3',
+        MinVersionOf(LCtx) = TLS1_3_VERSION, Format('$%.4x', [MinVersionOf(LCtx)]));
+      Check('28 ... cipher lists untouched by the minimum',
+        EffectiveNames(LCtx) = LNames, EffectiveNames(LCtx));
+      LCls := ApplyMin(LCtx, ntmTls12, LMsg);
+      Check('29 minimum TLS 1.2: accepted', LCls = '', LCls + ': ' + LMsg);
+      Check('30 ... the context REPORTS minimum TLS 1.2',
+        MinVersionOf(LCtx) = TLS1_2_VERSION, Format('$%.4x', [MinVersionOf(LCtx)]));
+    finally
+      LCtx.Free;
+    end;
+
+    LCtx := TTlsServerContext.Create;
+    GRealCtrl := SSL_CTX_ctrl;
+    SSL_CTX_ctrl := IgnoringCtrl;
+    try
+      LCls := ApplyMin(LCtx, ntmTls13, LMsg);
+    finally
+      SSL_CTX_ctrl := GRealCtrl;
+      LCtx.Free;
+    end;
+    Check('31 a minimum that reports success but does not take: refused by the READ-BACK',
+      (LCls = 'ENghttp2Tls') and (Pos('context reports', LMsg) > 0), LCls + ': ' + LMsg);
   end;
 
   WriteLn;

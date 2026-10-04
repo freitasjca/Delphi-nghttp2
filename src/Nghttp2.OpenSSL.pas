@@ -120,6 +120,13 @@ const
   SSL_VERIFY_CLIENT_ONCE          = $04;
   SSL_VERIFY_POST_HANDSHAKE       = $08;
 
+  // ─── Protocol versions + SSL_CTX_ctrl commands (MINVER-1, 1.23.0) ────────
+  // SSL_CTX_set/get_min_proto_version are macros over SSL_CTX_ctrl.
+  TLS1_2_VERSION                  = $0303;
+  TLS1_3_VERSION                  = $0304;
+  SSL_CTRL_SET_MIN_PROTO_VERSION  = 123;
+  SSL_CTRL_GET_MIN_PROTO_VERSION  = 130;
+
 var
   // ─── Method factories (unified TLS_*_method since 1.1.0) ────────────────
   TLS_server_method: function: PSSL_METHOD; cdecl;
@@ -242,6 +249,14 @@ var
   // OPENSSL_sk_num returns -1 for a nil stack.
   OPENSSL_sk_num:           function(st: POPENSSL_STACK): Integer; cdecl;
   OPENSSL_sk_value:         function(st: POPENSSL_STACK; i: Integer): Pointer; cdecl;
+
+  // ─── Minimum protocol version (MINVER-1, 1.23.0) ─────────────────────────
+  // OPTIONAL, same rule as the cipher symbols: it serves only
+  // TTlsServerContext.SetMinProtocolVersion. Declared like BIO_ctrl (LongInt
+  // for C long), which BIO_pending already proves on both compilers; the
+  // values passed and returned here (0, 1, $0303, $0304) fit either width.
+  SSL_CTX_ctrl:             function(ctx: PSSL_CTX; cmd: Integer; larg: LongInt;
+                                     parg: Pointer): LongInt; cdecl;
 
 // Bytes buffered in a memory BIO and not yet read out. OpenSSL exposes this
 // as a macro over BIO_ctrl, so it has to be written out by hand here.
@@ -509,6 +524,7 @@ begin
   GetOptional(ALibSsl,    'SSL_CIPHER_get_name',      Pointer(@SSL_CIPHER_get_name));
   GetOptional(ALibCrypto, 'OPENSSL_sk_num',           Pointer(@OPENSSL_sk_num));
   GetOptional(ALibCrypto, 'OPENSSL_sk_value',         Pointer(@OPENSSL_sk_value));
+  GetOptional(ALibSsl,    'SSL_CTX_ctrl',             Pointer(@SSL_CTX_ctrl));
 end;
 
 procedure ClearOptionalSymbols;
@@ -519,6 +535,7 @@ begin
   SSL_CIPHER_get_name      := nil;
   OPENSSL_sk_num           := nil;
   OPENSSL_sk_value         := nil;
+  SSL_CTX_ctrl             := nil;
 end;
 
 function OsLoadError: string;

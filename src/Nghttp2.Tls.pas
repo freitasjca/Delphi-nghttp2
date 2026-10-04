@@ -85,6 +85,10 @@ type
   { Owns one SSL_CTX for the lifetime of the server. Load cert+key ONCE at
     startup; every accepted connection borrows the same context via
     TTlsConnection.Create(AContext, ASocket). }
+  // MINVER-1 (1.23.0): the lowest protocol version a server context accepts.
+  // ntmTls12 = TLS 1.2 or newer; ntmTls13 = TLS 1.3 only.
+  TNghttp2TlsMinVersion = (ntmTls12, ntmTls13);
+
   TTlsServerContext = class
   strict private
     FCtx:      PSSL_CTX;
@@ -157,6 +161,14 @@ type
     // requested suite that is absent: a typo, a wrong case, or a suite this
     // OpenSSL build lacks.
     procedure SetTls13CipherSuites(const ASuites: string);
+
+    // Minimum protocol version -> SSL_CTX_set_min_proto_version (a macro over
+    // SSL_CTX_ctrl). ntmTls13 = TLS 1.3 only. The maximum is untouched, so
+    // ntmTls12 still allows TLS 1.3. Reads the minimum back from the context
+    // and raises if it is not exactly what was asked - a setting that reports
+    // success but does not take is the defect this library exists to catch.
+    // Same failure contract as the cipher setters: discard the context.
+    procedure SetMinProtocolVersion(AVersion: TNghttp2TlsMinVersion);
 
     property Handle: PSSL_CTX read GetHandle;
   end;
@@ -738,6 +750,31 @@ begin
       'Each is unknown, wrongly cased, or unavailable in this OpenSSL build ' +
       '(%s). Names are exact and case-sensitive, e.g. TLS_AES_256_GCM_SHA384.',
       [ASuites, LMissing, NghttpsslVersion]);
+end;
+
+procedure TTlsServerContext.SetMinProtocolVersion(AVersion: TNghttp2TlsMinVersion);
+var
+  LWant, LGot: LongInt;
+begin
+  if not Assigned(SSL_CTX_ctrl) then
+    raise ENghttp2Tls.CreateFmt(
+      'SetMinProtocolVersion: the loaded OpenSSL (%s) does not export ' +
+      'SSL_CTX_ctrl; the minimum TLS version cannot be applied.',
+      [NghttpsslVersion]);
+  if AVersion = ntmTls13 then
+    LWant := TLS1_3_VERSION
+  else
+    LWant := TLS1_2_VERSION;
+  if SSL_CTX_ctrl(FCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, LWant, nil) <> 1 then
+    raise ENghttp2Tls.CreateFmt(
+      'SSL_CTX_set_min_proto_version($%.4x) failed - this OpenSSL (%s) may ' +
+      'not support that version: %s', [LWant, NghttpsslVersion, NghttpsslLastError]);
+  LGot := SSL_CTX_ctrl(FCtx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, nil);
+  if LGot <> LWant then
+    raise ENghttp2Tls.CreateFmt(
+      'SetMinProtocolVersion: asked for minimum $%.4x but the context reports ' +
+      '$%.4x after setting it; refusing to serve with a weaker minimum than ' +
+      'configured.', [LWant, LGot]);
 end;
 
 // ─── TTlsConnection ─────────────────────────────────────────────────────
