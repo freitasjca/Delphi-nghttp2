@@ -13,6 +13,7 @@ The project has been on `1.x` since its first public tag.
 
 | Version | Date | Headline |
 |---|---|---|
+| [1.25.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.25.0) | 2026-10-05 | exact OpenSSL build in every TLS message (`OpenSSL_version`) |
 | [1.24.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.24.0) | 2026-10-05 | gRPC errors stop leaking the exception class name; grpc-message percent-encoded |
 | [1.23.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.23.0) | 2026-10-04 | minimum TLS version, verified by read-back |
 | [1.22.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.22.0) | 2026-10-01 | TLS 1.2 and TLS 1.3 cipher configuration, verified by read-back |

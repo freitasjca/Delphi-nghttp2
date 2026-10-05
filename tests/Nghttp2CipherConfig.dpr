@@ -13,6 +13,8 @@ program Nghttp2CipherConfig;
 //  other generation's list alone? And (MINVER-1, 1.23.0, cases 25-31) does
 //  SetMinProtocolVersion set the minimum, leave the cipher lists alone, and
 //  refuse when the minimum does not take?
+//  And (OSSLVER-1, 1.25.0, case 32) is the exact OpenSSL build reported,
+//  not just the generation the file name implies?
 //
 //  Every assertion reads back the context's EFFECTIVE cipher list through
 //  OpenSSL. "The setter did not raise" is never accepted as success on its
@@ -378,6 +380,15 @@ begin
     Check('31 a minimum that reports success but does not take: refused by the READ-BACK',
       (LCls = 'ENghttp2Tls') and (Pos('context reports', LMsg) > 0), LCls + ': ' + LMsg);
   end;
+
+  // -- 32 . the exact runtime build is reported (OSSLVER-1, 1.25.0) ---------
+  // delphi-tls rule 5: a TLS result must name the OpenSSL build, and
+  // "OpenSSL 3.x" is not one version (3.0 and 3.6 word the same failure
+  // differently). OpenSSL_version exists in every 1.1.0+ libcrypto the loader
+  // accepts, so it must resolve and the label must carry what it returned.
+  Check('32 OpenSSL_version resolved: the exact runtime build is reported',
+    Assigned(OpenSSL_version) and (Pos(' - OpenSSL ', NghttpsslVersion) > 0),
+    NghttpsslVersion);
 
   WriteLn;
   WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed');

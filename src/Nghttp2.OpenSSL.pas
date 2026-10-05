@@ -258,6 +258,18 @@ var
   SSL_CTX_ctrl:             function(ctx: PSSL_CTX; cmd: Integer; larg: LongInt;
                                      parg: Pointer): LongInt; cdecl;
 
+  // ─── Exact runtime version (OSSLVER-1, 1.25.0) ───────────────────────────
+  // OPTIONAL, libcrypto, 1.1.0+. OpenSSL_version(OSSL_VERSION_TEXT) returns the
+  // build actually loaded, e.g. 'OpenSSL 3.0.13 30 Jan 2024' - which the file
+  // name (libssl.so.3) cannot tell. Static string owned by OpenSSL; never free.
+  // Feeds NghttpsslVersion, so every TLS error message names the runtime.
+  OpenSSL_version:          function(t: Integer): PAnsiChar; cdecl;
+
+const
+  // C's OPENSSL_VERSION (0). Not given that name here: Pascal identifiers are
+  // case-insensitive, so it would collide with the OpenSSL_version variable.
+  OSSL_VERSION_TEXT = 0;
+
 // Bytes buffered in a memory BIO and not yet read out. OpenSSL exposes this
 // as a macro over BIO_ctrl, so it has to be written out by hand here.
 function BIO_pending(b: PBIO): Integer;
@@ -284,8 +296,11 @@ procedure NghttpsslUnload;
 // True after a successful NghttpsslLoad.
 function NghttpsslIsLoaded: Boolean;
 
-// Returns a description of what was loaded, e.g., "OpenSSL 3.x (libssl.so.3)"
-// or "OpenSSL 1.1.x (libssl-1_1-x64.dll)". Empty string if not loaded.
+// Returns a description of what was loaded, e.g.
+// "OpenSSL 3.x (libssl.so.3) - OpenSSL 3.0.13 30 Jan 2024". The part after the
+// dash is the exact runtime from OpenSSL_version (OSSLVER-1, 1.25.0); without
+// that optional symbol only the generation label from the file name remains,
+// e.g. "OpenSSL 1.1.x (libssl-1_1-x64.dll)". Empty string if not loaded.
 function NghttpsslVersion: string;
 
 // Convenience — turn the top ERR_get_error() code into a human-readable string.
@@ -525,6 +540,7 @@ begin
   GetOptional(ALibCrypto, 'OPENSSL_sk_num',           Pointer(@OPENSSL_sk_num));
   GetOptional(ALibCrypto, 'OPENSSL_sk_value',         Pointer(@OPENSSL_sk_value));
   GetOptional(ALibSsl,    'SSL_CTX_ctrl',             Pointer(@SSL_CTX_ctrl));
+  GetOptional(ALibCrypto, 'OpenSSL_version',          Pointer(@OpenSSL_version));
 end;
 
 procedure ClearOptionalSymbols;
@@ -536,6 +552,7 @@ begin
   OPENSSL_sk_num           := nil;
   OPENSSL_sk_value         := nil;
   SSL_CTX_ctrl             := nil;
+  OpenSSL_version          := nil;
 end;
 
 function OsLoadError: string;
@@ -555,6 +572,7 @@ function TryLoad(const ALibSslNames: array of string;
 var
   I: Integer;
   LSslTriedNames: string;
+  LVersionText: PAnsiChar;
 begin
   Result := False;
 
@@ -602,8 +620,17 @@ begin
 
   ResolveOptionalSymbols(GLibSSL, GLibCrypto);
 
+  { OSSLVER-1: the label says which FILE was loaded ('OpenSSL 3.x
+    (libssl.so.3)'); 3.0.13 and 3.6.0 word the same failure differently, so a
+    result needs the exact build too. }
   GVersion := ALabel;
-  Result   := True;
+  if Assigned(OpenSSL_version) then
+  begin
+    LVersionText := OpenSSL_version(OSSL_VERSION_TEXT);
+    if LVersionText <> nil then
+      GVersion := ALabel + ' - ' + string(AnsiString(LVersionText));
+  end;
+  Result := True;
 end;
 
 function NghttpsslLoad: Boolean;
