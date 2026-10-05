@@ -68,7 +68,7 @@ uses
     drags in ffi.manager, which is why -dNGHTTP2_GRPC_NO_FFI is required on FPC
     here exactly as it is for Nghttp2ProtobufNegativeTests. }
   Nghttp2.Grpc.Registry,       // IGrpcStreamReader
-  Nghttp2.Grpc.Dispatcher,     // StripGrpcPrefix
+  Nghttp2.Grpc.Dispatcher,     // StripGrpcPrefix, GrpcPercentEncode
   Nghttp2.Grpc.StreamWriter,   // WrapGrpcMessage
   Nghttp2.Grpc.StreamReader;   // TGrpcStreamReader
 
@@ -581,6 +581,60 @@ begin
   LStreamIntf := nil;
 end;
 
+// -- 06  grpc-message percent-encoding (GRPC-ERRMSG-1) -----------------------
+
+{ A string from explicit UTF-8 bytes. The source file is BOM-less ASCII, so a
+  non-ASCII literal would be read in whatever codepage the compiler assumes;
+  building the text from bytes pins the input on both compilers. }
+function Utf8Text(const ABytes: array of Byte): string;
+var
+  LBytes: TBytes;
+  I: Integer;
+begin
+  SetLength(LBytes, Length(ABytes));
+  for I := 0 to High(ABytes) do
+    LBytes[I] := ABytes[I];
+  Result := TEncoding.UTF8.GetString(LBytes);
+end;
+
+procedure ExpectEncoded(const AName, AInput, AExpected: string);
+var
+  LGot: string;
+begin
+  LGot := GrpcPercentEncode(AInput);
+  Check(AName, LGot = AExpected,
+    Format('expected "%s", got "%s"', [AExpected, LGot]));
+end;
+
+procedure TestPercentEncode;
+begin
+  WriteLn;
+  WriteLn('-- 06  grpc-message percent-encoding (GRPC-ERRMSG-1)');
+
+  ExpectEncoded('plain ASCII passes through unchanged',
+    'method not registered: /greeter.Greeter/DoesNotExist',
+    'method not registered: /greeter.Greeter/DoesNotExist');
+  ExpectEncoded('space and ~ (0x20, 0x7E, the range ends) pass through',
+    'a b~c', 'a b~c');
+  ExpectEncoded('a literal % is encoded, or the client would decode it',
+    '100%', '100%25');
+  ExpectEncoded('an already-encoded-looking %41 is encoded, not trusted',
+    'x%41', 'x%2541');
+  ExpectEncoded('CR LF are encoded (a header value must not carry them)',
+    'a'#13#10'b', 'a%0D%0Ab');
+  ExpectEncoded('DEL (0x7F) is encoded', 'a'#127, 'a%7F');
+  ExpectEncoded('2-byte UTF-8 (U+00E7) becomes its two bytes',
+    Utf8Text([$C3, $A7]), '%C3%A7');
+  { U+1F600 is a surrogate PAIR in a Delphi string. Encoding per Char would
+    emit the two surrogates separately (invalid UTF-8); encoding the UTF-8
+    bytes gives the four bytes a client decodes back to the one character. }
+  ExpectEncoded('4-byte UTF-8 (U+1F600) becomes its four bytes',
+    Utf8Text([$F0, $9F, $98, $80]), '%F0%9F%98%80');
+  ExpectEncoded('upper-case hex digits',
+    Utf8Text([$C3, $BF]), '%C3%BF');
+  ExpectEncoded('empty stays empty', '', '');
+end;
+
 begin
   WriteLn('Nghttp2GrpcFramingTests - gRPC length-prefix framing + reassembly');
   WriteLn('The variable under test is the CHOP PATTERN, not the payload.');
@@ -591,6 +645,7 @@ begin
     TestReassembly;
     TestTruncatedStream;
     TestEmptyStream;
+    TestPercentEncode;
   except
     on E: Exception do
     begin

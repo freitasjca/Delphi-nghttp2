@@ -26,6 +26,15 @@ unit Nghttp2.Grpc.Dispatcher;
 //    (Other codes 1-11, 14-16 available for handlers to signal via custom
 //    exception classes; not yet implemented — see plan §M4 Deferred.)
 //
+//  GRPC-ERRMSG-1 (1.24.0). A handler exception reaches the client as
+//  grpc-status 13 with grpc-message = the exception's MESSAGE only. It used to
+//  be the class name, a colon and the message, which told every client the
+//  server's internal type names. The class name now goes to TGrpcDispatcher.
+//  OnHandlerError, the server's own hook, together with the request path.
+//  Every grpc-message is also percent-encoded now (GrpcPercentEncode): the
+//  gRPC spec requires it, and a raw '%' or non-ASCII character in an
+//  exception message reached clients mangled.
+//
 //  Extracted from horse-provider-nghttp2 on 2026-08-23. The layer never
 //  depended on Horse — only its unit name did; the sole input here is an
 //  INghttp2Stream. Any host that owns one can serve gRPC with it.
@@ -44,8 +53,22 @@ uses
   Nghttp2.Types;
 
 type
+  { GRPC-ERRMSG-1. Called when a registered handler (or the encoding of its
+    response) raises, with the request :path and the exception, before the
+    client is sent grpc-status 13. The client sees only the percent-encoded
+    E.Message; the class name and anything else diagnostic belongs here, in
+    the server's own log. Runs on the dispatching thread, once per failed
+    call. It must not raise: anything it raises is swallowed, so a broken
+    logger can never change what the client receives. A plain procedure
+    (not `reference to`) so it compiles on FPC without FUNCTIONREFERENCES. }
+  TGrpcHandlerErrorHook = procedure(const APath: string; const AError: Exception);
+
   TGrpcDispatcher = class
   public
+    { GRPC-ERRMSG-1. Optional; nil = no server-side report. Assign once at
+      startup, before serving: it is read without a lock on every failure. }
+    class var OnHandlerError: TGrpcHandlerErrorHook;
+
     { Call this at the top of your request pipeline, before any per-request
       allocation the host would otherwise do. If the request is
       application/grpc*, this routine fully handles it — writes response and
@@ -80,6 +103,13 @@ const
   function, no state - exposing it costs nothing. }
 function StripGrpcPrefix(const AData: TBytes; out ABody: TBytes;
   out AError: string): Boolean;
+
+{ GRPC-ERRMSG-1. Percent-encodes a grpc-message value as the gRPC spec
+  requires (PROTOCOL-HTTP2.md, "grpc-message"): the text is taken as UTF-8,
+  and every byte outside 0x20..0x7E, plus '%' itself, becomes %XX (upper-case
+  hex). Everything else passes through, so plain ASCII messages are unchanged.
+  Exposed for the framing test suite, which pins the byte-level output. }
+function GrpcPercentEncode(const AText: string): string;
 
 implementation
 
@@ -176,6 +206,62 @@ begin
   AStream.ReadBuffer(Result[0], AStream.Size);
 end;
 
+// ── grpc-message encoding (GRPC-ERRMSG-1) ───────────────────────────────────
+
+function GrpcPercentEncode(const AText: string): string;
+const
+  HEX_DIGITS = '0123456789ABCDEF';
+var
+  LBytes: TBytes;
+  I:      Integer;
+  B:      Byte;
+begin
+  Result := '';
+  if AText = '' then
+    Exit;
+  { UTF-8 bytes on both compilers - the same call Nghttp2.Protobuf uses for
+    string fields. Encoding per Char would split a UTF-16 surrogate pair on
+    Delphi and treat UTF-8 bytes as characters on FPC. }
+  LBytes := TEncoding.UTF8.GetBytes(AText);
+  for I := 0 to High(LBytes) do
+  begin
+    B := LBytes[I];
+    if (B >= $20) and (B <= $7E) and (B <> Ord('%')) then
+      Result := Result + Char(B)
+    else
+      Result := Result + '%' + HEX_DIGITS[(B shr 4) + 1] + HEX_DIGITS[(B and $0F) + 1];
+  end;
+end;
+
+{ Reports a handler failure to OnHandlerError and returns what the CLIENT may
+  see: the message alone. One function, so the five handler paths (unary x2,
+  server-stream, client-stream, bidi) cannot drift apart again - each used to
+  spell out its own class-name-plus-message string. }
+function HandlerFailureMessage(const APath: string; const AError: Exception): string;
+var
+  LHook: TGrpcHandlerErrorHook;
+begin
+  LHook := TGrpcDispatcher.OnHandlerError;
+  if Assigned(LHook) then
+  try
+    LHook(APath, AError);
+  except
+    { Swallowed on purpose: a failing logger must not turn a reported
+      INTERNAL into an unhandled exception on the connection thread. }
+  end;
+  Result := AError.Message;
+end;
+
+{ Status trailers for the paths that have already started a response
+  (streaming, bidi) and so cannot use SendGrpcStatusOnly. }
+procedure AddStatusTrailers(const AStream: INghttp2Stream; AStatus: Integer;
+  const AMessage: string);
+begin
+  AStream.AddTrailer('grpc-status', IntToStr(AStatus));
+  if AMessage <> '' then
+    AStream.AddTrailer('grpc-message', GrpcPercentEncode(AMessage));
+end;
+
 // ── Error-path helper: emit an empty body + grpc-status trailer ────────────
 
 procedure SendGrpcStatusOnly(
@@ -189,7 +275,7 @@ begin
   AStream.Header['content-type'] := 'application/grpc';
   AStream.AddTrailer('grpc-status', IntToStr(AStatus));
   if AMessage <> '' then
-    AStream.AddTrailer('grpc-message', AMessage);
+    AStream.AddTrailer('grpc-message', GrpcPercentEncode(AMessage));
   // Empty framed body per gRPC spec — client sees zero-length message and
   // reads status from trailers. We still emit the 5-byte prefix for a
   // well-formed frame (compression=0, length=0).
@@ -263,8 +349,8 @@ begin
         except
           on E: Exception do
           begin
-            AStream.AddTrailer('grpc-status',  IntToStr(GRPC_STATUS_INTERNAL));
-            AStream.AddTrailer('grpc-message', E.ClassName + ': ' + E.Message);
+            AddStatusTrailers(AStream, GRPC_STATUS_INTERNAL,
+              HandlerFailureMessage(LPath, E));
           end;
         end;
       finally
@@ -286,7 +372,7 @@ begin
         on E: Exception do
         begin
           SendGrpcStatusOnly(AStream, GRPC_STATUS_INTERNAL,
-            E.ClassName + ': ' + E.Message);
+            HandlerFailureMessage(LPath, E));
           Exit;
         end;
       end;
@@ -359,8 +445,8 @@ begin
                 gRPC has for this, and it is why a streaming client must check
                 grpc-status after the last message rather than assuming that
                 receiving data means success. }
-              AStream.AddTrailer('grpc-status',  IntToStr(GRPC_STATUS_INTERNAL));
-              AStream.AddTrailer('grpc-message', E.ClassName + ': ' + E.Message);
+              AddStatusTrailers(AStream, GRPC_STATUS_INTERNAL,
+                HandlerFailureMessage(LPath, E));
             end;
           end;
         finally
@@ -385,7 +471,7 @@ begin
             on E: Exception do
             begin
               SendGrpcStatusOnly(AStream, GRPC_STATUS_INTERNAL,
-                E.ClassName + ': ' + E.Message);
+                HandlerFailureMessage(LPath, E));
               Exit;
             end;
           end;
@@ -421,7 +507,7 @@ begin
             on E: Exception do
             begin
               SendGrpcStatusOnly(AStream, GRPC_STATUS_INTERNAL,
-                E.ClassName + ': ' + E.Message);
+                HandlerFailureMessage(LPath, E));
               Exit;
             end;
           end;
