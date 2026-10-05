@@ -15,6 +15,8 @@ program Nghttp2CipherConfig;
 //  refuse when the minimum does not take?
 //  And (OSSLVER-1, 1.25.0, case 32) is the exact OpenSSL build reported,
 //  not just the generation the file name implies?
+//  And (H2CIPHER-1, 1.26.0, cases 33-40) does RequireHttp2Tls12Cipher
+//  refuse a TLS 1.2 list with no cipher RFC 7540 permits for HTTP/2?
 //
 //  Every assertion reads back the context's EFFECTIVE cipher list through
 //  OpenSSL. "The setter did not raise" is never accepted as success on its
@@ -161,6 +163,41 @@ end;
 
 // Case 31's fault: reports success for SET_MIN_PROTO_VERSION but changes
 // nothing, which only a read-back can notice. Everything else passes through.
+{ H2CIPHER-1: RequireHttp2Tls12Cipher on a context whose TLS 1.2 list was
+  set to ARules ('' = OpenSSL's default list). Returns the exception class,
+  '' if it did not raise, or 'SETUP:' + class if the rules themselves failed. }
+function RequireH2Catch(const ARules: string; out AMsg: string): string;
+var
+  LCtx: TTlsServerContext;
+begin
+  Result := '';
+  AMsg   := '';
+  LCtx := TTlsServerContext.Create;
+  try
+    try
+      LCtx.SetTls12CipherRules(ARules);
+    except
+      on E: Exception do
+      begin
+        Result := 'SETUP:' + E.ClassName;
+        AMsg   := E.Message;
+        Exit;
+      end;
+    end;
+    try
+      LCtx.RequireHttp2Tls12Cipher;
+    except
+      on E: Exception do
+      begin
+        Result := E.ClassName;
+        AMsg   := E.Message;
+      end;
+    end;
+  finally
+    LCtx.Free;
+  end;
+end;
+
 function IgnoringCtrl(ctx: PSSL_CTX; cmd: Integer; larg: LongInt;
   parg: Pointer): LongInt; cdecl;
 begin
@@ -389,6 +426,38 @@ begin
   Check('32 OpenSSL_version resolved: the exact runtime build is reported',
     Assigned(OpenSSL_version) and (Pos(' - OpenSSL ', NghttpsslVersion) > 0),
     NghttpsslVersion);
+
+  // -- 33..40 . HTTP/2 TLS 1.2 cipher requirement (H2CIPHER-1, 1.26.0) ------
+  // RFC 7540 Appendix A. 33-36 pin the ported block-list table against
+  // values whose verdict is known from the RFC itself; 37-40 run the check
+  // on real contexts. 38 is the configuration provider stage 10d measured:
+  // AES128-SHA256 alone was SERVED over HTTP/2 before this check existed.
+  Check('33 SSL_CIPHER_get_id resolved (H2CIPHER-1 symbol)',
+    Assigned(SSL_CIPHER_get_id), NghttpsslVersion);
+  Check('34 block list: AES128-SHA256 ($003C, RSA kx + CBC) and AES128-GCM-SHA256 ($009C, RSA kx) are blocked',
+    IsHttp2BlockedTls12Cipher($003C) and IsHttp2BlockedTls12Cipher($009C));
+  Check('35 block list: ECDHE-RSA-AES128-SHA256 ($C027, ECDHE + CBC) is blocked',
+    IsHttp2BlockedTls12Cipher($C027));
+  Check('36 block list: ECDHE/DHE + AEAD are permitted ($C02F, $0300C02F form, $C030, $009E, $CCA8), and TLS 1.3 ($1301) is not listed',
+    not IsHttp2BlockedTls12Cipher($C02F) and not IsHttp2BlockedTls12Cipher($0300C02F)
+    and not IsHttp2BlockedTls12Cipher($C030) and not IsHttp2BlockedTls12Cipher($009E)
+    and not IsHttp2BlockedTls12Cipher($CCA8) and not IsHttp2BlockedTls12Cipher($1301));
+  if Assigned(SSL_CIPHER_get_id) then
+  begin
+    LCls := RequireH2Catch('', LMsg);
+    Check('37 OpenSSL''s default TLS 1.2 list passes (it holds ECDHE AEAD ciphers)',
+      LCls = '', LCls + ': ' + LMsg);
+    LCls := RequireH2Catch('AES128-SHA256', LMsg);
+    Check('38 a TLS 1.2 list of only blocked ciphers is REFUSED, naming RFC 7540 and the cipher',
+      (LCls = 'ENghttp2Tls') and (Pos('RFC 7540', LMsg) > 0) and (Pos('AES128-SHA256', LMsg) > 0),
+      LCls + ': ' + LMsg);
+    LCls := RequireH2Catch('AES128-SHA256:ECDHE-RSA-AES128-GCM-SHA256', LMsg);
+    Check('39 one permitted cipher beside a blocked one is enough',
+      LCls = '', LCls + ': ' + LMsg);
+    LCls := RequireH2Catch('ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384', LMsg);
+    Check('40 ECDHE alone is not enough: an ECDHE + CBC-only list is REFUSED',
+      (LCls = 'ENghttp2Tls') and (Pos('RFC 7540', LMsg) > 0), LCls + ': ' + LMsg);
+  end;
 
   WriteLn;
   WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed');

@@ -170,6 +170,19 @@ type
     // Same failure contract as the cipher setters: discard the context.
     procedure SetMinProtocolVersion(AVersion: TNghttp2TlsMinVersion);
 
+    // H2CIPHER-1 (1.26.0). HTTP/2 over TLS 1.2 SHOULD NOT use a cipher on the
+    // RFC 7540 Appendix A block list, and clients MAY refuse one with
+    // INADEQUATE_SECURITY - browsers do, curl does not (measured). OpenSSL and
+    // libnghttp2 check nothing, so a TLS 1.2 rule string that leaves ONLY
+    // blocked ciphers starts a server that some clients cannot use, silently.
+    // Reads the context's effective list and raises when it holds at least one
+    // TLS 1.2 cipher and every one of them is blocked. TLS 1.3 suites are not
+    // considered (all five are permitted). A list with no TLS 1.2 cipher at
+    // all passes - TLS 1.2 then cannot be negotiated. Call after
+    // SetTls12CipherRules; skip it when the minimum is TLS 1.3. Same failure
+    // contract as the setters: discard the context after a raise.
+    procedure RequireHttp2Tls12Cipher;
+
     property Handle: PSSL_CTX read GetHandle;
   end;
 
@@ -397,6 +410,11 @@ type
 
     property SSL: PSSL read FSSL;
   end;
+
+{ H2CIPHER-1. True when the IANA cipher-suite id (or SSL_CIPHER_get_id's
+  $0300XXXX form) is on the RFC 7540 Appendix A block list. Pure; exposed so
+  Nghttp2CipherConfig can pin the table directly. }
+function IsHttp2BlockedTls12Cipher(AId: Cardinal): Boolean;
 
 implementation
 
@@ -775,6 +793,96 @@ begin
       'SetMinProtocolVersion: asked for minimum $%.4x but the context reports ' +
       '$%.4x after setting it; refusing to serve with a weaker minimum than ' +
       'configured.', [LWant, LGot]);
+end;
+
+// ─── HTTP/2 TLS 1.2 cipher requirement (H2CIPHER-1, 1.26.0) ─────────────
+
+const
+  { RFC 7540 Appendix A block list as two 256-bit maps, bit (id mod 8) of
+    byte ((id and $FF) div 8): IANA ids $0000-$00FF and $C000-$C0FF. Ported
+    byte for byte from nghttpx (nghttp2 src/tls.cc, IS_CIPHER_BANNED_METHOD2),
+    which takes it from github.com/jay/http2_blacklisted_ciphers. Ids outside
+    both ranges (ChaCha20 $CCxx, TLS 1.3 $13xx) are not on the list. }
+  H2_BLOCKED_00XX: array[0..31] of Byte = (
+    $FF, $FF, $FF, $CF, $FF, $FF, $FF, $FF, $7F, $00, $00, $00, $80, $3F, $00, $00,
+    $F0, $FF, $FF, $3F, $F3, $F3, $FF, $FF, $3F, $00, $00, $00, $00, $00, $00, $80);
+  H2_BLOCKED_C0XX: array[0..31] of Byte = (
+    $FE, $FF, $FF, $FF, $FF, $67, $FE, $FF, $FF, $FF, $33, $CF, $FC, $CF, $FF, $CF,
+    $3C, $F3, $FC, $3F, $33, $03, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00);
+  { How many blocked names the refusal lists before eliding the rest. }
+  H2_NAMES_SHOWN = 8;
+
+function IsHttp2BlockedTls12Cipher(AId: Cardinal): Boolean;
+var
+  LId: Cardinal;
+begin
+  LId := AId and $FFFF;   // SSL_CIPHER_get_id returns $0300XXXX
+  if LId <= $00FF then
+    Result := (H2_BLOCKED_00XX[LId shr 3] and (1 shl (LId and 7))) <> 0
+  else if (LId >= $C000) and (LId <= $C0FF) then
+    Result := (H2_BLOCKED_C0XX[(LId and $FF) shr 3] and (1 shl (LId and 7))) <> 0
+  else
+    Result := False;
+end;
+
+procedure TTlsServerContext.RequireHttp2Tls12Cipher;
+var
+  LStack:   POPENSSL_STACK;
+  LCipher:  PSSL_CIPHER;
+  LName:    PAnsiChar;
+  LId:      Cardinal;
+  I, N:     Integer;
+  LBlocked: Integer;
+  LNames:   string;
+begin
+  if not (Assigned(SSL_CTX_get_ciphers) and Assigned(SSL_CIPHER_get_id)
+          and Assigned(SSL_CIPHER_get_name) and Assigned(OPENSSL_sk_num)
+          and Assigned(OPENSSL_sk_value)) then
+    raise ENghttp2Tls.CreateFmt(
+      'RequireHttp2Tls12Cipher: the loaded OpenSSL (%s) lacks the symbols ' +
+      'needed to inspect the cipher list; refusing to serve HTTP/2 over ' +
+      'TLS 1.2 unchecked.', [NghttpsslVersion]);
+
+  LBlocked := 0;
+  LNames   := '';
+  LStack   := SSL_CTX_get_ciphers(FCtx);   // OpenSSL's stack - not freed
+  N := OPENSSL_sk_num(LStack);             // -1 for a nil stack
+  for I := 0 to N - 1 do
+  begin
+    LCipher := OPENSSL_sk_value(LStack, I);
+    LId := SSL_CIPHER_get_id(LCipher) and $FFFF;
+    { $13xx = a TLS 1.3 suite: not subject to the block list. }
+    if (LId and $FF00) <> $1300 then
+    begin
+      if not IsHttp2BlockedTls12Cipher(LId) then
+        Exit;   // one permitted TLS 1.2 cipher is enough
+      Inc(LBlocked);
+      if LBlocked <= H2_NAMES_SHOWN then
+      begin
+        LName := SSL_CIPHER_get_name(LCipher);
+        if LName <> nil then
+        begin
+          if LNames <> '' then
+            LNames := LNames + ', ';
+          LNames := LNames + string(AnsiString(LName));
+        end;
+      end;
+    end;
+  end;
+
+  if LBlocked = 0 then
+    Exit;   // no TLS 1.2 cipher at all: TLS 1.2 cannot be negotiated
+  if LBlocked > H2_NAMES_SHOWN then
+    LNames := LNames + ', ...';
+
+  raise ENghttp2Tls.CreateFmt(
+    'The TLS 1.2 cipher list leaves no cipher HTTP/2 permits: all %d TLS 1.2 ' +
+    'cipher(s) are on the RFC 7540 Appendix A block list (%s). Clients may ' +
+    'refuse such a connection with INADEQUATE_SECURITY (RFC 7540 9.2.2), so ' +
+    'HTTP/2 over TLS 1.2 would work for some clients and not others. Keep an ' +
+    'ECDHE or DHE AEAD cipher, e.g. ECDHE-RSA-AES128-GCM-SHA256, or set the ' +
+    'minimum TLS version to 1.3. OpenSSL: %s',
+    [LBlocked, LNames, NghttpsslVersion]);
 end;
 
 // ─── TTlsConnection ─────────────────────────────────────────────────────

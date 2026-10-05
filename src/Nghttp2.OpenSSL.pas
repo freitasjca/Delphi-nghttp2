@@ -265,6 +265,12 @@ var
   // Feeds NghttpsslVersion, so every TLS error message names the runtime.
   OpenSSL_version:          function(t: Integer): PAnsiChar; cdecl;
 
+  // ─── HTTP/2 TLS 1.2 cipher check (H2CIPHER-1, 1.26.0) ────────────────────
+  // OPTIONAL, libssl, 1.1.0+. Returns 0x0300XXXX where XXXX is the IANA
+  // cipher-suite value; Nghttp2.Tls masks it and looks it up in the RFC 7540
+  // Appendix A block list. Serves only TTlsServerContext.RequireHttp2Tls12Cipher.
+  SSL_CIPHER_get_id:        function(c: PSSL_CIPHER): Cardinal; cdecl;
+
 const
   // C's OPENSSL_VERSION (0). Not given that name here: Pascal identifiers are
   // case-insensitive, so it would collide with the OpenSSL_version variable.
@@ -541,6 +547,7 @@ begin
   GetOptional(ALibCrypto, 'OPENSSL_sk_value',         Pointer(@OPENSSL_sk_value));
   GetOptional(ALibSsl,    'SSL_CTX_ctrl',             Pointer(@SSL_CTX_ctrl));
   GetOptional(ALibCrypto, 'OpenSSL_version',          Pointer(@OpenSSL_version));
+  GetOptional(ALibSsl,    'SSL_CIPHER_get_id',        Pointer(@SSL_CIPHER_get_id));
 end;
 
 procedure ClearOptionalSymbols;
@@ -553,6 +560,7 @@ begin
   OPENSSL_sk_value         := nil;
   SSL_CTX_ctrl             := nil;
   OpenSSL_version          := nil;
+  SSL_CIPHER_get_id        := nil;
 end;
 
 function OsLoadError: string;
