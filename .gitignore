@@ -109,3 +109,7 @@ tools/protogen/.spot-out/
 # (see the header of ProtoQualRefProbe.dpr), so its output lands wherever -FE
 # points; keep the whole directory out.
 tests/qualref/out/
+
+# Session state an assistant tool writes into whatever folder it works in.
+# Two such files reached 1.27.0 via a copied fixtures folder; never commit them.
+**/.claude/autoharness/
