@@ -123,6 +123,7 @@ uses
 {$IFEND}
   Nghttp2.Protobuf,
   Nghttp2.Protobuf.Rtti,
+  Nghttp2.Grpc.Framing,        { GC0 - GrpcUnframeMessage, GrpcEncodeStatusMessage }
   Nghttp2.Grpc.Registry,
   Nghttp2.Grpc.StreamWriter,   { M6a — TGrpcStreamWriter }
   Nghttp2.Grpc.StreamReader;   { M6b — TGrpcStreamReader }
@@ -130,60 +131,13 @@ uses
 // ── 5-byte prefix framing ──────────────────────────────────────────────────
 
 function StripGrpcPrefix(const AData: TBytes; out ABody: TBytes; out AError: string): Boolean;
-var
-  LMsgLen: UInt32;
 begin
-  Result := False;
-  if Length(AData) < 5 then
-  begin
-    AError := 'gRPC frame too short (< 5-byte prefix)';
-    Exit;
-  end;
-  if AData[0] <> 0 then
-  begin
-    AError := 'gRPC compression flag set (per-message compression not supported in v0.1)';
-    Exit;
-  end;
-  // 4-byte big-endian length prefix
-  LMsgLen := (UInt32(AData[1]) shl 24) or
-             (UInt32(AData[2]) shl 16) or
-             (UInt32(AData[3]) shl 8)  or
-              UInt32(AData[4]);
-
-  { FIX-GRPC-LEN-1. The cap MUST be tested before any signed arithmetic on
-    LMsgLen, and this ordering is the fix rather than an optimisation.
-
-    The truncation check below used to read `Length(AData) < 5 + Integer(LMsgLen)`.
-    LMsgLen is wire-supplied and unsigned, so a prefix of 00 FF FF FF FF makes
-    Integer(LMsgLen) = -1 and the expression evaluates to 4 - the guard passes
-    for any buffer of 4 bytes or more. SetLength then sees the UNSIGNED value
-    and attempts a 4 GB allocation, and if that succeeds the Move reads 4 GB
-    past the end of a ten-byte buffer. Remotely triggerable by a ten-byte
-    request; an upstream body-size limit does not help, because the body is
-    tiny and it is the header that lies.
-
-    Testing the cap first bounds LMsgLen to 4 MB, after which Integer(LMsgLen)
-    is provably safe. The same constant already guarded the STREAMING path in
-    Nghttp2.Grpc.StreamReader; only the unary path was unprotected, which is
-    exactly the two-copies-of-one-format asymmetry the comment below warns
-    about. }
-  if LMsgLen > GRPC_MAX_MESSAGE_BYTES then
-  begin
-    AError := Format('gRPC message length %u exceeds the %d-byte maximum',
-                     [LMsgLen, GRPC_MAX_MESSAGE_BYTES]);
-    Exit;
-  end;
-
-  if Length(AData) - 5 < Integer(LMsgLen) then
-  begin
-    AError := Format('gRPC frame truncated: header says %u bytes, buffer has %d',
-                     [LMsgLen, Length(AData) - 5]);
-    Exit;
-  end;
-  SetLength(ABody, LMsgLen);
-  if LMsgLen > 0 then
-    Move(AData[5], ABody[0], LMsgLen);
-  Result := True;
+  { GC0 (1.28.0). The parser moved to Nghttp2.Grpc.Framing so a gRPC client can
+    share it without linking the dispatcher; behaviour and error texts are
+    unchanged (Nghttp2GrpcFramingTests section 07). The FIX-GRPC-LEN-1 ordering
+    - cap tested on the unsigned length before any signed arithmetic - lives
+    there now, in ReadHeader's caller. }
+  Result := GrpcUnframeMessage(AData, ABody, AError, GRPC_MAX_MESSAGE_BYTES);
 end;
 
 { Outbound framing lives in Nghttp2.Grpc.StreamWriter as
@@ -209,28 +163,10 @@ end;
 // ── grpc-message encoding (GRPC-ERRMSG-1) ───────────────────────────────────
 
 function GrpcPercentEncode(const AText: string): string;
-const
-  HEX_DIGITS = '0123456789ABCDEF';
-var
-  LBytes: TBytes;
-  I:      Integer;
-  B:      Byte;
 begin
-  Result := '';
-  if AText = '' then
-    Exit;
-  { UTF-8 bytes on both compilers - the same call Nghttp2.Protobuf uses for
-    string fields. Encoding per Char would split a UTF-16 surrogate pair on
-    Delphi and treat UTF-8 bytes as characters on FPC. }
-  LBytes := TEncoding.UTF8.GetBytes(AText);
-  for I := 0 to High(LBytes) do
-  begin
-    B := LBytes[I];
-    if (B >= $20) and (B <= $7E) and (B <> Ord('%')) then
-      Result := Result + Char(B)
-    else
-      Result := Result + '%' + HEX_DIGITS[(B shr 4) + 1] + HEX_DIGITS[(B and $0F) + 1];
-  end;
+  { GC0 (1.28.0): moved to Nghttp2.Grpc.Framing, which also has the decoder a
+    client needs. Same output byte for byte (section 07). }
+  Result := GrpcEncodeStatusMessage(AText);
 end;
 
 { Reports a handler failure to OnHandlerError and returns what the CLIENT may

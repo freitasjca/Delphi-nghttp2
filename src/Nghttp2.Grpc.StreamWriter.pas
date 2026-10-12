@@ -59,21 +59,14 @@ function WrapGrpcMessage(const AProtoBody: TBytes): TBytes;
 implementation
 
 uses
-  Nghttp2.Protobuf.Rtti;
+  Nghttp2.Protobuf.Rtti,
+  Nghttp2.Grpc.Framing;   { GC0 - GrpcFrameMessage }
 
 function WrapGrpcMessage(const AProtoBody: TBytes): TBytes;
-var
-  LLen: UInt32;
 begin
-  LLen := UInt32(Length(AProtoBody));
-  SetLength(Result, 5 + Integer(LLen));
-  Result[0] := 0;                          // compression flag = uncompressed
-  Result[1] := Byte((LLen shr 24) and $FF);
-  Result[2] := Byte((LLen shr 16) and $FF);
-  Result[3] := Byte((LLen shr 8)  and $FF);
-  Result[4] := Byte( LLen         and $FF);
-  if LLen > 0 then
-    Move(AProtoBody[0], Result[5], LLen);
+  { GC0 (1.28.0): moved to Nghttp2.Grpc.Framing so a gRPC client frames its
+    requests with the same function. Same bytes (section 07). }
+  Result := GrpcFrameMessage(AProtoBody);
 end;
 
 constructor TGrpcStreamWriter.Create(const AStream: INghttp2Stream;

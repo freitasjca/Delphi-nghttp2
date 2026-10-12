@@ -36,6 +36,13 @@ program Nghttp2GrpcFramingTests;
 //  catches an endianness or offset regression - but the value of this file is
 //  sections 03-05, which need no external reference at all.
 //
+//  GC0 (lib 1.28.0, B2 client plan) added sections 07-09. The framing moved
+//  to Nghttp2.Grpc.Framing so the gRPC client can share it; 07 pins that the
+//  server's old names still give the same bytes and the same error TEXTS
+//  (literals copied from the pre-GC0 code), 08 tests the shared reassembler
+//  directly with the chunk sizes a client's ReadChunk produces, 09 the
+//  grpc-message decoder a client needs.
+//
 //  Malformed input is covered separately by Nghttp2ProtobufNegativeTests
 //  section 05 (F1/F3) and is not duplicated here.
 //
@@ -70,7 +77,8 @@ uses
   Nghttp2.Grpc.Registry,       // IGrpcStreamReader
   Nghttp2.Grpc.Dispatcher,     // StripGrpcPrefix, GrpcPercentEncode
   Nghttp2.Grpc.StreamWriter,   // WrapGrpcMessage
-  Nghttp2.Grpc.StreamReader;   // TGrpcStreamReader
+  Nghttp2.Grpc.StreamReader,   // TGrpcStreamReader, GRPC_MAX_MESSAGE_BYTES
+  Nghttp2.Grpc.Framing;        // GC0 - the shared framing unit (sections 07-09)
 
 {$IF DEFINED(FPC)}
   {$RTTI EXPLICIT PROPERTIES([vcPublished]) FIELDS([vcPublic]) METHODS([vcPublic])}
@@ -635,6 +643,358 @@ begin
   ExpectEncoded('empty stays empty', '', '');
 end;
 
+// -- 07  GC0: the server's names keep their bytes and their error texts ------
+
+{ GC0 moved the framing into Nghttp2.Grpc.Framing and left the old names as
+  one-line delegations. Comparing old name with new name would be true by
+  construction, so the pins here are LITERALS, copied from the pre-GC0
+  sources: the exact error texts a client of StripGrpcPrefix, or a peer of
+  TGrpcStreamReader, used to receive. If GC0 changed any of them, this fails. }
+
+function ByteArr(const A: array of Byte): TBytes;
+var
+  I: Integer;
+begin
+  SetLength(Result, Length(A));
+  for I := 0 to High(A) do
+    Result[I] := A[I];
+end;
+
+{ ACount bytes of a non-repeating-looking pattern, so a shifted or truncated
+  copy does not compare equal by accident. }
+function PatternBytes(ACount: Integer): TBytes;
+var
+  I: Integer;
+begin
+  SetLength(Result, ACount);
+  for I := 0 to ACount - 1 do
+    Result[I] := Byte((I * 7 + 3) and $FF);
+end;
+
+procedure ExpectStripError(const AName: string; const AData: TBytes;
+  const AExpected: string);
+var
+  LOk:   Boolean;
+  LBody: TBytes;
+  LErr:  string;
+begin
+  LOk := StripGrpcPrefix(AData, LBody, LErr);
+  Check(AName, (not LOk) and (LErr = AExpected),
+    Format('expected "%s", got ok=%s "%s"', [AExpected, BoolToStr(LOk, True), LErr]));
+end;
+
+procedure ExpectReaderError(const AName: string; const AData: TBytes;
+  const AExpected: string);
+var
+  LStream:     TFakeInboundStream;
+  LStreamIntf: INghttp2Stream;
+  LReader:     IGrpcStreamReader;
+  LObj:        TObject;
+  LMsg:        string;
+begin
+  LStream     := TFakeInboundStream.Create(AData, cmAllAtOnce);
+  LStreamIntf := LStream;
+  LReader     := TGrpcStreamReader.Create(LStreamIntf, TFrameMsg);
+  LMsg := '(no exception)';
+  try
+    LReader.Next(LObj);
+  except
+    on E: Exception do
+      LMsg := E.Message;
+  end;
+  Check(AName, LMsg = AExpected,
+    Format('expected "%s", got "%s"', [AExpected, LMsg]));
+  LReader     := nil;
+  LStreamIntf := nil;
+end;
+
+procedure TestCompatibility;
+var
+  LPayload: TBytes;
+  I:        Integer;
+  LSizes:   array[0..4] of Integer;
+  LOk:      Boolean;
+begin
+  WriteLn;
+  WriteLn('-- 07  GC0 compatibility: old names, same bytes, same texts');
+
+  Check('GRPC_MAX_MESSAGE_BYTES is still 4194304',
+    GRPC_MAX_MESSAGE_BYTES = 4194304, IntToStr(GRPC_MAX_MESSAGE_BYTES));
+  Check('GRPC_DEFAULT_MAX_MESSAGE_BYTES equals it',
+    GRPC_DEFAULT_MAX_MESSAGE_BYTES = GRPC_MAX_MESSAGE_BYTES);
+
+  LSizes[0] := 0; LSizes[1] := 1; LSizes[2] := 255; LSizes[3] := 256;
+  LSizes[4] := 65539;
+  LOk := True;
+  for I := 0 to High(LSizes) do
+  begin
+    LPayload := PatternBytes(LSizes[I]);
+    if not BytesEqual(WrapGrpcMessage(LPayload), GrpcFrameMessage(LPayload)) then
+      LOk := False;
+  end;
+  Check('WrapGrpcMessage = GrpcFrameMessage for 0, 1, 255, 256, 65539 bytes', LOk);
+
+  ExpectStripError('unary: short buffer, same text',
+    ByteArr([$00, $00, $00]),
+    'gRPC frame too short (< 5-byte prefix)');
+  ExpectStripError('unary: compression flag, same text',
+    ByteArr([$01, $00, $00, $00, $01, $AA]),
+    'gRPC compression flag set (per-message compression not supported in v0.1)');
+  ExpectStripError('unary: over the cap, same text',
+    ByteArr([$00, $00, $40, $00, $01, $AA]),
+    'gRPC message length 4194305 exceeds the 4194304-byte maximum');
+  ExpectStripError('unary: length $FFFFFFFF, same text (F1)',
+    ByteArr([$00, $FF, $FF, $FF, $FF, $01]),
+    'gRPC message length 4294967295 exceeds the 4194304-byte maximum');
+  ExpectStripError('unary: truncated, same text',
+    ByteArr([$00, $00, $00, $00, $64, $01, $02, $03]),
+    'gRPC frame truncated: header says 100 bytes, buffer has 3');
+
+  ExpectReaderError('stream: compression flag, same text',
+    ByteArr([$01, $00, $00, $00, $01, $AA]),
+    'gRPC stream: per-message compression is not supported');
+  { Header only: the cap must fire before any payload arrives. }
+  ExpectReaderError('stream: over the cap, same text, judged on the header',
+    ByteArr([$00, $00, $40, $00, $01]),
+    'gRPC stream: message length 4194305 exceeds the 4194304-byte limit');
+  ExpectReaderError('stream: half-close mid-message, same text',
+    ByteArr([$00, $00, $00, $00, $0A, $01, $02, $03]),
+    'gRPC stream: peer half-closed with 8 bytes of an incomplete message');
+end;
+
+// -- 08  TGrpcMessageReassembler, directly ------------------------------------
+
+type
+  TPayloadList = array of TBytes;
+
+{ Feeds AData to a fresh reassembler AChunk bytes at a time, draining after
+  every append, as a client reading ReadChunk will. Stops at the first error. }
+function FeedChopped(const AData: TBytes; AChunk: Integer; out AError: string;
+  out ALeftover: Integer): TPayloadList;
+var
+  R:        TGrpcMessageReassembler;
+  LPos:     Integer;
+  LTake:    Integer;
+  LPiece:   TBytes;
+  LPayload: TBytes;
+  LRes:     TGrpcFrameResult;
+begin
+  SetLength(Result, 0);
+  AError    := '';
+  ALeftover := 0;
+  R := TGrpcMessageReassembler.Create;
+  try
+    LPos := 0;
+    LRes := gfrNeedMore;
+    while (LPos < Length(AData)) and (LRes <> gfrError) do
+    begin
+      LTake := AChunk;
+      if LTake > Length(AData) - LPos then
+        LTake := Length(AData) - LPos;
+      SetLength(LPiece, LTake);
+      Move(AData[LPos], LPiece[0], LTake);
+      Inc(LPos, LTake);
+      R.Append(LPiece);
+      repeat
+        LRes := R.TryNext(LPayload, AError);
+        if LRes = gfrMessage then
+        begin
+          SetLength(Result, Length(Result) + 1);
+          Result[High(Result)] := LPayload;
+        end;
+      until LRes <> gfrMessage;
+    end;
+    ALeftover := R.BufferedBytes;
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TestReassembler;
+const
+  CChunks: array[0..6] of Integer = (1, 2, 5, 6, 7, 40, MaxInt);
+var
+  LParts:   array[0..4] of TBytes;
+  LAll:     TBytes;
+  LPayload: TBytes;
+  LGot:     TPayloadList;
+  LErr:     string;
+  LLeft:    Integer;
+  I, J:     Integer;
+  LOk:      Boolean;
+  LRaised:  Boolean;
+  R:        TGrpcMessageReassembler;
+begin
+  WriteLn;
+  WriteLn('-- 08  TGrpcMessageReassembler (GC0) - shared by client and server');
+
+  { Two empty messages, and one over 64 KB so the length uses three bytes. }
+  LParts[0] := PatternBytes(0);
+  LParts[1] := PatternBytes(1);
+  LParts[2] := PatternBytes(300);
+  LParts[3] := PatternBytes(0);
+  LParts[4] := PatternBytes(70000);
+  SetLength(LAll, 0);
+  for I := 0 to 4 do
+    LAll := Concat2(LAll, GrpcFrameMessage(LParts[I]));
+
+  for J := 0 to High(CChunks) do
+  begin
+    LGot := FeedChopped(LAll, CChunks[J], LErr, LLeft);
+    LOk := (LErr = '') and (LLeft = 0) and (Length(LGot) = 5);
+    if LOk then
+      for I := 0 to 4 do
+        if not BytesEqual(LGot[I], LParts[I]) then
+          LOk := False;
+    Check(Format('5 messages in %d-byte chunks: same messages, same order',
+      [CChunks[J]]), LOk,
+      Format('got %d messages, %d bytes left, error "%s"', [Length(LGot), LLeft, LErr]));
+  end;
+
+  R := TGrpcMessageReassembler.Create;
+  try
+    R.Append(Concat2(GrpcFrameMessage(LParts[2]), GrpcFrameMessage(LParts[1])));
+    LOk := (R.TryNext(LPayload, LErr) = gfrMessage) and BytesEqual(LPayload, LParts[2]);
+    LOk := LOk and (R.TryNext(LPayload, LErr) = gfrMessage) and BytesEqual(LPayload, LParts[1]);
+    LOk := LOk and (R.TryNext(LPayload, LErr) = gfrNeedMore) and (R.BufferedBytes = 0);
+    Check('two messages in one append: both, in order, then need-more', LOk);
+  finally
+    R.Free;
+  end;
+
+  R := TGrpcMessageReassembler.Create;
+  try
+    R.Append(ByteArr([$00, $00, $00]));
+    LOk := (R.TryNext(LPayload, LErr) = gfrNeedMore) and (R.BufferedBytes = 3);
+    Check('3 header bytes: need-more, 3 buffered', LOk);
+    R.Append(ByteArr([$00, $02, $AA]));
+    LOk := (R.TryNext(LPayload, LErr) = gfrNeedMore) and (R.BufferedBytes = 6);
+    Check('header + 1 of 2 payload bytes: need-more, 6 buffered', LOk);
+    R.Append(ByteArr([$BB]));
+    LOk := (R.TryNext(LPayload, LErr) = gfrMessage) and
+           BytesEqual(LPayload, ByteArr([$AA, $BB])) and (R.BufferedBytes = 0);
+    Check('last payload byte: the message, nothing buffered', LOk);
+  finally
+    R.Free;
+  end;
+
+  R := TGrpcMessageReassembler.Create;
+  try
+    R.Append(ByteArr([$00, $00, $00, $00, $01, $CC, $DD, $EE]), 6);
+    LOk := (R.TryNext(LPayload, LErr) = gfrMessage) and
+           BytesEqual(LPayload, ByteArr([$CC])) and (R.BufferedBytes = 0);
+    Check('Append(chunk, 6) takes 6 bytes, not the whole chunk', LOk);
+    R.Append(ByteArr([$00, $00, $00, $00, $00]));
+    LOk := (R.TryNext(LPayload, LErr) = gfrMessage) and (Length(LPayload) = 0);
+    Check('zero-length message is a message, not need-more', LOk);
+  finally
+    R.Free;
+  end;
+
+  { The cap, at the boundary, with a small maximum so no test allocates 4 MB. }
+  R := TGrpcMessageReassembler.Create(16);
+  try
+    R.Append(ByteArr([$00, $00, $00, $00, $10]));
+    Check('length = maximum (16): need-more, not an error',
+      R.TryNext(LPayload, LErr) = gfrNeedMore, LErr);
+  finally
+    R.Free;
+  end;
+  R := TGrpcMessageReassembler.Create(16);
+  try
+    R.Append(ByteArr([$00, $00, $00, $00, $11]));
+    Check('length = maximum + 1 (17): error on the header alone',
+      (R.TryNext(LPayload, LErr) = gfrError) and
+      (LErr = 'message length 17 exceeds the 16-byte limit'), LErr);
+    R.Append(PatternBytes(17));
+    Check('an error is terminal: more bytes do not clear it',
+      R.TryNext(LPayload, LErr) = gfrError, LErr);
+  finally
+    R.Free;
+  end;
+
+  R := TGrpcMessageReassembler.Create;
+  try
+    R.Append(ByteArr([$00, $FF, $FF, $FF, $FF, $01]));
+    Check('length $FFFFFFFF: error, no allocation (F1 analogue)',
+      R.TryNext(LPayload, LErr) = gfrError, LErr);
+  finally
+    R.Free;
+  end;
+
+  R := TGrpcMessageReassembler.Create;
+  try
+    R.Append(ByteArr([$01, $00, $00, $00, $01, $AA]));
+    Check('compressed flag: error, named',
+      (R.TryNext(LPayload, LErr) = gfrError) and
+      (LErr = 'per-message compression is not supported'), LErr);
+  finally
+    R.Free;
+  end;
+
+  LRaised := False;
+  try
+    TGrpcMessageReassembler.Create(0).Free;
+  except
+    on E: EArgumentException do
+      LRaised := True;
+  end;
+  Check('Create(0) raises EArgumentException', LRaised);
+
+  { The unary parser's new optional maximum, used by a client that wants a
+    ceiling other than the 4 MB default. }
+  LOk := GrpcUnframeMessage(Concat2(ByteArr([$00, $00, $00, $00, $10]), PatternBytes(16)),
+    LPayload, LErr, 16);
+  Check('GrpcUnframeMessage: length = its maximum (16) is accepted',
+    LOk and BytesEqual(LPayload, PatternBytes(16)), LErr);
+  LOk := GrpcUnframeMessage(Concat2(ByteArr([$00, $00, $00, $00, $11]), PatternBytes(17)),
+    LPayload, LErr, 16);
+  Check('GrpcUnframeMessage: maximum + 1 is refused, naming the maximum',
+    (not LOk) and (LErr = 'gRPC message length 17 exceeds the 16-byte maximum'), LErr);
+  LOk := GrpcUnframeMessage(ByteArr([$00, $00, $00, $00, $00]), LPayload, LErr, 0);
+  Check('GrpcUnframeMessage: a maximum of 0 refuses, never disables the cap',
+    not LOk, 'accepted');
+end;
+
+// -- 09  grpc-message decoding (GC0, the client side of GRPC-ERRMSG-1) -------
+
+procedure ExpectDecoded(const AName, AInput, AExpected: string);
+var
+  LGot: string;
+begin
+  LGot := GrpcDecodeStatusMessage(AInput);
+  Check(AName, LGot = AExpected,
+    Format('expected "%s", got "%s"', [AExpected, LGot]));
+end;
+
+procedure ExpectRoundTrip(const AName, AText: string);
+begin
+  ExpectDecoded(AName, GrpcEncodeStatusMessage(AText), AText);
+end;
+
+procedure TestPercentDecode;
+begin
+  WriteLn;
+  WriteLn('-- 09  grpc-message percent-decoding (GC0)');
+
+  ExpectRoundTrip('round trip: plain ASCII',
+    'method not registered: /greeter.Greeter/DoesNotExist');
+  ExpectRoundTrip('round trip: a literal %', '100%');
+  ExpectRoundTrip('round trip: text that looks encoded', 'x%41');
+  ExpectRoundTrip('round trip: CR LF', 'a'#13#10'b');
+  ExpectRoundTrip('round trip: DEL', 'a'#127);
+  ExpectRoundTrip('round trip: 2-byte UTF-8', Utf8Text([$C3, $A7]));
+  ExpectRoundTrip('round trip: 4-byte UTF-8 (a surrogate pair on Delphi)',
+    Utf8Text([$F0, $9F, $98, $80]));
+  ExpectRoundTrip('round trip: empty', '');
+
+  ExpectDecoded('%20 decodes to a space', 'a%20b', 'a b');
+  ExpectDecoded('lower-case hex is accepted', '%c3%a7', Utf8Text([$C3, $A7]));
+  ExpectDecoded('lenient: a trailing % is kept', '100%', '100%');
+  ExpectDecoded('lenient: % plus one hex digit at the end is kept', 'a%4', 'a%4');
+  ExpectDecoded('lenient: % plus a non-hex digit is kept', '%G1x', '%G1x');
+end;
+
 begin
   WriteLn('Nghttp2GrpcFramingTests - gRPC length-prefix framing + reassembly');
   WriteLn('The variable under test is the CHOP PATTERN, not the payload.');
@@ -646,6 +1006,9 @@ begin
     TestTruncatedStream;
     TestEmptyStream;
     TestPercentEncode;
+    TestCompatibility;
+    TestReassembler;
+    TestPercentDecode;
   except
     on E: Exception do
     begin

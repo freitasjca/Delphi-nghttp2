@@ -22,6 +22,11 @@ unit Nghttp2.Grpc.StreamReader;
 //  not. The buffer compacts once drained, so a long-lived bidi stream does not
 //  grow by every byte it ever received.
 //
+//  GC0 (1.28.0): the rolling buffer is now TGrpcMessageReassembler in
+//  Nghttp2.Grpc.Framing, shared with the gRPC client. This unit keeps the
+//  transport half (ReadInbound, liveness) and its own error texts, which are
+//  unchanged: "gRPC stream: " + the reassembler's reason.
+//
 //  Extracted from horse-provider-nghttp2 on 2026-08-23. The layer never
 //  depended on Horse — only its unit name did; the sole input here is an
 //  INghttp2Stream. Any host that owns one can serve gRPC with it.
@@ -36,6 +41,7 @@ uses
   System.SysUtils, System.Classes,
 {$ENDIF}
   Nghttp2.Types,
+  Nghttp2.Grpc.Framing,      { GC0 - TGrpcMessageReassembler, the 4 MB default }
   Nghttp2.Grpc.Registry;
 
 const
@@ -49,19 +55,17 @@ const
     prefix (up to 4 GB) makes the server allocate on the peer's say-so before
     a single payload byte has been validated. 4 MB matches gRPC's common
     default max receive size. }
-  GRPC_MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
+  GRPC_MAX_MESSAGE_BYTES = GRPC_DEFAULT_MAX_MESSAGE_BYTES;
 
 type
   TGrpcStreamReader = class(TInterfacedObject, IGrpcStreamReader)
   private
     FStream:       INghttp2Stream;
     FRequestClass: TClass;
-    FBuf:          TBytes;      // rolling reassembly buffer
-    FBufLen:       Integer;     // valid bytes in FBuf (may be < Length(FBuf))
+    FFrames:       TGrpcMessageReassembler;   // GC0 - the rolling buffer
     FCurrent:      TObject;     // reader-owned; freed on next Next / destroy
     FCount:        Integer;
     function TryExtractMessage(out APayload: TBytes): Boolean;
-    procedure Compact;
   public
     constructor Create(const AStream: INghttp2Stream; ARequestClass: TClass);
     destructor  Destroy; override;
@@ -80,7 +84,7 @@ begin
   inherited Create;
   FStream       := AStream;
   FRequestClass := ARequestClass;
-  FBufLen       := 0;
+  FFrames       := TGrpcMessageReassembler.Create(GRPC_MAX_MESSAGE_BYTES);
   FCurrent      := nil;
   FCount        := 0;
 end;
@@ -91,65 +95,27 @@ begin
     IGrpcStreamReader.Next. Freeing it here is what makes "do not free it"
     correct advice rather than a leak. }
   FCurrent.Free;
+  FFrames.Free;
   inherited;
 end;
 
-{ Drops consumed bytes from the front. Called only when the buffer is fully
-  drained, which keeps it O(1) amortised: a partial message stays put until
-  the rest of it arrives rather than being memmoved on every read. }
-procedure TGrpcStreamReader.Compact;
-begin
-  FBufLen := 0;
-  SetLength(FBuf, 0);
-end;
+{ Pulls one complete message off the front of the buffer if there is one.
 
-{ Pulls one complete message off the front of FBuf if there is one.
-
-  Returns False when the buffer holds fewer than 5 bytes, or holds a header
-  whose payload has not fully arrived — both are "not yet", not errors. }
+  Returns False when fewer bytes than one whole message are buffered - "not
+  yet", not an error. Raises EGrpcRegistry, with the texts this unit has always
+  used, when the buffered header can never become a valid message. }
 function TGrpcStreamReader.TryExtractMessage(out APayload: TBytes): Boolean;
 var
-  LLen:   UInt32;
-  LTotal: Integer;
-  LRest:  Integer;
+  LError: string;
 begin
-  Result := False;
-  SetLength(APayload, 0);
-
-  if FBufLen < 5 then Exit;
-
-  if FBuf[0] <> 0 then
-    raise EGrpcRegistry.Create(
-      'gRPC stream: per-message compression is not supported');
-
-  LLen := (UInt32(FBuf[1]) shl 24) or
-          (UInt32(FBuf[2]) shl 16) or
-          (UInt32(FBuf[3]) shl 8)  or
-           UInt32(FBuf[4]);
-
-  if LLen > GRPC_MAX_MESSAGE_BYTES then
-    raise EGrpcRegistry.CreateFmt(
-      'gRPC stream: message length %u exceeds the %d-byte limit',
-      [LLen, GRPC_MAX_MESSAGE_BYTES]);
-
-  LTotal := 5 + Integer(LLen);
-  if FBufLen < LTotal then Exit;    // header complete, payload still arriving
-
-  SetLength(APayload, LLen);
-  if LLen > 0 then
-    Move(FBuf[5], APayload[0], LLen);
-
-  { Shift any trailing bytes — the start of the NEXT message, which arrived in
-    the same read — down to the front. Dropping them here is the subtle way to
-    lose every second message on a peer that batches. }
-  LRest := FBufLen - LTotal;
-  if LRest > 0 then
-    Move(FBuf[LTotal], FBuf[0], LRest);
-  FBufLen := LRest;
-  if FBufLen = 0 then
-    Compact;
-
-  Result := True;
+  case FFrames.TryNext(APayload, LError) of
+    gfrMessage:
+      Result := True;
+    gfrError:
+      raise EGrpcRegistry.Create('gRPC stream: ' + LError);
+  else
+    Result := False;
+  end;
 end;
 
 function TGrpcStreamReader.Next(out AMessage: TObject): Boolean;
@@ -189,10 +155,10 @@ begin
       { End of stream. A partial message still sitting in the buffer means the
         peer half-closed mid-message — report it rather than silently dropping
         the fragment, which would look like a clean short stream. }
-      if FBufLen > 0 then
+      if FFrames.BufferedBytes > 0 then
         raise EGrpcRegistry.CreateFmt(
           'gRPC stream: peer half-closed with %d bytes of an incomplete message',
-          [FBufLen]);
+          [FFrames.BufferedBytes]);
       Exit(False);
     end;
 
@@ -204,10 +170,7 @@ begin
       Continue;
     end;
 
-    if FBufLen + LRead > Length(FBuf) then
-      SetLength(FBuf, FBufLen + LRead);
-    Move(LChunk[0], FBuf[FBufLen], LRead);
-    Inc(FBufLen, LRead);
+    FFrames.Append(LChunk, LRead);
   end;
 end;
 
