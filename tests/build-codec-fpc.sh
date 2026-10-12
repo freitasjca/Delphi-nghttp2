@@ -29,6 +29,10 @@
 #                                       when libnghttp2 is absent.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
+#    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
+#                                       + HeadersOnly. Part B needs python h2 for
+#                                       client-trailers-peer.py and SKIPS LOUDLY
+#                                       without it; Part A always runs.)
 #                                       TLS 1.2/1.3 cipher setters read back
 #                                       from OpenSSL. Skips LOUDLY when
 #                                       OpenSSL is absent. Same name as the
@@ -824,6 +828,82 @@ else
     echo "  FAIL  Nghttp2StreamRead.dpr did not compile"
     grep -E "Error|Fatal" "$SROUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $SROUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── 4k · client trailers (GC1, B2 gRPC client plan) ──────────────────────────
+# Response.Trailers + Response.HeadersOnly. Part A drives our own server (body
+# and streamed body, with and without trailers, two streams at once). Part B
+# needs an INDEPENDENT peer: TNghttp2Server always sends DATA, so it cannot
+# produce a headers-only (gRPC Trailers-Only) response or a 1xx block at all.
+# The peer is client-trailers-peer.py on python h2. Interpreter: H2_PYTHON if
+# set, else the protogen venv, else python3 - whichever can `import h2`.
+# Without one, Part B prints SKIP and this stage says so; a skip is not a pass.
+echo
+echo "── client trailers (GC1) ─────────────────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientTrailers.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientTrailers.dpr not present"
+else
+  CTOUT="$OUT/client-trailers"
+  mkdir -p "$CTOUT"
+  rm -f "$CTOUT"/*.ppu "$CTOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$CTOUT" -FE"$CTOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientTrailers.dpr" > "$CTOUT/build.log" 2>&1 \
+     && [[ -x "$CTOUT/Nghttp2ClientTrailers" ]]; then
+
+    CT_PY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then CT_PY="$CAND"; break; fi
+    done
+
+    CT_PEER_PID=""
+    CT_ARGS=""
+    if [[ -n "$CT_PY" ]]; then
+      "$CT_PY" "$HERE/client-trailers-peer.py" 19322 --lifetime 60 \
+        > "$CTOUT/peer.log" 2>&1 &
+      CT_PEER_PID=$!
+      for _ in $(seq 1 50); do
+        grep -q '^READY' "$CTOUT/peer.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$CTOUT/peer.log" 2>/dev/null; then
+        CT_ARGS="peer=19322"
+      else
+        echo "  NOTE  the h2 peer did not start - see $CTOUT/peer.log"
+      fi
+    else
+      echo "  NOTE  no python with h2 (set H2_PYTHON, or pip install h2 into"
+      echo "        tools/protogen/.venv) - Part B will SKIP"
+    fi
+
+    timeout 60 "$CTOUT/Nghttp2ClientTrailers" $CT_ARGS < /dev/null | sed 's/^/  /'
+    CT_RC=${PIPESTATUS[0]}
+    [[ -n "$CT_PEER_PID" ]] && kill "$CT_PEER_PID" 2>/dev/null
+    wait "$CT_PEER_PID" 2>/dev/null || true
+
+    case "$CT_RC" in
+      0)   if [[ -n "$CT_ARGS" ]]; then
+             echo "  client trailers: PASSED (both parts)"
+           else
+             echo "  client trailers: Part A PASSED - Part B SKIPPED, headers-only and"
+             echo "        1xx handling were NOT exercised by this run"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - Response.Trailers was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  client trailers"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientTrailers.dpr did not compile"
+    grep -E "Error|Fatal" "$CTOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $CTOUT/build.log"
     RC=2
   fi
 fi

@@ -109,6 +109,22 @@ type
     Status:  Integer;
     Headers: TNghttp2Headers;
     Body:    TBytes;
+
+    { [GC1] The trailer section: the fields of a HEADERS block that arrived
+      AFTER the final response headers, i.e. after the body (RFC 9113 8.1).
+      gRPC carries grpc-status and grpc-message here.
+
+      Headers ALSO still holds these fields, exactly as it did before GC1, so
+      no existing caller sees a change. Trailers is the only place that tells
+      the two sections apart - which a gRPC client must do, because a status
+      found in the wrong section is a protocol error, not a status. }
+    Trailers: TNghttp2Headers;
+
+    { [GC1] True when the whole response was ONE HEADERS block that ended the
+      stream: no DATA and no trailer section. gRPC calls this shape
+      "Trailers-Only" and sends grpc-status in it, so for this shape the
+      status is in Headers and Trailers is empty by definition. }
+    HeadersOnly: Boolean;
   end;
 
   { MULTISTREAM-1 — one in-flight stream's accumulated state. The on_header,
@@ -138,6 +154,12 @@ type
     Streaming:  Boolean;
     Inbound:    TBytes;
     InboundLen: Integer;
+
+    { [GC1] The final response HEADERS block has been received. Every header
+      field after it belongs to the trailer section. Set only for a final
+      status (>= 200): a 1xx informational block is followed by the real
+      response headers, which must not be mistaken for trailers. }
+    HeadersDone: Boolean;
   end;
 
   TNghttp2Client = class
@@ -387,6 +409,14 @@ begin
     LHdr.Value := string(LValue);
     LClient.FStreams[LIdx].Response.Headers :=
       LClient.FStreams[LIdx].Response.Headers + [LHdr];
+
+    { [GC1] After the final response headers, a HEADERS frame can only be the
+      trailer section. The frame-type test keeps a PUSH_PROMISE, whose header
+      callbacks carry its associated stream's id, out of it. }
+    if LClient.FStreams[LIdx].HeadersDone
+       and (frame^.hd.ftype = NGHTTP2_HEADERS) then
+      LClient.FStreams[LIdx].Response.Trailers :=
+        LClient.FStreams[LIdx].Response.Trailers + [LHdr];
   end;
   Result := 0;
 end;
@@ -467,6 +497,11 @@ begin
 end;
 
 { [CL4] Receives connection-level frames. Two cases matter here:
+    HEADERS — [GC1] fires once per header BLOCK, after all of its fields.
+              The first block with a final status (>= 200) marks the stream's
+              response headers as complete, so the header callbacks that
+              follow are the trailer section; and if that block also carried
+              END_STREAM, the response was headers-only (gRPC Trailers-Only).
     GOAWAY  — the server will not accept new streams on this session. Set the
               flag so BeginRequest can reconnect transparently.
     PING+ACK — we sent a PING and this is the echo. Clear FPingPending so
@@ -479,10 +514,22 @@ function OnFrameRecvCb(
   user_data: Pointer): Integer; cdecl;
 var
   LClient: TNghttp2Client;
+  LIdx:    Integer;
 begin
   LClient := TNghttp2Client(user_data);
   if LClient = nil then Exit(0);
   case frame^.hd.ftype of
+    NGHTTP2_HEADERS:
+      begin
+        LIdx := LClient.FindSlot(frame^.hd.stream_id);
+        if (LIdx >= 0) and (not LClient.FStreams[LIdx].HeadersDone)
+           and (LClient.FStreams[LIdx].Response.Status >= 200) then
+        begin
+          LClient.FStreams[LIdx].HeadersDone := True;
+          LClient.FStreams[LIdx].Response.HeadersOnly :=
+            (frame^.hd.flags and NGHTTP2_FLAG_END_STREAM) <> 0;
+        end;
+      end;
     NGHTTP2_GOAWAY:
       LClient.FGoAwayReceived := True;
     NGHTTP2_PING:

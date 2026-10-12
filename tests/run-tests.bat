@@ -36,6 +36,10 @@ REM    4h Nghttp2ConnectTimeout           build + run   (gates; cmd has no
 REM                                       watchdog - a hang IS the result)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
+REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
+REM                                       Response.Trailers + HeadersOnly.
+REM                                       Part B needs Python with h2 and
+REM                                       SKIPS LOUDLY without it.
 REM                                       TLS 1.2/1.3 cipher setters, read
 REM                                       back from OpenSSL. Skips LOUDLY
 REM                                       when OpenSSL is absent.)
@@ -548,6 +552,80 @@ set "STAGE=Nghttp2KeyPassword"
 set "GATES=1"
 set "SKIPRC=3"
 call :build_run
+
+REM -- Stage 4k. Client trailers (GC1, B2 gRPC client plan). ----------------
+REM
+REM Response.Trailers + Response.HeadersOnly. Part A drives our own server and
+REM always runs. Part B needs an INDEPENDENT peer, client-trailers-peer.py on
+REM python h2: TNghttp2Server always sends DATA, so it can never produce a
+REM headers-only (gRPC Trailers-Only) response or a 1xx block. Without a
+REM python that can import h2, Part B SKIPS and this stage says so.
+REM
+REM The peer is started in a TITLED window and killed BY THAT TITLE with /T
+REM (py.exe launches python.exe as a child), never by image name. It also
+REM exits by itself after 60 s without a connection.
+if not exist "Nghttp2ClientTrailers.dpr" goto :no_trailers
+echo -- Nghttp2ClientTrailers ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientTrailers.dpr" > "Nghttp2ClientTrailers.buildlog" 2>&1
+if errorlevel 1 goto :trailers_buildfail
+if not exist "Nghttp2ClientTrailers.exe" goto :trailers_buildfail
+
+set "H2PY="
+for %%P in (py python) do if not defined H2PY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "H2PY=%%P"
+)
+set "CTARGS="
+set "CTTITLE=NGHTTP2TRAILERPEER"
+if not defined H2PY goto :trailers_nopeer
+start "!CTTITLE!" /min !H2PY! "client-trailers-peer.py" 19322 --lifetime 60
+ping -n 3 127.0.0.1 > nul
+set "CTARGS=peer=19322"
+goto :trailers_run
+
+:trailers_nopeer
+echo    NOTE  no Python with the h2 package ^(pip install h2^) - Part B will SKIP
+
+:trailers_run
+Nghttp2ClientTrailers.exe !CTARGS! < nul
+set "CT_RC=!errorlevel!"
+if defined H2PY taskkill /FI "WINDOWTITLE eq !CTTITLE!" /T /F > nul 2>&1
+echo.
+if "!CT_RC!"=="3" goto :trailers_skip
+if not "!CT_RC!"=="0" goto :trailers_fail
+if not defined H2PY goto :trailers_partial
+echo    PASS  Nghttp2ClientTrailers - both parts
+goto :after_trailers
+
+:trailers_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2ClientTrailers - Part A only. SKIP Part B: headers-only and
+echo          1xx handling were NOT exercised by this run
+goto :after_trailers
+
+:trailers_fail
+echo    FAIL  Nghttp2ClientTrailers - !CT_RC!
+set /a FAILED+=1
+goto :after_trailers
+
+:trailers_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientTrailers - libnghttp2 absent; Trailers NOT exercised
+goto :after_trailers
+
+:trailers_buildfail
+echo    FAIL  Nghttp2ClientTrailers did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientTrailers.buildlog"
+echo.
+echo    Full log: Nghttp2ClientTrailers.buildlog
+set /a FAILED+=1
+goto :after_trailers
+
+:no_trailers
+echo -- Nghttp2ClientTrailers ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientTrailers.dpr not present
+
+:after_trailers
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in
