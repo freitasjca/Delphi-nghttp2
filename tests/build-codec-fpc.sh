@@ -28,6 +28,7 @@
 #                                       that STARTS a server. Skips LOUDLY
 #                                       when libnghttp2 is absent.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
+#    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #                                       TLS 1.2/1.3 cipher setters read back
 #                                       from OpenSSL. Skips LOUDLY when
 #                                       OpenSSL is absent. Same name as the
@@ -670,6 +671,47 @@ if [[ -f "$HERE/Nghttp2CipherConfig.dpr" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2CipherConfig.dpr not present"
+fi
+
+# ── password-protected private keys (KEYPW-1) ──────────────────────────────
+# One key in four forms (certs-keypw/): right password loads, wrong password is
+# refused, a non-ASCII password must reach OpenSSL as UTF-8, and an encrypted
+# key with NO password must be refused WITHOUT OpenSSL prompting on the
+# terminal. The program puts each load on a thread with a 5 s deadline; the
+# outer `timeout` is the backstop if that machinery itself wedges.
+echo
+echo "── private-key passwords (KEYPW-1) ───────────────────────────────────"
+if [[ -f "$HERE/Nghttp2KeyPassword.dpr" ]]; then
+  KPOUT="$OUT/key-password"
+  mkdir -p "$KPOUT"
+  rm -f "$KPOUT"/*.ppu "$KPOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$KPOUT" -FE"$KPOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2KeyPassword.dpr" > "$KPOUT/build.log" 2>&1 \
+     && [[ -x "$KPOUT/Nghttp2KeyPassword" ]]; then
+    timeout 60 "$KPOUT/Nghttp2KeyPassword" "$HERE/certs-keypw" < /dev/null | sed 's/^/  /'
+    KP_RC=${PIPESTATUS[0]}
+    case "$KP_RC" in
+      0)   echo "  key passwords: PASSED" ;;
+      3)   echo "  SKIP  OpenSSL absent - key passwords were NOT exercised by this run." ;;
+      4)   echo "  FAIL  fixtures missing ($HERE/certs-keypw)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      124) echo "  FAIL  Nghttp2KeyPassword killed by timeout - a load blocked past"
+           echo "        its own deadline (OpenSSL prompting for a pass phrase?)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  private-key passwords"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2KeyPassword.dpr did not compile"
+    grep -E "Error|Fatal" "$KPOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $KPOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2KeyPassword.dpr not present"
 fi
 
 # ── read timeout (CL2c) — the one stage that can HANG instead of failing ─────

@@ -92,7 +92,7 @@ type
   TTlsServerContext = class
   strict private
     FCtx:      PSSL_CTX;
-    FPassword: AnsiString;    // holds password bytes so cb_userdata pointer stays valid
+    FPassword: RawByteString; // password bytes (KEYPW-1: UTF-8 on Delphi); keeps the cb_userdata pointer valid
     function GetHandle: PSSL_CTX;
   public
     // Constructs an empty context. Call LoadCertificate + LoadPrivateKey
@@ -101,10 +101,15 @@ type
     destructor  Destroy; override;
 
     // Set the password OpenSSL should use when decrypting an encrypted PEM
-    // key. MUST be called BEFORE LoadPrivateKeyFile. The password is held on
-    // the TTlsServerContext (via FPassword AnsiString) for the object's
-    // lifetime — safe because SSL_CTX and TTlsServerContext have matching
-    // scope. For unencrypted keys, don't call this.
+    // key. MUST be called BEFORE LoadPrivateKeyFile. The password bytes are
+    // held on the TTlsServerContext for the object's lifetime — safe because
+    // SSL_CTX and TTlsServerContext have matching scope. For unencrypted keys,
+    // don't call this.
+    // KEYPW-1: on Delphi the password goes to OpenSSL as UTF-8, the encoding
+    // the openssl CLI and Linux use, so a non-ASCII password works; on FPC the
+    // string's bytes are passed unchanged (hold UTF-8 there). Without a
+    // password, an encrypted key is REFUSED at LoadPrivateKeyFile: this
+    // context never lets OpenSSL prompt on the terminal for one.
     procedure SetPrivateKeyPassword(const APassword: string);
 
     // Load PEM-encoded cert + key from disk. On mismatch or missing file,
@@ -329,7 +334,7 @@ type
   TTlsClientContext = class
   strict private
     FCtx:      PSSL_CTX;
-    FPassword: AnsiString;    // key-password holder — same lifetime rule as server
+    FPassword: RawByteString; // key-password bytes — same lifetime and encoding rules as server
     function GetHandle: PSSL_CTX;
   public
     // Constructs an empty client context. Raises ENghttp2Tls if OpenSSL
@@ -557,6 +562,39 @@ begin
   Result := LLen;
 end;
 
+// KEYPW-1: the bytes OpenSSL receives for a key password. PEM/PKCS#8 key
+// encryption hashes the raw password bytes, and keys are encrypted from
+// UTF-8 by the openssl CLI and on Linux. Delphi's string is UTF-16, and the
+// old AnsiString(APassword) went through the Windows ANSI code page, so
+// "pässwörd" arrived as Latin-1 bytes and the key could not be opened
+// (measured: Nghttp2KeyPassword P5/C3, bad decrypt). FPC's string is an
+// AnsiString already holding the program's bytes, so it is passed unchanged.
+function PasswordBytes(const APassword: string): RawByteString;
+begin
+{$IF DEFINED(FPC)}
+  Result := RawByteString(APassword);
+{$ELSE}
+  Result := RawByteString(UTF8String(APassword));
+{$ENDIF}
+end;
+
+// KEYPW-1: installed by both context constructors, with no password, so an
+// encrypted key loaded without one fails at once instead of falling back to
+// OpenSSL's default callback, which PROMPTS on the terminal (measured: a
+// Windows console server waited forever at "Enter PEM pass phrase:", and on
+// Linux OpenSSL printed the prompt and failed only because its read hit EOF).
+procedure InstallPasswordCallback(ACtx: PSSL_CTX);
+begin
+  SSL_CTX_set_default_passwd_cb(ACtx, @PemPasswordCallback);
+  SSL_CTX_set_default_passwd_cb_userdata(ACtx, nil);
+end;
+
+// Appended to a failed key load when no password was set.
+const
+  NO_PASSWORD_HINT =
+    ' - if the key is encrypted, set its password (SSLKeyPassword); ' +
+    'this library never prompts for one';
+
 // ─── TTlsServerContext ──────────────────────────────────────────────────
 
 constructor TTlsServerContext.Create;
@@ -574,6 +612,7 @@ begin
   FCtx := SSL_CTX_new(TLS_server_method());
   if FCtx = nil then
     RaiseTls('SSL_CTX_new', 0, nil);
+  InstallPasswordCallback(FCtx);   // KEYPW-1: never prompt
 end;
 
 destructor TTlsServerContext.Destroy;
@@ -596,7 +635,7 @@ begin
   // Hold the password as an AnsiString on Self so the pointer we hand to
   // OpenSSL stays valid across the LoadPrivateKeyFile call (the callback
   // fires from inside PEM_read_bio_PrivateKey during that load).
-  FPassword := AnsiString(APassword);
+  FPassword := PasswordBytes(APassword);   // KEYPW-1: UTF-8 on Delphi
 
   SSL_CTX_set_default_passwd_cb(FCtx, @PemPasswordCallback);
   // Pointer(FPassword) yields a PAnsiChar to the string's first byte, or nil
@@ -620,8 +659,14 @@ var
 begin
   LPathAnsi := AnsiString(APath);
   if SSL_CTX_use_PrivateKey_file(FCtx, PAnsiChar(LPathAnsi), SSL_FILETYPE_PEM) <> 1 then
+  begin
+    if FPassword = '' then
+      raise ENghttp2Tls.CreateFmt(
+        'SSL_CTX_use_PrivateKey_file(%s) failed: %s%s',
+        [APath, NghttpsslLastError, NO_PASSWORD_HINT]);
     raise ENghttp2Tls.CreateFmt(
       'SSL_CTX_use_PrivateKey_file(%s) failed: %s', [APath, NghttpsslLastError]);
+  end;
 end;
 
 procedure TTlsServerContext.CheckKeyMatch;
@@ -1313,6 +1358,7 @@ begin
 
   // Default: verify server cert. Callers explicitly opt into insecure mode.
   SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil);
+  InstallPasswordCallback(FCtx);   // KEYPW-1: never prompt
 end;
 
 destructor TTlsClientContext.Destroy;
@@ -1343,9 +1389,15 @@ begin
   // Password FIRST (before key load), same rule as server side.
   if AKeyPassword <> '' then
   begin
-    FPassword := AnsiString(AKeyPassword);
+    FPassword := PasswordBytes(AKeyPassword);   // KEYPW-1: UTF-8 on Delphi
     SSL_CTX_set_default_passwd_cb(FCtx, @PemPasswordCallback);
     SSL_CTX_set_default_passwd_cb_userdata(FCtx, Pointer(FPassword));
+  end
+  else
+  begin
+    // KEYPW-1: a call without a password must not reuse an earlier call's.
+    FPassword := '';
+    SSL_CTX_set_default_passwd_cb_userdata(FCtx, nil);
   end;
 
   LCertAnsi := AnsiString(ACertFile);
@@ -1356,9 +1408,15 @@ begin
 
   LKeyAnsi := AnsiString(AKeyFile);
   if SSL_CTX_use_PrivateKey_file(FCtx, PAnsiChar(LKeyAnsi), SSL_FILETYPE_PEM) <> 1 then
+  begin
+    if FPassword = '' then
+      raise ENghttp2Tls.CreateFmt(
+        'SSL_CTX_use_PrivateKey_file(%s) [client-side mTLS] failed: %s%s',
+        [AKeyFile, NghttpsslLastError, NO_PASSWORD_HINT]);
     raise ENghttp2Tls.CreateFmt(
       'SSL_CTX_use_PrivateKey_file(%s) [client-side mTLS] failed: %s',
       [AKeyFile, NghttpsslLastError]);
+  end;
 
   if SSL_CTX_check_private_key(FCtx) <> 1 then
     raise ENghttp2Tls.CreateFmt(

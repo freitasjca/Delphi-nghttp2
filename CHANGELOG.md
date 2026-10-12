@@ -13,6 +13,7 @@ The project has been on `1.x` since its first public tag.
 
 | Version | Date | Headline |
 |---|---|---|
+| [1.27.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.27.0) | 2026-10-12 | encrypted private keys never prompt on the terminal; key passwords sent as UTF-8 on Delphi |
 | [1.26.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.26.0) | 2026-10-05 | HTTP/2 TLS 1.2 cipher check against the RFC 7540 block list |
 | [1.25.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.25.0) | 2026-10-05 | exact OpenSSL build in every TLS message (`OpenSSL_version`) |
 | [1.24.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.24.0) | 2026-10-05 | gRPC errors stop leaking the exception class name; grpc-message percent-encoded |

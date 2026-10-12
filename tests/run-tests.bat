@@ -35,6 +35,7 @@ REM                                       RSS check is Linux-only, skipped here)
 REM    4h Nghttp2ConnectTimeout           build + run   (gates; cmd has no
 REM                                       watchdog - a hang IS the result)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
+REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM                                       TLS 1.2/1.3 cipher setters, read
 REM                                       back from OpenSSL. Skips LOUDLY
 REM                                       when OpenSSL is absent.)
@@ -530,6 +531,20 @@ REM absent, a loud skip. The CONTROL line is informational: it shows whether
 REM this OpenSSL silently drops a typo next to a valid suite name (3.0.13
 REM does), which is why the TLS 1.3 setter reads back.
 set "STAGE=Nghttp2CipherConfig"
+set "GATES=1"
+set "SKIPRC=3"
+call :build_run
+
+REM -- Stage 4j. Password-protected private keys (KEYPW-1). -----------------
+REM
+REM Loads one key in four forms (tests\certs-keypw) through TTlsServerContext
+REM and TTlsClientContext: right password must load, wrong password must be
+REM refused, a non-ASCII password must reach OpenSSL as UTF-8, and an
+REM encrypted key with NO password must be refused WITHOUT OpenSSL prompting
+REM on the terminal. Each load runs on its own thread with a 5 s deadline, so
+REM a prompt is reported as a failure instead of hanging this script. Needs
+REM OpenSSL only. Exit 3 = OpenSSL absent (loud skip); 4 = fixtures missing.
+set "STAGE=Nghttp2KeyPassword"
 set "GATES=1"
 set "SKIPRC=3"
 call :build_run
