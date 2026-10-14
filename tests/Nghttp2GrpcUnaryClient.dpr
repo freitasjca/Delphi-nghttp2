@@ -51,6 +51,17 @@ program Nghttp2GrpcUnaryClient;
 //  WIRE. Part B: grpcio's application sees the metadata and the deadline
 //  (context.time_remaining), and enforces it too.
 //
+//  ── GC4: server streaming ──
+//
+//  /gctest.Probe/Count streams num messages. Part A (our dispatcher): order,
+//  an empty stream, a handler that fails after 2 messages (both kept, then
+//  13), a deadline, the one-call-at-a-time rule and recovery after a release.
+//  Part B (grpcio): order, abort after 2 (kept, then 5), and a deadline that
+//  fires AFTER messages arrived - grpcio streams them as they are produced,
+//  which our inline dispatcher does not. Part C (raw h2): a stream cut into
+//  7-byte DATA frames, no trailer, truncated, a 4 MB + 1 header (8, refused on
+//  the header alone), HTTP 503.
+//
 //  The verification failures are asserted by their X509_V_* CODE through
 //  TNghttp2Client (ENghttp2TlsCertVerify.VerifyResult), never by the text,
 //  which differs between OpenSSL versions; at the gRPC level every TLS
@@ -147,6 +158,7 @@ type
     procedure Fail(const AReq: TObject; const AResp: TObject);
     procedure Empty(const AReq: TObject; const AResp: TObject);
     procedure Slow(const AReq: TObject; const AResp: TObject);
+    procedure Count(const ARequest: TObject; const AWriter: IGrpcStreamWriter);
   end;
 
   { GC2b: what a test client context trusts, and which certificate it shows. }
@@ -231,6 +243,34 @@ begin
   Sleep(TEchoRequest(AReq).num);
   TEchoReply(AResp).text := 'slept';
   TEchoReply(AResp).num  := TEchoRequest(AReq).num;
+end;
+
+{ GC4: see gctest.proto Count. Raising after K messages makes our dispatcher
+  end the stream with 13 and the message - after the K already sent. }
+procedure TProbeService.Count(const ARequest: TObject; const AWriter: IGrpcStreamWriter);
+var
+  I, LFailAt, LDelay: Integer;
+  LText:  string;
+  LReply: TEchoReply;
+begin
+  LText   := TEchoRequest(ARequest).text;
+  LFailAt := -1;
+  LDelay  := 0;
+  if Copy(LText, 1, 5) = 'fail:' then
+    LFailAt := StrToIntDef(Copy(LText, 6, MaxInt), 0)
+  else if LText = 'slow' then
+    LDelay := 300;
+  for I := 1 to TEchoRequest(ARequest).num do
+  begin
+    if I - 1 = LFailAt then
+      raise Exception.CreateFmt('stopped at %d', [LFailAt]);
+    if LDelay > 0 then
+      Sleep(LDelay);
+    LReply := TEchoReply.Create;
+    LReply.text := 'item' + IntToStr(I);
+    LReply.num  := I;
+    AWriter.Send(LReply);           // Send takes ownership
+  end;
 end;
 
 procedure HandleRequest(const AStream: INghttp2Stream);
@@ -410,6 +450,63 @@ begin
   Result.AddMetadata(AName, AValue);
 end;
 
+// ── GC4 helpers ─────────────────────────────────────────────────────────────
+
+{ Opens a server stream and reads it to its end. AItems: the texts received,
+  comma-joined. AStatus: 0 for a clean end, the gRPC code it raised, or -1
+  for any other exception (named in AMessage). }
+procedure DrainStream(AChannel: TGrpcChannel; const APath: string;
+  ARequest: TObject; const AOptions: TGrpcCallOptions;
+  out AItems: string; out AStatus: Integer; out AMessage: string);
+var
+  LStream: IGrpcClientStream;
+begin
+  AItems   := '';
+  AStatus  := -1;
+  AMessage := '';
+  try
+    LStream := AChannel.ServerStream(APath, ARequest, TEchoReply, AOptions);
+    while LStream.MoveNext do
+    begin
+      if AItems <> '' then
+        AItems := AItems + ',';
+      AItems := AItems + TEchoReply(LStream.Current).text;
+    end;
+    AStatus := 0;
+  except
+    on E: EGrpcClientError do
+    begin
+      AStatus  := E.Status;
+      AMessage := E.GrpcMessage;
+    end;
+    on E: Exception do
+    begin
+      AStatus  := -1;
+      AMessage := E.ClassName + ': ' + E.Message;
+    end;
+  end;
+end;
+
+{ One stream case: the exact items, then the exact ending. }
+procedure StreamCase(AChannel: TGrpcChannel; const AName, APath: string;
+  ARequest: TObject; const AOptions: TGrpcCallOptions;
+  const AExpectItems: string; AExpectStatus: Integer; const AExpectMessage: string = '');
+var
+  LItems, LMsg: string;
+  LStatus:      Integer;
+begin
+  DrainStream(AChannel, APath, ARequest, AOptions, LItems, LStatus, LMsg);
+  Check(AName, (LItems = AExpectItems) and (LStatus = AExpectStatus)
+    and ((AExpectMessage = '') or (LMsg = AExpectMessage)),
+    Format('items [%s] status %d "%s"; expected [%s] status %d', [LItems, LStatus,
+      LMsg, AExpectItems, AExpectStatus]));
+end;
+
+function CountReq(ANum: Integer; const AText: string): TEchoRequest;
+begin
+  Result := NewEcho(AText, ANum);
+end;
+
 { The part every peer that implements gctest.Probe must pass: Echo, Empty,
   an unknown method. Returns nothing; records checks. }
 procedure CommonCalls(AChannel: TGrpcChannel; const APrefix: string);
@@ -459,6 +556,77 @@ end;
 
 { GC3 against our own server. Our dispatcher ignores grpc-timeout, so every
   deadline here is enforced by the CLIENT alone. }
+procedure GC4PartA(AChannel: TGrpcChannel);
+var
+  LReq, LEcho:  TEchoRequest;
+  LStream:      IGrpcClientStream;
+  LReply:       TEchoReply;
+  LItems, LMsg: string;
+  LStatus:      Integer;
+begin
+  WriteLn;
+  WriteLn('-- A4  GC4: server streaming');
+  LEcho := NewEcho('mid', 1);
+  LReq  := CountReq(5, '');
+  try
+    StreamCase(AChannel, 'A Count(5): five messages, in order, then a clean end',
+      '/gctest.Probe/Count', LReq, Opts(0), 'item1,item2,item3,item4,item5', 0);
+    LReq.num := 0;
+    StreamCase(AChannel, 'A Count(0): no message, a clean end',
+      '/gctest.Probe/Count', LReq, Opts(0), '', 0);
+    LReq.num := 5;
+    LReq.text := 'fail:2';
+    StreamCase(AChannel, 'A handler fails after 2: both delivered, then 13 with its message',
+      '/gctest.Probe/Count', LReq, Opts(0), 'item1,item2', GRPC_STATUS_INTERNAL,
+      'stopped at 2');
+    { Our dispatcher sends a stream in one burst when the handler returns
+      (inline dispatch), so only the status is asserted here; Part B shows
+      messages arriving before a deadline. }
+    LReq.text := 'slow';
+    DrainStream(AChannel, '/gctest.Probe/Count', LReq, Opts(500), LItems, LStatus, LMsg);
+    Check('A deadline 500 ms vs a 1.5 s stream -> 4 DEADLINE_EXCEEDED',
+      LStatus = GRPC_STATUS_DEADLINE_EXCEEDED, Format('status %d "%s"', [LStatus, LMsg]));
+
+    LReply := CallOkOpt(AChannel, 'A a unary call after a failed stream',
+      '/gctest.Probe/Echo', LEcho, Opts(3000));
+    if LReply <> nil then
+    try
+      Check('A a unary call after a failed stream works', LReply.text = 'echo:mid');
+    finally
+      LReply.Free;
+    end;
+
+    { One call at a time: an open stream refuses a second call, and releasing
+      it early frees the channel. }
+    LReq.text := '';
+    try
+      LStream := AChannel.ServerStream('/gctest.Probe/Count', LReq, TEchoReply, Opts(0));
+      try
+        Check('A first MoveNext of an open stream', LStream.MoveNext and
+          (TEchoReply(LStream.Current).text = 'item1'));
+        ExpectStatusOpt(AChannel, 'A a unary call while a stream is open -> 9 FAILED_PRECONDITION',
+          '/gctest.Probe/Echo', LEcho, Opts(3000), GRPC_STATUS_FAILED_PRECONDITION);
+      finally
+        LStream := nil;    // released before its end
+      end;
+    except
+      on E: Exception do
+        Check('A an open stream', False, E.ClassName + ': ' + E.Message);
+    end;
+    LReply := CallOkOpt(AChannel, 'A a unary call after releasing a stream early',
+      '/gctest.Probe/Echo', LEcho, Opts(3000));
+    if LReply <> nil then
+    try
+      Check('A a unary call after releasing a stream early works', LReply.text = 'echo:mid');
+    finally
+      LReply.Free;
+    end;
+  finally
+    LReq.Free;
+    LEcho.Free;
+  end;
+end;
+
 procedure GC3PartA(AChannel: TGrpcChannel);
 const
   DEADLINE = 400;
@@ -576,6 +744,7 @@ begin
       end;
 
       GC3PartA(LChannel);
+      GC4PartA(LChannel);
     finally
       LChannel.Free;
     end;
@@ -640,6 +809,31 @@ begin
   end;
 end;
 
+{ GC4 against grpcio, which sends each message as it is produced. }
+procedure GC4PartB(AChannel: TGrpcChannel);
+var
+  LReq:         TEchoRequest;
+  LItems, LMsg: string;
+  LStatus:      Integer;
+begin
+  LReq := CountReq(5, '');
+  try
+    StreamCase(AChannel, 'B GC4 Count(5) from grpcio: five messages, in order, clean end',
+      '/gctest.Probe/Count', LReq, Opts(0), 'item1,item2,item3,item4,item5', 0);
+    LReq.text := 'fail:2';
+    StreamCase(AChannel, 'B GC4 abort(NOT_FOUND) after 2: both delivered, then 5 with its message',
+      '/gctest.Probe/Count', LReq, Opts(0), 'item1,item2', GRPC_STATUS_NOT_FOUND,
+      'stopped at 2');
+    LReq.text := 'slow';
+    DrainStream(AChannel, '/gctest.Probe/Count', LReq, Opts(700), LItems, LStatus, LMsg);
+    Check('B GC4 deadline 700 ms vs a slow grpcio stream: messages first, then 4',
+      (LStatus = GRPC_STATUS_DEADLINE_EXCEEDED) and (LItems <> ''),
+      Format('items [%s] status %d "%s"', [LItems, LStatus, LMsg]));
+  finally
+    LReq.Free;
+  end;
+end;
+
 procedure PartB(APort: Integer);
 var
   LChannel: TGrpcChannel;
@@ -669,6 +863,7 @@ begin
     end;
 
     GC3PartB(LChannel);
+    GC4PartB(LChannel);
   finally
     LChannel.Free;
   end;
@@ -701,6 +896,18 @@ begin
     Raw('TrailersOnlyOk', GRPC_STATUS_INTERNAL);
     Raw('BadStatus',      GRPC_STATUS_UNKNOWN);
     Raw('Truncated',      GRPC_STATUS_INTERNAL);
+
+    { GC4: streams no real server sends. }
+    StreamCase(LChannel, 'C GC4 a stream cut into 7-byte DATA frames: 3 messages, clean end',
+      '/gctest.Raw/StreamChunked', LReq, Opts(3000), 'raw1,raw2,raw3', 0);
+    StreamCase(LChannel, 'C GC4 no trailer: both messages, then 13',
+      '/gctest.Raw/StreamNoTrailer', LReq, Opts(3000), 'raw1,raw2', GRPC_STATUS_INTERNAL);
+    StreamCase(LChannel, 'C GC4 truncated last message: two kept, then 13 (grpcio accepts this)',
+      '/gctest.Raw/StreamTruncated', LReq, Opts(3000), 'raw1,raw2', GRPC_STATUS_INTERNAL);
+    StreamCase(LChannel, 'C GC4 a 4 MB + 1 header: refused on the header, 8 RESOURCE_EXHAUSTED',
+      '/gctest.Raw/StreamTooBig', LReq, Opts(3000), '', GRPC_STATUS_RESOURCE_EXHAUSTED);
+    StreamCase(LChannel, 'C GC4 HTTP 503 -> 14, no message read from the body',
+      '/gctest.Raw/StreamHttp503', LReq, Opts(3000), '', GRPC_STATUS_UNAVAILABLE);
 
     { GC3: what actually went on the wire. }
     LReply := CallOkOpt(LChannel, 'C GC3 EchoHeaders',
@@ -991,7 +1198,7 @@ var
   GService: TProbeService;
 
 begin
-  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS, GC3 deadlines/metadata)');
+  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS, GC3 deadlines/metadata, GC4 server streaming)');
 
   if not NghttpLoad then
   begin
@@ -1013,6 +1220,8 @@ begin
       TEchoRequest, TEchoReply, GService.Empty);
     TGrpcRegistry.RegisterMethod('/gctest.Probe/Slow',
       TEchoRequest, TEchoReply, GService.Slow);
+    TGrpcRegistry.RegisterServerStream('/gctest.Probe/Count',
+      TEchoRequest, TEchoReply, GService.Count);
     try
       try
         PartA;

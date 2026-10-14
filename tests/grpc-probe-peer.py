@@ -78,6 +78,18 @@ def main():
             time.sleep(request.num / 1000.0)
             return pb2.EchoReply(text='slept', num=request.num)
 
+        def Count(self, request, context):
+            fail_at = -1
+            if request.text.startswith('fail:'):
+                fail_at = int(request.text[5:])
+            delay = 0.3 if request.text == 'slow' else 0.0
+            for i in range(1, request.num + 1):
+                if i - 1 == fail_at:
+                    context.abort(grpc.StatusCode.NOT_FOUND, 'stopped at %d' % fail_at)
+                if delay:
+                    time.sleep(delay)
+                yield pb2.EchoReply(text='item%d' % i, num=i)
+
         def Meta(self, request, context):
             md = sorted((k, v) for k, v in context.invocation_metadata()
                         if k.startswith('x-'))

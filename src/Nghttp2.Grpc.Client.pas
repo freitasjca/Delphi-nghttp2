@@ -39,6 +39,9 @@ unit Nghttp2.Grpc.Client;
 //    grpc-status not a number                           2  UNKNOWN
 //    status 0 but no message / two messages /
 //    truncated / compressed / undecodable message       13 INTERNAL
+//    a message over MaxReceiveMessageBytes              8  RESOURCE_EXHAUSTED
+//                                                       (GC4; what grpc-go and
+//                                                       grpcio report too)
 //    request could not be encoded                       13 INTERNAL
 //
 //  grpc-message is percent-decoded (Nghttp2.Grpc.Framing) before it reaches
@@ -66,10 +69,31 @@ unit Nghttp2.Grpc.Client;
 //  is implemented. A bad name or value raises EArgumentException before
 //  anything is sent: it is a bug in the caller, not a call status.
 //
+//  ── Server streaming (GC4) ──
+//
+//    LStream := LChannel.ServerStream('/pkg.Svc/List', LReq, TItem, LOpt);
+//    while LStream.MoveNext do
+//      Use(LStream.Current as TItem);      // the STREAM owns Current
+//
+//  Current belongs to the stream and is freed by the next MoveNext (or when
+//  the stream is released): copy what you keep. MoveNext returns False only
+//  for a stream that ENDED WELL (grpc-status 0). Any other end - a non-zero
+//  status after some messages, a missing trailer, a truncated or oversized
+//  message, a dropped connection - RAISES EGrpcClientError from MoveNext, and
+//  the messages already returned stay returned. Status is never left for the
+//  caller to remember to check.
+//
+//  Deadlines: DeadlineMS bounds the WHOLE stream, connecting included (4).
+//  Without one, CallTimeoutMS bounds each wait for the NEXT message - an idle
+//  limit, since a healthy stream may run for hours. One call at a time per
+//  channel: while a stream is open, Unary and ServerStream on the same
+//  channel raise 9 FAILED_PRECONDITION. Releasing a stream before its end
+//  drops the connection (the next call opens a fresh one). The stream must
+//  not outlive its channel; if it does, MoveNext raises 14.
+//
 //  ── Not here yet ──
 //
-//  Server streaming is GC4; client and bidi streaming are deferred (plan
-//  decision D1).
+//  Client and bidi streaming are deferred (plan decision D1).
 //
 //  ── TLS (GC2b) ──
 //
@@ -129,6 +153,21 @@ type
     procedure AddMetadata(const AName, AValue: string);
   end;
 
+  { GC4. A server-streaming call in progress; see the unit header. }
+  IGrpcClientStream = interface
+    ['{5E2B7C41-9A3D-4F60-8B17-2C9E4D6A1F03}']
+    { True: Current holds the next message. False: the stream ended with
+      grpc-status 0. Every other ending raises EGrpcClientError. }
+    function MoveNext: Boolean;
+    { The message MoveNext just decoded. Owned by the stream: freed by the
+      next MoveNext and when the stream is released. nil before the first
+      MoveNext and after the last. }
+    function GetCurrent: TObject;
+    { Messages delivered so far. }
+    function Received: Integer;
+    property Current: TObject read GetCurrent;
+  end;
+
   TGrpcChannel = class
   private
     FClient:          TNghttp2Client;
@@ -136,7 +175,11 @@ type
     FPort:            Word;
     FCallTimeoutMS:   Integer;
     FMaxReceiveBytes: Integer;
+    FOpenStream:      TObject;   // GC4: the TGrpcClientStream in progress, not owned
     procedure EnsureConnected;
+    procedure RefuseWhileStreaming;
+    function  BuildCallHeaders(const AOptions: TGrpcCallOptions;
+      out ABudgetMS: Integer): TNghttp2Headers;
   public
     { Connects lazily, on the first call. ATlsContext is BORROWED: the caller
       keeps it alive for the channel's lifetime and frees it afterwards. nil
@@ -155,8 +198,17 @@ type
     function Unary(const APath: string; ARequest: TObject;
       AResponseClass: TClass; const AOptions: TGrpcCallOptions): TObject; overload;
 
+    { GC4: one server-streaming call. ARequest is serialised and NOT freed;
+      AResponseClass is the type of EACH streamed message. Read it with
+      MoveNext - see the unit header for ownership, endings and deadlines. }
+    function ServerStream(const APath: string; ARequest: TObject;
+      AResponseClass: TClass): IGrpcClientStream; overload;
+    function ServerStream(const APath: string; ARequest: TObject;
+      AResponseClass: TClass; const AOptions: TGrpcCallOptions): IGrpcClientStream; overload;
+
     { How long a call WITHOUT a deadline may wait for its response, in ms.
-      Local only - nothing is sent. A call with a deadline uses the deadline. }
+      Local only - nothing is sent. A call with a deadline uses the deadline.
+      For a server stream it is the wait for each NEXT message. }
     property CallTimeoutMS: Integer read FCallTimeoutMS write FCallTimeoutMS;
 
     { Ceiling on one received message; defaults to 4 MB like the server. }
@@ -221,6 +273,56 @@ end;
 procedure Fail(AStatus: Integer; const AMessage: string);
 begin
   raise EGrpcClientError.CreateStatus(AStatus, AMessage);
+end;
+
+{ :status and content-type - what says a gRPC server answered at all. }
+procedure CheckResponseHead(const AResp: TNghttp2Response; const APath: string);
+var
+  LValue: string;
+begin
+  if AResp.Status = 0 then
+    Fail(GRPC_STATUS_UNAVAILABLE,
+      Format('the stream to %s closed before any response headers', [APath]));
+  if AResp.Status <> 200 then
+    Fail(HttpToGrpcStatus(AResp.Status),
+      Format('HTTP status %d from %s', [AResp.Status, APath]));
+  if not FindHeader(AResp.Headers, 'content-type', LValue)
+     or not SameText(Copy(LValue, 1, 16), 'application/grpc') then
+    Fail(GRPC_STATUS_INTERNAL,
+      Format('response content-type is "%s", not application/grpc', [LValue]));
+end;
+
+{ GC1: the status lives in the trailers, or in the headers of a headers-only
+  response - never anywhere else. Headers also holds the trailer fields (kept
+  for compatibility), so it is read only in the headers-only case, where no
+  trailer section exists. Raises for anything but grpc-status 0. }
+procedure CheckGrpcStatus(const AResp: TNghttp2Response);
+var
+  LStatusList: TNghttp2Headers;
+  LValue:      string;
+  LStatus:     Integer;
+begin
+  if AResp.HeadersOnly then
+    LStatusList := AResp.Headers
+  else
+    LStatusList := AResp.Trailers;
+
+  if not FindHeader(LStatusList, 'grpc-status', LValue) then
+  begin
+    if AResp.HeadersOnly then
+      Fail(GRPC_STATUS_INTERNAL, 'headers-only response without grpc-status')
+    else
+      Fail(GRPC_STATUS_INTERNAL, 'response has no grpc-status trailer');
+  end;
+  LStatus := StrToIntDef(Trim(LValue), -1);
+  if LStatus < 0 then
+    Fail(GRPC_STATUS_UNKNOWN, Format('grpc-status "%s" is not a number', [LValue]));
+
+  if LStatus <> GRPC_STATUS_OK then
+  begin
+    FindHeader(LStatusList, 'grpc-message', LValue);
+    Fail(LStatus, GrpcDecodeStatusMessage(LValue));
+  end;
 end;
 
 { ── GC3 helpers ─────────────────────────────────────────────────────────── }
@@ -297,6 +399,212 @@ end;
 
 { ── TGrpcChannel ────────────────────────────────────────────────────────── }
 
+{ ── TGrpcClientStream (GC4) ──────────────────────────────────────────────── }
+
+type
+  TGrpcClientStream = class(TInterfacedObject, IGrpcClientStream)
+  private
+    FChannel:       TGrpcChannel;   // nil once finished or detached
+    FStreamId:      Int32;
+    FPath:          string;
+    FResponseClass: TClass;
+    FDeadlineMS:    Integer;        // 0 = none: CallTimeoutMS per message
+    FStart:         TDateTime;
+    FReasm:         TGrpcMessageReassembler;
+    FCurrent:       TObject;
+    FCount:         Integer;
+    FHeadChecked:   Boolean;
+    FTaken:         Boolean;        // TakeResponse done: the HTTP/2 stream is closed
+    FFinished:      Boolean;
+    procedure Finish;
+    procedure Abandon;
+  public
+    constructor Create(AChannel: TGrpcChannel; AStreamId: Int32;
+      const APath: string; AResponseClass: TClass; ADeadlineMS: Integer;
+      AStart: TDateTime);
+    destructor Destroy; override;
+    function MoveNext: Boolean;
+    function GetCurrent: TObject;
+    function Received: Integer;
+  end;
+
+constructor TGrpcClientStream.Create(AChannel: TGrpcChannel; AStreamId: Int32;
+  const APath: string; AResponseClass: TClass; ADeadlineMS: Integer;
+  AStart: TDateTime);
+begin
+  inherited Create;
+  FChannel       := AChannel;
+  FStreamId      := AStreamId;
+  FPath          := APath;
+  FResponseClass := AResponseClass;
+  FDeadlineMS    := ADeadlineMS;
+  FStart         := AStart;
+  FReasm         := TGrpcMessageReassembler.Create(AChannel.FMaxReceiveBytes);
+end;
+
+destructor TGrpcClientStream.Destroy;
+begin
+  FreeAndNil(FCurrent);
+  if not FFinished then
+    Abandon;          // released before its end: the stream is still open
+  FReasm.Free;
+  inherited;
+end;
+
+{ Detach from the channel, leaving the connection as it is. }
+procedure TGrpcClientStream.Finish;
+begin
+  if FChannel <> nil then
+  begin
+    if FChannel.FOpenStream = Self then
+      FChannel.FOpenStream := nil;
+    FChannel := nil;
+  end;
+  FFinished := True;
+end;
+
+{ The HTTP/2 stream is still open (or in an unknown state): drop the
+  connection, as after a deadline, so the next call starts clean. }
+procedure TGrpcClientStream.Abandon;
+begin
+  if (FChannel <> nil) and not FTaken then
+    try
+      FChannel.FClient.Disconnect;
+    except
+    end;
+  Finish;
+end;
+
+function TGrpcClientStream.GetCurrent: TObject;
+begin
+  Result := FCurrent;
+end;
+
+function TGrpcClientStream.Received: Integer;
+begin
+  Result := FCount;
+end;
+
+function TGrpcClientStream.MoveNext: Boolean;
+const
+  READ_CHUNK = 65536;
+var
+  LPayload: TBytes;
+  LChunk:   TBytes;
+  LError:   string;
+  LGot:     Integer;
+  LWaitMS:  Int64;
+  LObj:     TObject;
+  LResp:    TNghttp2Response;
+begin
+  Result := False;
+  FreeAndNil(FCurrent);
+  if FFinished then
+    Exit;
+  if FChannel = nil then
+  begin
+    FFinished := True;
+    Fail(GRPC_STATUS_UNAVAILABLE, 'the channel was freed while this stream was open');
+  end;
+
+  try
+    repeat
+      { Whole messages already buffered go first - one DATA frame may carry
+        several, and the end of the stream may arrive with them. }
+      case FReasm.TryNext(LPayload, LError) of
+        gfrMessage:
+          begin
+            LObj := FResponseClass.Create;
+            try
+              TProtoSerializer.Deserialize(LPayload, LObj);
+            except
+              on E: Exception do
+              begin
+                LObj.Free;
+                Fail(GRPC_STATUS_INTERNAL, Format('message %d decode failed: %s',
+                  [FCount + 1, E.Message]));
+              end;
+            end;
+            FCurrent := LObj;
+            Inc(FCount);
+            Result := True;
+            Exit;
+          end;
+        gfrError:
+          if FReasm.TooLarge then
+            Fail(GRPC_STATUS_RESOURCE_EXHAUSTED, Format('message %d: %s',
+              [FCount + 1, LError]))
+          else
+            Fail(GRPC_STATUS_INTERNAL, Format('message %d: %s', [FCount + 1, LError]));
+        gfrNeedMore:
+          ;
+      end;
+
+      if FDeadlineMS > 0 then
+      begin
+        LWaitMS := FDeadlineMS - ElapsedMS(FStart);
+        if LWaitMS <= 0 then
+          Fail(GRPC_STATUS_DEADLINE_EXCEEDED, Format(
+            'deadline of %d ms exceeded after %d message(s)', [FDeadlineMS, FCount]));
+      end
+      else
+        LWaitMS := FChannel.FCallTimeoutMS;
+
+      LGot := FChannel.FClient.ReadChunk(FStreamId, LChunk, READ_CHUNK, Integer(LWaitMS));
+      if LGot < 0 then
+      begin
+        if FDeadlineMS > 0 then
+          Continue;     // the check above reports it once the budget is gone
+        Fail(GRPC_STATUS_DEADLINE_EXCEEDED, Format(
+          'no message within CallTimeoutMS = %d ms after %d message(s)',
+          [FChannel.FCallTimeoutMS, FCount]));
+      end;
+
+      { The response head is known by now: DATA never precedes it, and an end
+        of stream means the whole response is in. Judge it once, before any
+        body byte is trusted as a gRPC message. }
+      if not FHeadChecked then
+      begin
+        if FChannel.FClient.PeekResponseHeaders(FStreamId, LResp) then
+          CheckResponseHead(LResp, FPath);
+        FHeadChecked := True;
+      end;
+
+      if LGot > 0 then
+        FReasm.Append(LChunk, LGot)
+      else
+      begin
+        { End of stream. TakeResponse raises when the connection died before
+          the stream closed - that is a transport failure (14, below). }
+        LResp := FChannel.FClient.TakeResponse(FStreamId);
+        FTaken := True;
+        if not FHeadChecked then
+          CheckResponseHead(LResp, FPath);
+        CheckGrpcStatus(LResp);
+        if FReasm.BufferedBytes > 0 then
+          Fail(GRPC_STATUS_INTERNAL, Format(
+            'the stream ended inside message %d (%d byte(s) of it received)',
+            [FCount + 1, FReasm.BufferedBytes]));
+        Finish;
+        Exit;   // Result = False: ended with grpc-status 0
+      end;
+    until False;
+  except
+    on E: EGrpcClientError do
+    begin
+      Abandon;
+      raise;
+    end;
+    on E: Exception do
+    begin
+      Abandon;
+      Fail(GRPC_STATUS_UNAVAILABLE, E.ClassName + ': ' + E.Message);
+    end;
+  end;
+end;
+
+{ ── TGrpcChannel ────────────────────────────────────────────────────────── }
+
 constructor TGrpcChannel.Create(const AHost: string; APort: Word;
   ATlsContext: TTlsClientContext);
 begin
@@ -311,6 +619,11 @@ end;
 
 destructor TGrpcChannel.Destroy;
 begin
+  { A stream still referenced elsewhere must not reach a freed channel:
+    detach it, and its next MoveNext raises 14. }
+  if FOpenStream <> nil then
+    TGrpcClientStream(FOpenStream).FChannel := nil;
+  FOpenStream := nil;
   FClient.Free;
   inherited;
 end;
@@ -325,6 +638,54 @@ begin
     FClient.Reconnect;
 end;
 
+{ GC4. One call at a time per channel: TNghttp2Client.PumpAll waits for EVERY
+  open stream, so a unary call made while a server stream is open would sit
+  until that stream ended. Refusing says so at once. }
+procedure TGrpcChannel.RefuseWhileStreaming;
+begin
+  if FOpenStream <> nil then
+    Fail(GRPC_STATUS_FAILED_PRECONDITION, 'a server stream is still open on ' +
+      'this channel - read it to the end or release it first (one call at a ' +
+      'time per channel)');
+end;
+
+{ GC3: content-type, te, grpc-timeout, then the metadata, in Call-Definitions
+  order. Validates the options first: a bad one is EArgumentException and
+  nothing is sent. ABudgetMS: the deadline, or CallTimeoutMS without one. }
+function TGrpcChannel.BuildCallHeaders(const AOptions: TGrpcCallOptions;
+  out ABudgetMS: Integer): TNghttp2Headers;
+var
+  I: Integer;
+begin
+  if AOptions.DeadlineMS < 0 then
+    raise EArgumentException.CreateFmt(
+      'TGrpcChannel: DeadlineMS is %d - use 0 for no deadline',
+      [AOptions.DeadlineMS]);
+  ValidateMetadata(AOptions.Metadata);
+
+  { te: trailers is REQUIRED of a gRPC client (gRPC over HTTP/2 spec): it is
+    how the server knows the peer will read the trailer section at all. }
+  SetLength(Result, 2);
+  Result[0].Name  := 'content-type';
+  Result[0].Value := 'application/grpc';
+  Result[1].Name  := 'te';
+  Result[1].Value := 'trailers';
+  if AOptions.DeadlineMS > 0 then
+  begin
+    SetLength(Result, 3);
+    Result[2].Name  := 'grpc-timeout';
+    Result[2].Value := GrpcTimeoutValue(AOptions.DeadlineMS);
+    ABudgetMS := AOptions.DeadlineMS;
+  end
+  else
+    ABudgetMS := FCallTimeoutMS;
+  for I := 0 to High(AOptions.Metadata) do
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := AOptions.Metadata[I];
+  end;
+end;
+
 function TGrpcChannel.Unary(const APath: string; ARequest: TObject;
   AResponseClass: TClass): TObject;
 begin
@@ -334,60 +695,29 @@ end;
 function TGrpcChannel.Unary(const APath: string; ARequest: TObject;
   AResponseClass: TClass; const AOptions: TGrpcCallOptions): TObject;
 var
-  LHeaders:    TNghttp2Headers;
-  LBody:       TBytes;
-  LResp:       TNghttp2Response;
-  LPayload:    TBytes;
-  LValue:      string;
-  LStatusList: TNghttp2Headers;
-  LStatus:     Integer;
-  LError:      string;
-  LObj:        TObject;
-  LBudgetMS:   Integer;
-  LLeftMS:     Int64;
-  LStart:      TDateTime;
-  I:           Integer;
+  LHeaders:  TNghttp2Headers;
+  LBody:     TBytes;
+  LResp:     TNghttp2Response;
+  LPayload:  TBytes;
+  LError:    string;
+  LObj:      TObject;
+  LBudgetMS: Integer;
+  LLeftMS:   Int64;
+  LStart:    TDateTime;
 begin
   Result := nil;
   if ARequest = nil then
     raise EArgumentException.Create('TGrpcChannel.Unary: ARequest is nil');
   if AResponseClass = nil then
     raise EArgumentException.Create('TGrpcChannel.Unary: AResponseClass is nil');
-  if AOptions.DeadlineMS < 0 then
-    raise EArgumentException.CreateFmt(
-      'TGrpcChannel.Unary: DeadlineMS is %d - use 0 for no deadline',
-      [AOptions.DeadlineMS]);
-  ValidateMetadata(AOptions.Metadata);
+  LHeaders := BuildCallHeaders(AOptions, LBudgetMS);
+  RefuseWhileStreaming;
 
   try
     LBody := GrpcFrameMessage(TProtoSerializer.Serialize(ARequest));
   except
     on E: Exception do
       Fail(GRPC_STATUS_INTERNAL, 'request encode failed: ' + E.Message);
-  end;
-
-  { te: trailers is REQUIRED of a gRPC client (gRPC over HTTP/2 spec): it is
-    how the server knows the peer will read the trailer section at all. }
-  SetLength(LHeaders, 2);
-  LHeaders[0].Name  := 'content-type';
-  LHeaders[0].Value := 'application/grpc';
-  LHeaders[1].Name  := 'te';
-  LHeaders[1].Value := 'trailers';
-  { GC3. Call-Definitions order (gRPC over HTTP/2): grpc-timeout before the
-    custom metadata. }
-  if AOptions.DeadlineMS > 0 then
-  begin
-    SetLength(LHeaders, 3);
-    LHeaders[2].Name  := 'grpc-timeout';
-    LHeaders[2].Value := GrpcTimeoutValue(AOptions.DeadlineMS);
-    LBudgetMS := AOptions.DeadlineMS;
-  end
-  else
-    LBudgetMS := FCallTimeoutMS;
-  for I := 0 to High(AOptions.Metadata) do
-  begin
-    SetLength(LHeaders, Length(LHeaders) + 1);
-    LHeaders[High(LHeaders)] := AOptions.Metadata[I];
   end;
 
   LStart := Now;
@@ -420,45 +750,17 @@ begin
       Fail(GRPC_STATUS_UNAVAILABLE, E.ClassName + ': ' + E.Message);
   end;
 
-  if LResp.Status <> 200 then
-    Fail(HttpToGrpcStatus(LResp.Status),
-      Format('HTTP status %d from %s', [LResp.Status, APath]));
-
-  if not FindHeader(LResp.Headers, 'content-type', LValue)
-     or not SameText(Copy(LValue, 1, 16), 'application/grpc') then
-    Fail(GRPC_STATUS_INTERNAL,
-      Format('response content-type is "%s", not application/grpc', [LValue]));
-
-  { GC1: the status lives in the trailers, or in the headers of a
-    headers-only response - never anywhere else. Headers also holds the
-    trailer fields (kept for compatibility), so it is read only in the
-    headers-only case, where no trailer section exists. }
-  if LResp.HeadersOnly then
-    LStatusList := LResp.Headers
-  else
-    LStatusList := LResp.Trailers;
-
-  if not FindHeader(LStatusList, 'grpc-status', LValue) then
-  begin
-    if LResp.HeadersOnly then
-      Fail(GRPC_STATUS_INTERNAL, 'headers-only response without grpc-status')
-    else
-      Fail(GRPC_STATUS_INTERNAL, 'response has no grpc-status trailer');
-  end;
-  LStatus := StrToIntDef(Trim(LValue), -1);
-  if LStatus < 0 then
-    Fail(GRPC_STATUS_UNKNOWN, Format('grpc-status "%s" is not a number', [LValue]));
-
-  if LStatus <> GRPC_STATUS_OK then
-  begin
-    FindHeader(LStatusList, 'grpc-message', LValue);
-    Fail(LStatus, GrpcDecodeStatusMessage(LValue));
-  end;
+  CheckResponseHead(LResp, APath);
+  CheckGrpcStatus(LResp);
 
   { OK. A unary response carries exactly one message. A zero-LENGTH message
     (all fields at their defaults) is a message; NO message is a violation. }
   if Length(LResp.Body) = 0 then
     Fail(GRPC_STATUS_INTERNAL, 'grpc-status 0 but the response carried no message');
+  if GrpcFrameTooLarge(LResp.Body, FMaxReceiveBytes) then
+    Fail(GRPC_STATUS_RESOURCE_EXHAUSTED, Format(
+      'the response message is over the %d-byte MaxReceiveMessageBytes',
+      [FMaxReceiveBytes]));
   if not GrpcUnframeMessage(LResp.Body, LPayload, LError, FMaxReceiveBytes) then
     Fail(GRPC_STATUS_INTERNAL, LError);
   if Length(LResp.Body) > GRPC_FRAME_HEADER_BYTES + Length(LPayload) then
@@ -475,6 +777,55 @@ begin
     end;
   end;
   Result := LObj;
+end;
+
+function TGrpcChannel.ServerStream(const APath: string; ARequest: TObject;
+  AResponseClass: TClass): IGrpcClientStream;
+begin
+  Result := ServerStream(APath, ARequest, AResponseClass, TGrpcCallOptions.Default);
+end;
+
+function TGrpcChannel.ServerStream(const APath: string; ARequest: TObject;
+  AResponseClass: TClass; const AOptions: TGrpcCallOptions): IGrpcClientStream;
+var
+  LHeaders:  TNghttp2Headers;
+  LBody:     TBytes;
+  LBudgetMS: Integer;
+  LStart:    TDateTime;
+  LId:       Int32;
+  LStream:   TGrpcClientStream;
+begin
+  Result := nil;
+  if ARequest = nil then
+    raise EArgumentException.Create('TGrpcChannel.ServerStream: ARequest is nil');
+  if AResponseClass = nil then
+    raise EArgumentException.Create('TGrpcChannel.ServerStream: AResponseClass is nil');
+  LHeaders := BuildCallHeaders(AOptions, LBudgetMS);
+  RefuseWhileStreaming;
+
+  try
+    LBody := GrpcFrameMessage(TProtoSerializer.Serialize(ARequest));
+  except
+    on E: Exception do
+      Fail(GRPC_STATUS_INTERNAL, 'request encode failed: ' + E.Message);
+  end;
+
+  LStart := Now;
+  LId := 0;
+  try
+    EnsureConnected;
+    { AStreamResponse = True: the body goes to ReadChunk as it arrives instead
+      of accumulating until END_STREAM. }
+    LId := FClient.BeginRequest('POST', APath, LHeaders, LBody, True);
+  except
+    on E: Exception do
+      Fail(GRPC_STATUS_UNAVAILABLE, E.ClassName + ': ' + E.Message);
+  end;
+
+  LStream := TGrpcClientStream.Create(Self, LId, APath, AResponseClass,
+    AOptions.DeadlineMS, LStart);
+  FOpenStream := LStream;
+  Result := LStream;
 end;
 
 end.

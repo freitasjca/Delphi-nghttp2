@@ -325,6 +325,15 @@ type
       ACount: Integer;
       ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS): Integer;
 
+    { [GC4] The response head of a stream that may still be in progress: True
+      once the final (>= 200) response HEADERS block has arrived, or the stream
+      has closed, with AResponse a COPY of what is known so far (Status,
+      Headers, HeadersOnly). Nothing is consumed - TakeResponse still owns the
+      slot. A streaming caller needs this to judge :status and content-type
+      before the body ends; TakeResponse refuses while bytes are unread. }
+    function  PeekResponseHeaders(AStreamId: Int32;
+      out AResponse: TNghttp2Response): Boolean;
+
     property Connected:       Boolean            read FConnected;
     property Host:            string             read FHost;
     property Port:            Word               read FPort;
@@ -1228,6 +1237,18 @@ begin
     them onto the wire now or the peer stalls waiting for window. }
   FlushSession;
   Result := 1;
+end;
+
+function TNghttp2Client.PeekResponseHeaders(AStreamId: Int32;
+  out AResponse: TNghttp2Response): Boolean;
+var
+  LIdx: Integer;
+begin
+  AResponse := Default(TNghttp2Response);
+  LIdx := FindSlot(AStreamId);
+  Result := (LIdx >= 0) and (FStreams[LIdx].HeadersDone or FStreams[LIdx].Done);
+  if Result then
+    AResponse := FStreams[LIdx].Response;
 end;
 
 function TNghttp2Client.ReadChunk(AStreamId: Int32; var ABuffer: TBytes;

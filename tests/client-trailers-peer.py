@@ -61,7 +61,46 @@ def string_reply(text):
     return b'\x0a' + bytes([len(data)]) + data
 
 
+def raw_item(n):
+    # EchoReply{text: "raw<n>", num: n}
+    text = ('raw%d' % n).encode()
+    return b'\x0a' + bytes([len(text)]) + text + b'\x10' + bytes([n])
+
+
+def respond_stream(conn, stream_id, name):
+    # GC4: server-streaming shapes. True when name was one of them.
+    items = frame(raw_item(1)) + frame(raw_item(2)) + frame(raw_item(3))
+    if name == 'StreamHttp503':
+        conn.send_headers(stream_id, [(':status', '503')])
+        conn.send_data(stream_id, b'busy', end_stream=True)
+        return True
+    if name not in ('StreamChunked', 'StreamNoTrailer', 'StreamTruncated',
+                    'StreamTooBig'):
+        return False
+    conn.send_headers(stream_id, [(':status', '200'), GRPC_CT])
+    if name == 'StreamChunked':
+        # three messages cut into 7-byte DATA frames: no frame boundary lines
+        # up with a message boundary
+        for i in range(0, len(items), 7):
+            conn.send_data(stream_id, items[i:i + 7])
+    elif name == 'StreamNoTrailer':
+        conn.send_data(stream_id, frame(raw_item(1)) + frame(raw_item(2)),
+                       end_stream=True)
+        return True
+    elif name == 'StreamTruncated':
+        conn.send_data(stream_id, frame(raw_item(1)) + frame(raw_item(2))
+                       + frame(raw_item(3))[:6])
+    elif name == 'StreamTooBig':
+        # a header announcing 4 MB + 1 and nothing behind it: the client must
+        # refuse on the header, not wait for (or allocate) the payload
+        conn.send_data(stream_id, bytes([0]) + (4194305).to_bytes(4, 'big'))
+    conn.send_headers(stream_id, [('grpc-status', '0')], end_stream=True)
+    return True
+
+
 def respond_raw(conn, stream_id, name, headers=()):
+    if respond_stream(conn, stream_id, name):
+        return
     if name == 'EchoHeaders':
         # GC3: the request headers exactly as they arrived on the wire -
         # grpc-timeout (or "-") then the x-* metadata, sorted.

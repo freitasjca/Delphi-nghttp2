@@ -106,6 +106,7 @@ type
     FBufLen:      Integer;   // valid bytes in FBuf (Length(FBuf) is capacity)
     FMaxMessage:  Integer;
     FError:       string;
+    FTooLarge:    Boolean;
   public
     constructor Create(AMaxMessageBytes: Integer = GRPC_DEFAULT_MAX_MESSAGE_BYTES);
 
@@ -121,6 +122,11 @@ type
     function BufferedBytes: Integer;
 
     property MaxMessageBytes: Integer read FMaxMessage;
+
+    { GC4. True when the gfrError is a length over MaxMessageBytes - as
+      opposed to a compressed flag - so a client can report the gRPC code
+      peers use for it (8 RESOURCE_EXHAUSTED) instead of 13. }
+    property TooLarge: Boolean read FTooLarge;
   end;
 
 { Frames one protobuf payload as a gRPC message: flag 0 (uncompressed), the
@@ -136,6 +142,13 @@ function GrpcFrameMessage(const APayload: TBytes): TBytes;
   Length(APayload)). Formerly StripGrpcPrefix, with the same error texts. }
 function GrpcUnframeMessage(const AData: TBytes; out APayload: TBytes;
   out AError: string;
+  AMaxMessageBytes: Integer = GRPC_DEFAULT_MAX_MESSAGE_BYTES): Boolean;
+
+{ GC4. True when AData starts with a gRPC frame header whose declared length
+  is over AMaxMessageBytes - judged on the 5-byte header alone, so nothing
+  of the payload needs to have arrived. The unary client uses it to report
+  8 RESOURCE_EXHAUSTED for exactly that case. }
+function GrpcFrameTooLarge(const AData: TBytes;
   AMaxMessageBytes: Integer = GRPC_DEFAULT_MAX_MESSAGE_BYTES): Boolean;
 
 { Percent-encodes a grpc-message value as the gRPC spec requires
@@ -194,6 +207,15 @@ begin
   Result[4] := Byte( LLen         and $FF);
   if LLen > 0 then
     Move(APayload[0], Result[GRPC_FRAME_HEADER_BYTES], LLen);
+end;
+
+function GrpcFrameTooLarge(const AData: TBytes; AMaxMessageBytes: Integer): Boolean;
+var
+  LCompressed: Boolean;
+  LLen:        UInt32;
+begin
+  Result := ReadHeader(AData, LCompressed, LLen) and (AMaxMessageBytes >= 0)
+            and (LLen > UInt32(AMaxMessageBytes));
 end;
 
 function GrpcUnframeMessage(const AData: TBytes; out APayload: TBytes;
@@ -301,8 +323,11 @@ begin
   if LCompressed then
     FError := 'per-message compression is not supported'
   else if LLen > UInt32(FMaxMessage) then
+  begin
     FError := Format('message length %u exceeds the %d-byte limit',
                      [LLen, FMaxMessage]);
+    FTooLarge := True;
+  end;
   if FError <> '' then
   begin
     AError := FError;
