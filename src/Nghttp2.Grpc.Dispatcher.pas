@@ -198,8 +198,16 @@ begin
     AStream.AddTrailer('grpc-message', GrpcPercentEncode(AMessage));
 end;
 
-// ── Error-path helper: emit an empty body + grpc-status trailer ────────────
+// ── Error-path helper: no message, grpc-status in the trailer ──────────────
 
+{ GRPC-STATUSONLY-1. An error reply carries NO message: an empty body, then
+  the trailer. This used to send a 5-byte zero-length FRAME, which is a real
+  (empty) message, not an empty body. A unary client never noticed - it reads
+  the status first - but a server-streaming client received one default
+  message before the error. Found by the GC6 control (protogen client against
+  a wrong path: "12 after 1 message"). Zero messages followed by the trailer is
+  a valid gRPC response; Trailers-Only would be better still, but this server
+  always sends a DATA frame. }
 procedure SendGrpcStatusOnly(
   const AStream: INghttp2Stream;
   AStatus: Integer;
@@ -212,15 +220,7 @@ begin
   AStream.AddTrailer('grpc-status', IntToStr(AStatus));
   if AMessage <> '' then
     AStream.AddTrailer('grpc-message', GrpcPercentEncode(AMessage));
-  // Empty framed body per gRPC spec — client sees zero-length message and
-  // reads status from trailers. We still emit the 5-byte prefix for a
-  // well-formed frame (compression=0, length=0).
-  SetLength(LEmpty, 5);
-  LEmpty[0] := 0;
-  LEmpty[1] := 0;
-  LEmpty[2] := 0;
-  LEmpty[3] := 0;
-  LEmpty[4] := 0;
+  SetLength(LEmpty, 0);
   AStream.Send(LEmpty);
 end;
 

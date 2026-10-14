@@ -627,6 +627,43 @@ begin
   end;
 end;
 
+{ GRPC-STATUSONLY-1. An error reply must carry no message. Counted, not
+  compared as text: the old zero-length frame decoded to an EchoReply whose
+  text is '', which an items string cannot tell apart from no message. }
+procedure StatusOnlyPartA(AChannel: TGrpcChannel);
+var
+  LReq:    TEchoRequest;
+  LStream: IGrpcClientStream;
+  LCount, LStatus: Integer;
+  LGot:    string;
+begin
+  WriteLn;
+  WriteLn('-- A5  GRPC-STATUSONLY-1: an error reply carries no message');
+  LReq := CountReq(3, '');
+  try
+    LCount := 0; LStatus := -1; LGot := 'a clean end';
+    try
+      LStream := AChannel.ServerStream('/gctest.Probe/Nope', LReq, TEchoReply, Opts(3000));
+      while LStream.MoveNext do
+        Inc(LCount);
+    except
+      on E: EGrpcClientError do
+      begin
+        LStatus := E.Status;
+        LGot := Format('%d "%s"', [E.Status, E.GrpcMessage]);
+      end;
+      on E: Exception do
+        LGot := E.ClassName + ': ' + E.Message;
+    end;
+    LStream := nil;
+    Check('A a stream to an unknown method: no message, then 12',
+      (LCount = 0) and (LStatus = GRPC_STATUS_UNIMPLEMENTED),
+      Format('%d message(s), then %s', [LCount, LGot]));
+  finally
+    LReq.Free;
+  end;
+end;
+
 procedure GC3PartA(AChannel: TGrpcChannel);
 const
   DEADLINE = 400;
@@ -745,6 +782,7 @@ begin
 
       GC3PartA(LChannel);
       GC4PartA(LChannel);
+      StatusOnlyPartA(LChannel);
     finally
       LChannel.Free;
     end;
