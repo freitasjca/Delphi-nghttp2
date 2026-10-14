@@ -22,6 +22,10 @@ unit Protogen.Runner;
 //    .Service.pas is written ONLY when absent — it holds user code.
 //    If .Service.pas already exists, the new skeleton goes to .Service.new.pas.
 //
+//  .Client.pas (GC6) is written only when AClient is True (protogen --client)
+//  and the file declares a service. It holds no user code, so it is always
+//  regenerated. Without the flag nothing about the output changes.
+//
 //  .Registration.pas (C5) is deliberately on the always-regenerated side. It is
 //  the file that must track the .proto: preserving it would leave a newly added
 //  rpc unregistered, which surfaces at runtime as an unimplemented path with
@@ -52,6 +56,7 @@ type
     ServicePath:      string;  // .Service.pas or .Service.new.pas
     ServiceIsNew:     Boolean; // True → .new.pas, existing .Service.pas preserved
     RegistrationPath: string;  // .Registration.pas — always regenerated (C5)
+    ClientPath:       string;  // .Client.pas — only with AClient (GC6); '' otherwise
   end;
 
   TProtogenRunner = class
@@ -69,7 +74,8 @@ type
       ADryRun: Boolean; out AResult: TProtogenResult;
       ALog: TStrings = nil;
       const AProtoFileName: string = '';
-      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil): Integer;
+      AFileSet: TProtoFileSet = nil; AEntry: TProtoFileEntry = nil;
+      AClient: Boolean = False): Integer;
 
     { IMPORT-1. Generate a root .proto AND everything it imports.
 
@@ -85,11 +91,11 @@ type
     class function RunClosure(const AInputFile, AOutputDir, AUnitPrefix: string;
       AIncludeRoots: TStrings; ADryRun: Boolean;
       out AResults: TArray<TProtogenResult>;
-      ALog: TStrings = nil): Integer;
+      ALog: TStrings = nil; AClient: Boolean = False): Integer;
 
     class function Run(const AInputFile, AOutputDir, AUnitPrefix: string;
       ADryRun: Boolean; out AResult: TProtogenResult;
-      ALog: TStrings = nil): Integer;
+      ALog: TStrings = nil; AClient: Boolean = False): Integer;
   end;
 
 implementation
@@ -129,13 +135,15 @@ class function TProtogenRunner.WriteUnits(AFile: TProtoFileNode;
   const AOutputDir, AUnitPrefix: string; ADryRun: Boolean;
   out AResult: TProtogenResult; ALog: TStrings;
   const AProtoFileName: string;
-  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry): Integer;
+  AFileSet: TProtoFileSet; AEntry: TProtoFileEntry;
+  AClient: Boolean): Integer;
 var
   LLines:      TStringList;
   LEmitMsg:    TMessagesEmitter;
   LEmitIface:  TInterfacesEmitter;
   LEmitSkel:   TServiceSkeletonEmitter;
   LEmitReg:    TRegistrationEmitter;
+  LEmitClient: TClientEmitter;
   LServicePas: string;
   LServiceNew: string;
   LWantSvc:    Boolean;
@@ -158,6 +166,9 @@ begin
     AResult.InterfacesPath   := MakePath(AOutputDir, AUnitPrefix, 'Interfaces');
     AResult.RegistrationPath := MakePath(AOutputDir, AUnitPrefix, 'Registration');
   end;
+  // GC6: a client needs a service to call, in single-file mode too.
+  if AClient and (AFile.Services.Count > 0) then
+    AResult.ClientPath := MakePath(AOutputDir, AUnitPrefix, 'Client');
   LServicePas := MakePath(AOutputDir, AUnitPrefix, 'Service');
   LServiceNew := IncludeTrailingPathDelimiter(AOutputDir)
     + AUnitPrefix + '.Service.new.pas';
@@ -231,6 +242,19 @@ begin
     finally
       LEmitReg.Free;
     end;
+
+    // Client stubs — GC6, opt-in, always regenerated.
+    if AResult.ClientPath <> '' then
+    begin
+      LLines.Clear;
+      LEmitClient := TClientEmitter.Create;
+      try
+        LEmitClient.Emit(AFile, AUnitPrefix, LLines, AFileSet, AEntry);
+        Flush(LLines, AResult.ClientPath, ADryRun, ALog);
+      finally
+        LEmitClient.Free;
+      end;
+    end;
   finally
     LLines.Free;
   end;
@@ -240,7 +264,8 @@ end;
 
 class function TProtogenRunner.RunClosure(const AInputFile, AOutputDir,
   AUnitPrefix: string; AIncludeRoots: TStrings; ADryRun: Boolean;
-  out AResults: TArray<TProtogenResult>; ALog: TStrings): Integer;
+  out AResults: TArray<TProtogenResult>; ALog: TStrings;
+  AClient: Boolean): Integer;
 var
   LFS:  TProtoFileSet;
   I:    Integer;
@@ -288,7 +313,7 @@ begin
       try
         LRc := WriteUnits(LFS.Files[I].Node, AOutputDir,
           LFS.Files[I].UnitPrefix, ADryRun, LRes, ALog,
-          LFS.Files[I].ImportPath, LFS, LFS.Files[I]);
+          LFS.Files[I].ImportPath, LFS, LFS.Files[I], AClient);
       except
         on E: Exception do
         begin
@@ -312,7 +337,7 @@ end;
 
 class function TProtogenRunner.Run(const AInputFile, AOutputDir,
   AUnitPrefix: string; ADryRun: Boolean; out AResult: TProtogenResult;
-  ALog: TStrings): Integer;
+  ALog: TStrings; AClient: Boolean): Integer;
 var
   LContent: TStringList;
   LParser:  TProtoParser;
@@ -355,7 +380,7 @@ begin
       LFile   := LParser.Parse;
       FreeAndNil(LParser);
       Result := WriteUnits(LFile, AOutputDir, AUnitPrefix, ADryRun, AResult, ALog,
-        ExtractFileName(AInputFile));
+        ExtractFileName(AInputFile), nil, nil, AClient);
     except
       on E: Exception do
       begin

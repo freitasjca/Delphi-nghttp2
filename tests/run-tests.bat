@@ -834,7 +834,7 @@ echo.
 set "GENOUT=%TEMP%\protogen-gencheck"
 if exist "%GENOUT%" rmdir /s /q "%GENOUT%"
 pushd "..\tools\protogen"
-Protogen.exe -i "..\..\..\horse-provider-nghttp2\samples\grpc\greeter.proto" -o "%GENOUT%" --unit-prefix Sample > nul
+Protogen.exe -i "..\..\..\horse-provider-nghttp2\samples\grpc\greeter.proto" -o "%GENOUT%" --unit-prefix Sample --client > nul
 if errorlevel 1 (
   echo -- ProtogenGeneratedCompileCheck ^(C6a^) ------------------------------------------------
   echo    FAIL  Protogen.exe could not generate into %GENOUT%
@@ -845,7 +845,14 @@ if errorlevel 1 (
 set "STAGE=ProtogenGeneratedCompileCheck"
 set "GATES=1"
 set "STAGEUNITS=%GENOUT%;..\..\src"
+REM GC6: the check now runs a client round trip against a live server, so it
+REM loads libnghttp2. nghttp2.dll sits in tests\ beside the other live stages'
+REM executables, but this one runs from tools\protogen - put tests\ on PATH for
+REM this stage only. Before GC6 the stage never loaded the library.
+set "SAVEDPATH=!PATH!"
+set "PATH=%~dp0;!PATH!"
 call :build_run
+set "PATH=!SAVEDPATH!"
 popd
 set "STAGEUNITS=..\src"
 goto :after_gencheck

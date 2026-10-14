@@ -146,6 +146,23 @@ begin
   end;
 end;
 
+function EmitClient(AFile: TProtoFileNode;
+  const AUnitPrefix: string): string;
+var
+  LE: TClientEmitter;
+  LL: TStringList;
+begin
+  LL := TStringList.Create;
+  LE := TClientEmitter.Create;
+  try
+    LE.Emit(AFile, AUnitPrefix, LL);
+    Result := LL.Text;
+  finally
+    LE.Free;
+    LL.Free;
+  end;
+end;
+
 function EmitSkel(AFile: TProtoFileNode;
   const AUnitPrefix: string): string;
 var
@@ -790,6 +807,183 @@ begin
   end;
 end;
 
+// ── GC6: client stubs ───────────────────────────────────────────────────────
+//
+// Text checks only. Whether the stubs COMPILE and reach the right server
+// method is ProtogenGeneratedCompileCheck's job (C6a), which builds them with
+// --client and calls every generated method against a live dispatcher.
+
+procedure TestClientEmitterGreeter;
+var
+  LFile: TProtoFileNode;
+  LDir, LRaw, LCli: string;
+begin
+  Section('GC6: client stubs (real greeter.proto)');
+
+  LDir := GreeterDir;
+  if LDir = '' then
+  begin
+    Skip('GC6 client', 'sibling checkout not found; set PROTOGEN_GREETER_DIR');
+    Exit;
+  end;
+
+  LFile := nil;
+  try
+    LFile := Parse(ReadFileText(Join(LDir, 'greeter.proto')));
+    Check('greeter parse ok (client)', LFile <> nil);
+    if LFile = nil then Exit;
+
+    LRaw := EmitClient(LFile, 'Sample.Greeter');
+    LCli := Normalize(LRaw);
+
+    CheckHas('client: unit name', LCli, 'unit Sample.Greeter.Client;');
+    Check('client: always-regenerated warning present',
+      Pos('ALWAYS regenerated', LRaw) > 0);
+    CheckHas('client: uses the channel unit and the messages',
+      LCli, 'uses Nghttp2.Grpc.Client, Sample.Greeter.Messages;');
+    CheckHas('client: one class per service, borrowing the channel', LCli,
+      'TGreeterClient = class private FChannel: TGrpcChannel; public constructor Create(AChannel: TGrpcChannel);');
+
+    // Unary: two overloads, the second taking call options (GC3).
+    CheckHas('client: unary, plain', LCli,
+      'function Greet(ARequest: TGreetRequest): TGreetResponse; overload;');
+    CheckHas('client: unary, with options', LCli,
+      'function Greet(ARequest: TGreetRequest; const AOptions: TGrpcCallOptions): TGreetResponse; overload;');
+    CheckHas('client: unary body calls the registered path', LCli,
+      'Result := TGreetResponse(FChannel.Unary(''/greeter.Greeter/Greet'', ARequest, TGreetResponse));');
+    CheckHas('client: options body passes them on', LCli,
+      'Result := TEchoResponse(FChannel.Unary(''/greeter.Greeter/Echo'', ARequest, TEchoResponse, AOptions));');
+
+    // Server streaming: a typed wrapper per rpc (D2).
+    CheckHas('client: server stream returns its typed wrapper', LCli,
+      'function ListGreetings(ARequest: TGreetRequest): TGreeterListGreetingsStream; overload;');
+    CheckHas('client: the wrapper types Current', LCli,
+      'property Current: TGreetResponse read GetCurrent;');
+    CheckHas('client: the wrapper casts what the stream decoded', LCli,
+      'Result := TGreetResponse(FStream.Current);');
+    CheckHas('client: stream body calls the SAME path the registration registers', LCli,
+      'Result := TGreeterListGreetingsStream.Create(FChannel.ServerStream(''/greeter.Greeter/ListGreetings'', ARequest, TGreetResponse));');
+    Check('  ... and that path is the registration unit''s',
+      Pos(TightenPunctuation('RegisterServerStream(''/greeter.Greeter/ListGreetings'''),
+        Normalize(EmitReg(LFile, 'Sample.Greeter'))) > 0);
+
+    // Client and bidi streaming: no call exists yet (GC5), so no method.
+    Check('client: no method for client streaming (GC5)',
+      Pos('function JoinNames', LCli) = 0);
+    Check('client: no method for bidi streaming (GC5)',
+      Pos('function ChatGreetings', LCli) = 0);
+    Check('  ... but both are named in a comment, not silently dropped',
+      (Pos('JoinNames: client streaming', LRaw) > 0) and
+      (Pos('ChatGreetings: bidirectional streaming', LRaw) > 0));
+  finally
+    LFile.Free;
+  end;
+end;
+
+// Needs no sibling checkout: inline schemas for the naming rules.
+procedure TestClientEmitterRules;
+const
+  NAMES_PROTO =
+    'syntax = "proto3"; package p;' +
+    'message M { int32 v = 1; }' +
+    'service S {' +
+    '  rpc Free (M) returns (M);' +
+    '  rpc Channel (M) returns (M);' +
+    '  rpc Type (M) returns (stream M);' +
+    '  rpc Up (stream M) returns (M);' +
+    '}';
+  CLASH_PROTO =
+    'syntax = "proto3"; package p;' +
+    'message SClient { int32 v = 1; }' +
+    'service S { rpc Get (SClient) returns (SClient); }';
+  NOSVC_PROTO =
+    'syntax = "proto3"; package p; message M { int32 v = 1; }';
+  WKT_PROTO =
+    'syntax = "proto3"; package p;' +
+    'import "google/protobuf/empty.proto";' +
+    'message M { int32 v = 1; }' +
+    'service S { rpc Ping (google.protobuf.Empty) returns (M); }';
+var
+  LFile: TProtoFileNode;
+  LCli, LAgain: string;
+  LRaised: Boolean;
+  LMsg: string;
+begin
+  Section('GC6: client naming rules (inline schemas)');
+
+  Check('ClientClassName', TClientEmitter.ClientClassName('Greeter') = 'TGreeterClient');
+  Check('StreamClassName', TClientEmitter.StreamClassName('Greeter', 'ListGreetings')
+    = 'TGreeterListGreetingsStream');
+  Check('ClientMethodName leaves an ordinary name alone',
+    TClientEmitter.ClientMethodName('GetProduct') = 'GetProduct');
+  Check('ClientMethodName escapes a TObject member in any case',
+    (TClientEmitter.ClientMethodName('free') = 'free_') and
+    (TClientEmitter.ClientMethodName('ClassName') = 'ClassName_'));
+
+  LFile := Parse(NAMES_PROTO);
+  try
+    LCli := Normalize(EmitClient(LFile, 'P'));
+    CheckHas('an rpc named Free becomes Free_, never hiding TObject.Free', LCli,
+      'function Free_(ARequest: TM): TM; overload;');
+    Check('  ... and no method named Free is declared',
+      Pos(TightenPunctuation('function Free('), LCli) = 0);
+    CheckHas('an rpc named Channel does not collide with the Channel property', LCli,
+      'function Channel_(ARequest: TM): TM; overload;');
+    CheckHas('a reserved word (Type) is escaped too; its stream class is not', LCli,
+      'function Type_(ARequest: TM): TSTypeStream; overload;');
+    CheckHas('the escaped method still calls the proto name', LCli,
+      'FChannel.Unary(''/p.S/Free''');
+    LAgain := Normalize(EmitClient(LFile, 'P'));
+    Check('emitting twice gives identical text', LCli = LAgain);
+  finally
+    LFile.Free;
+  end;
+
+  LFile := Parse(CLASH_PROTO);
+  try
+    LRaised := False;
+    LMsg := '';
+    try
+      EmitClient(LFile, 'P');
+    except
+      on E: EEmitError do
+      begin
+        LRaised := True;
+        LMsg := E.Message;
+      end;
+    end;
+    Check('a message named like the client class is refused', LRaised);
+    Check('  ... naming the clash', Pos('TSClient', LMsg) > 0, LMsg);
+  finally
+    LFile.Free;
+  end;
+
+  LFile := Parse(NOSVC_PROTO);
+  try
+    LRaised := False;
+    try
+      EmitClient(LFile, 'P');
+    except
+      on E: EEmitError do
+        LRaised := True;
+    end;
+    Check('no service: refused rather than an empty unit', LRaised);
+  finally
+    LFile.Free;
+  end;
+
+  LFile := Parse(WKT_PROTO);
+  try
+    LCli := Normalize(EmitClient(LFile, 'P'));
+    CheckHas('a well-known request type maps to its bundled class', LCli,
+      'function Ping(ARequest: TProtobufEmpty): TM; overload;');
+    CheckHas('  ... and the uses clause brings the bundle in', LCli,
+      'uses Nghttp2.Grpc.Client, P.Messages, Nghttp2.Protobuf, Nghttp2.Protobuf.WellKnown;');
+  finally
+    LFile.Free;
+  end;
+end;
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 begin
@@ -801,6 +995,8 @@ begin
   TestEmitInterfacesGreeter;
   TestEmitSkeletonGreeter;
   TestStreamingEmitters;
+  TestClientEmitterGreeter;
+  TestClientEmitterRules;
   WriteLn;
   WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed, ', GSkip, ' skipped');
   if GFail > 0 then

@@ -48,7 +48,11 @@
 #  --all when you want the full sweep.
 #
 #  USAGE
-#    compile-check.sh [--sample N | --all | --only FILE] [corpus-dir]
+#    compile-check.sh [--sample N | --all | --only FILE] [--client] [corpus-dir]
+#
+#  --client (GC6) also generates <root>.Client.pas and compiles it after the
+#  messages unit, counting it separately. Only schemas that declare a service
+#  have a client, so CLIENT COMPILED is out of those, not out of every schema.
 #
 #  --only FILE re-runs just the schemas named in FILE, which may be a plain
 #  list of .proto paths or crashes.txt / failures.txt copied verbatim -- any
@@ -97,12 +101,14 @@ SAMPLE=300
 CORPUS=""
 
 ONLY=""
+CLIENT=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --all)    SAMPLE=0; shift ;;
     --sample) SAMPLE="${2:-300}"; shift 2 ;;
     --only)   ONLY="${2:-}"; shift 2 ;;
+    --client) CLIENT=1; shift ;;
     *)        CORPUS="$1"; shift ;;
   esac
 done
@@ -235,6 +241,12 @@ progress() {                  # <done> <total>
 # They are equal only in an --all run; keeping them apart is what lets a subset
 # run keep each schema's original unit name.
 OK=0; GENFAIL=0; COMPFAIL=0; CRASH=0; N=0; DONE=0
+CLIOK=0; CLIFAIL=0
+CLIENT_ARG=""
+[[ $CLIENT -eq 1 ]] && CLIENT_ARG="--client"
+# The client unit reaches Nghttp2.Client and its TLS/socket units, which need
+# more of the RTL than a messages unit does. Same list as build-codec-fpc.sh.
+CLIENT_UNIT_PATHS="-Fu$TU/rtl-extra -Fu$TU/fcl-net -Fu$TU/openssl -Fu$TU/pthreads -Fu$TU/hash"
 : > "$OUT/failures.txt"
 : > "$OUT/crashes.txt"
 
@@ -279,7 +291,7 @@ while IFS=$'\t' read -r N proto; do
   # -I the corpus root: googleapis import paths are corpus-relative
   # ('google/rpc/status.proto'), which is exactly what protoc expects too.
   if ! "$OUT/Protogen" -i "$proto" -I "$CORPUS" -o "$D" \
-        --unit-prefix "$PREFIX" > "$D/gen.log" 2>&1; then
+        --unit-prefix "$PREFIX" $CLIENT_ARG > "$D/gen.log" 2>&1; then
     # A refusal or an unresolvable import is corpus-check's business, not ours
     # - either way we never claimed to generate this one. Counted separately so
     # it cannot be mistaken for a compile failure.
@@ -299,6 +311,22 @@ while IFS=$'\t' read -r N proto; do
        -Fu"$TU/rtl-generics" -Fu"$TU/fcl-base" \
        "$UNIT" > "$D/build.log" 2>&1; then
     OK=$(( OK + 1 ))
+    # GC6: the root's client unit, when --client made one.
+    CUNIT="${UNIT%.Messages.pas}.Client.pas"
+    if [[ $CLIENT -eq 1 && -f "$CUNIT" ]]; then
+      if "$TRUNK" -MDelphi -O1 -FU"$D" -Fu"$D" -Fu"$SRC" \
+           -Fu"$TU/rtl" -Fu"$TU/rtl-objpas" -Fu"$TU/rtl-console" \
+           -Fu"$TU/rtl-generics" -Fu"$TU/fcl-base" $CLIENT_UNIT_PATHS \
+           "$CUNIT" > "$D/client-build.log" 2>&1; then
+        CLIOK=$(( CLIOK + 1 ))
+      else
+        CLIFAIL=$(( CLIFAIL + 1 ))
+        {
+          echo "=== [client] $proto"
+          grep -E "Error|Fatal" "$D/client-build.log" | head -4 | sed 's/^/    /'
+        } >> "$OUT/failures.txt"
+      fi
+    fi
   else
     # A COMPILER CRASH is not a rejection of our output. FPC dies on some of
     # what we generate - "Internal error 2015071505", "Compilation raised
@@ -338,6 +366,10 @@ printf "  COMPILED         %5d\n" "$OK"
 printf "  refused / unresolved imports %5d   (not an emitter defect)\n" "$GENFAIL"
 printf "  DID NOT COMPILE  %5d   <- emitter defects\n" "$COMPFAIL"
 printf "  compiler crashed %5d   (FPC fell over; not our output being rejected)\n" "$CRASH"
+if [[ $CLIENT -eq 1 ]]; then
+  printf "  CLIENT COMPILED  %5d   (schemas with a service, messages compiled)\n" "$CLIOK"
+  printf "  CLIENT FAILED    %5d   <- client emitter defects\n" "$CLIFAIL"
+fi
 echo "==========================================================="
 
 # WHY the refused ones were refused. This bucket is where a systematic problem
@@ -376,7 +408,7 @@ if [[ $CRASH -gt 0 ]]; then
   echo "   full list: $OUT/crashes.txt"
 fi
 
-if [[ $COMPFAIL -gt 0 ]]; then
+if [[ $(( COMPFAIL + CLIFAIL )) -gt 0 ]]; then
   echo
   echo "-- generated Pascal that a compiler rejected --------------"
   echo "   Each of these was ACCEPTED by the generator, so the tool"
@@ -394,4 +426,4 @@ if [[ $COMPFAIL -gt 0 ]]; then
     | sort | uniq -c | sort -rn | head -10 | sed 's/^/  /'
 fi
 
-exit $COMPFAIL
+exit $(( COMPFAIL + CLIFAIL ))

@@ -1567,8 +1567,10 @@ else
   # path, so greeter.proto under --unit-prefix Sample yields exactly the
   # Sample.Greeter.* units this stage has always compiled. The prefix lost a
   # segment; the generated unit names did not change.
+  # GC6: --client adds Sample.Greeter.Client, which the check program both
+  # compiles and drives against a live server (the round trip).
   if ! "$PBOUT/Protogen" -i "$GENPROTO" -o "$GENOUT" \
-         --unit-prefix Sample > "$GCOUT/generate.log" 2>&1; then
+         --unit-prefix Sample --client > "$GCOUT/generate.log" 2>&1; then
     echo "  FAIL  Protogen could not generate into $GENOUT"
     sed 's/^/    /' "$GCOUT/generate.log" | head -12
     [[ $RC -eq 0 ]] && RC=2
@@ -1589,7 +1591,7 @@ else
        && [[ -x "$GCOUT/ProtogenGeneratedCompileCheck" ]]; then
     "$GCOUT/ProtogenGeneratedCompileCheck" < /dev/null | sed 's/^/  /'
     if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
-      echo "  PASS  generated units compile and register under FPC"
+      echo "  PASS  generated units compile, register and answer the generated client under FPC"
     else
       echo "  FAIL  generated units compiled but registration was wrong"
       [[ $RC -eq 0 ]] && RC=2

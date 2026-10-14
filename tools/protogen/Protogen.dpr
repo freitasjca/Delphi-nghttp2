@@ -8,6 +8,7 @@ program Protogen;
 //    protogen -i greeter.proto -o src/ --unit-prefix Sample.Greeter
 //    protogen -i greeter.proto -o src/ --unit-prefix Sample.Greeter --dry-run
 //    protogen -i a/b.proto -I . -I vendor -o src/ --unit-prefix Demo
+//    protogen -i greeter.proto -o src/ --unit-prefix Sample --client
 //
 //  IMPORT-1: the input's imports are followed, and one unit is emitted per
 //  .proto in the closure. A unit's name comes from the FILE'S PATH, so
@@ -35,7 +36,7 @@ uses
 procedure PrintUsage;
 begin
   WriteLn('Usage: protogen -i <proto> -o <dir> --unit-prefix <Prefix>');
-  WriteLn('                [-I <dir>]... [--dry-run]');
+  WriteLn('                [-I <dir>]... [--client] [--dry-run]');
   WriteLn;
   WriteLn('  -i, --input       input .proto file');
   WriteLn('  -o, --output      output directory (created if absent)');
@@ -44,6 +45,8 @@ begin
   WriteLn('                    directory. Import paths are resolved against these');
   WriteLn('                    roots, never relative to the importing file.');
   WriteLn('      --unit-prefix unit prefix (e.g. Sample.Greeter)');
+  WriteLn('      --client      also emit <Unit>.Client.pas: gRPC client stubs over');
+  WriteLn('                    TGrpcChannel (unary + server streaming)');
   WriteLn('      --dry-run     show what would be written, write nothing');
   WriteLn('  -h, --help        show this help');
   WriteLn;
@@ -56,6 +59,8 @@ begin
   WriteLn('                             If it exists, the new skeleton goes to');
   WriteLn('                             <Unit>.Service.new.pas instead.');
   WriteLn('  <Unit>.Registration.pas  — registration (only if it declares a service)');
+  WriteLn('  <Unit>.Client.pas        — client stubs (only with --client and a service;');
+  WriteLn('                             always regenerated)');
   WriteLn;
   WriteLn('google/protobuf well-known types are supplied by the library, so they');
   WriteLn('are never looked up on an include path and generate no unit.');
@@ -68,6 +73,7 @@ var
   LOutput: string;
   LPrefix: string;
   LDryRun: Boolean;
+  LClient: Boolean;
   LResults: TArray<TProtogenResult>;
   LRoots:  TStringList;
   LLog:    TStringList;
@@ -77,6 +83,7 @@ begin
   LOutput := '';
   LPrefix := '';
   LDryRun := False;
+  LClient := False;
   LRoots  := TStringList.Create;
 
   I := 1;
@@ -133,6 +140,8 @@ begin
     end
     else if S = '--dry-run' then
       LDryRun := True
+    else if S = '--client' then
+      LClient := True
     else if (S = '-h') or (S = '--help') then
     begin
       PrintUsage;
@@ -164,7 +173,7 @@ begin
   LLog := TStringList.Create;
   try
     LCode := TProtogenRunner.RunClosure(LInput, LOutput, LPrefix, LRoots,
-      LDryRun, LResults, LLog);
+      LDryRun, LResults, LLog, LClient);
     for I := 0 to LLog.Count - 1 do
       WriteLn(LLog[I]);
     if LCode = 0 then

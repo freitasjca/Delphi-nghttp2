@@ -121,6 +121,7 @@ begin
   DeleteFile(D + APrefix + '.Service.pas');
   DeleteFile(D + APrefix + '.Service.new.pas');
   DeleteFile(D + APrefix + '.Registration.pas');   // C5
+  DeleteFile(D + APrefix + '.Client.pas');         // GC6
 end;
 
 // ── Proto source constants ───────────────────────────────────────────────────
@@ -293,6 +294,63 @@ begin
   end;
 end;
 
+// GC6. --client is opt-in (decision D3): without it no Client unit appears,
+// which is what keeps every existing caller's output unchanged.
+procedure TestClientFlag;
+var
+  LFile:   TProtoFileNode;
+  LResult: TProtogenResult;
+  LDir:    string;
+  LCode:   Integer;
+  LNoSvc:  TProtoFileNode;
+begin
+  Section('WriteUnits: --client (GC6)');
+  LDir := SubDir('client');
+  CleanOutputs(LDir, 'T.Greet');
+  LFile := nil;
+  LNoSvc := nil;
+  try
+    LFile := Parse(SIMPLE_PROTO);
+    Check('parse ok', LFile <> nil);
+    if LFile = nil then Exit;
+
+    LCode := TProtogenRunner.WriteUnits(LFile, LDir, 'T.Greet', False, LResult);
+    Check('without the flag: exit code 0', LCode = 0, IntToStr(LCode));
+    Check('without the flag: no client path', LResult.ClientPath = '');
+    Check('without the flag: no client file',
+      not FileExists(IncludeTrailingPathDelimiter(LDir) + 'T.Greet.Client.pas'));
+
+    LCode := TProtogenRunner.WriteUnits(LFile, LDir, 'T.Greet', False, LResult,
+      nil, '', nil, nil, True);
+    Check('with the flag: exit code 0', LCode = 0, IntToStr(LCode));
+    Check('with the flag: client path set', LResult.ClientPath <> '');
+    Check('with the flag: client file exists', FileExists(LResult.ClientPath));
+    Check('client has TGreeterClient',
+      Pos('TGreeterClient', ReadFile(LResult.ClientPath)) > 0);
+    Check('the other four are still written',
+      FileExists(LResult.MessagesPath) and FileExists(LResult.InterfacesPath) and
+      FileExists(LResult.RegistrationPath));
+
+    CleanOutputs(LDir, 'T.Greet');
+    LCode := TProtogenRunner.WriteUnits(LFile, LDir, 'T.Greet', True, LResult,
+      nil, '', nil, nil, True);
+    Check('dry-run with the flag: path reported', LResult.ClientPath <> '');
+    Check('dry-run with the flag: nothing written', not FileExists(LResult.ClientPath));
+
+    // A file without a service has no client to emit, even with the flag.
+    LNoSvc := Parse('syntax = "proto3"; package x; message M { int32 v = 1; }');
+    CleanOutputs(LDir, 'T.NoSvc');
+    LCode := TProtogenRunner.WriteUnits(LNoSvc, LDir, 'T.NoSvc', False, LResult,
+      nil, '', nil, nil, True);
+    Check('no service + flag: exit code 0', LCode = 0, IntToStr(LCode));
+    Check('no service + flag: no client', (LResult.ClientPath = '') and
+      not FileExists(IncludeTrailingPathDelimiter(LDir) + 'T.NoSvc.Client.pas'));
+  finally
+    LNoSvc.Free;
+    LFile.Free;
+  end;
+end;
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 begin
@@ -308,6 +366,7 @@ begin
   TestNoOverwrite;
   TestDryRun;
   TestRunApi;
+  TestClientFlag;
 
   WriteLn;
   WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed');
