@@ -40,6 +40,10 @@ REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
 REM                                       Response.Trailers + HeadersOnly.
 REM                                       Part B needs Python with h2 and
 REM                                       SKIPS LOUDLY without it.
+REM    4l Nghttp2GrpcUnaryClient         build + run   (gates) - GC2
+REM                                       TGrpcChannel.Unary. Part B needs
+REM                                       Python grpcio + grpcio-tools, Part C
+REM                                       Python h2; each SKIPS LOUDLY.
 REM                                       TLS 1.2/1.3 cipher setters, read
 REM                                       back from OpenSSL. Skips LOUDLY
 REM                                       when OpenSSL is absent.)
@@ -626,6 +630,91 @@ echo -- Nghttp2ClientTrailers --------------------------------------------------
 echo    SKIP  Nghttp2ClientTrailers.dpr not present
 
 :after_trailers
+
+REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
+REM
+REM TGrpcChannel.Unary returns a decoded reply with grpc-status 0 or raises
+REM EGrpcClientError with the EXACT code. Part A: our own dispatcher, always.
+REM Part B: grpc-probe-peer.py on python grpcio, an independent gRPC server
+REM (stubs generated at start-up from gctest.proto). Part C: the /gctest.Raw/*
+REM malformed replies of client-trailers-peer.py on python h2. Each python part
+REM SKIPS LOUDLY without its package. Peers are started in TITLED windows and
+REM killed by title with /T, never by image name.
+if not exist "Nghttp2GrpcUnaryClient.dpr" goto :no_gunary
+echo -- Nghttp2GrpcUnaryClient ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2GrpcUnaryClient.dpr" > "Nghttp2GrpcUnaryClient.buildlog" 2>&1
+if errorlevel 1 goto :gunary_buildfail
+if not exist "Nghttp2GrpcUnaryClient.exe" goto :gunary_buildfail
+
+set "GPY="
+for %%P in (py python) do if not defined GPY (
+  %%P -c "import grpc, grpc_tools" > nul 2>&1
+  if not errorlevel 1 set "GPY=%%P"
+)
+set "HPY="
+for %%P in (py python) do if not defined HPY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "HPY=%%P"
+)
+set "GUARGS="
+set "GUPARTS=0"
+if defined GPY (
+  start "NGHTTP2GRPCPEER" /min !GPY! "grpc-probe-peer.py" 19324 --lifetime 60
+  set "GUARGS=!GUARGS! grpcio=19324"
+  set /a GUPARTS+=1
+) else (
+  echo    NOTE  no Python with grpcio + grpcio-tools - Part B will SKIP
+)
+if defined HPY (
+  start "NGHTTP2RAWPEER" /min !HPY! "client-trailers-peer.py" 19322 --lifetime 60
+  set "GUARGS=!GUARGS! raw=19322"
+  set /a GUPARTS+=1
+) else (
+  echo    NOTE  no Python with h2 - Part C will SKIP
+)
+REM grpcio generates its stubs before listening: give it a few seconds.
+if not "!GUPARTS!"=="0" ping -n 5 127.0.0.1 > nul
+
+Nghttp2GrpcUnaryClient.exe !GUARGS! < nul
+set "GU_RC=!errorlevel!"
+if defined GPY taskkill /FI "WINDOWTITLE eq NGHTTP2GRPCPEER" /T /F > nul 2>&1
+if defined HPY taskkill /FI "WINDOWTITLE eq NGHTTP2RAWPEER" /T /F > nul 2>&1
+echo.
+if "!GU_RC!"=="3" goto :gunary_skip
+if not "!GU_RC!"=="0" goto :gunary_fail
+if not "!GUPARTS!"=="2" goto :gunary_partial
+echo    PASS  Nghttp2GrpcUnaryClient - all three parts
+goto :after_gunary
+
+:gunary_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2GrpcUnaryClient - Part A only or A + one python part. A
+echo          SKIPPED part did NOT run: see the SKIP lines above
+goto :after_gunary
+
+:gunary_fail
+echo    FAIL  Nghttp2GrpcUnaryClient - !GU_RC!
+set /a FAILED+=1
+goto :after_gunary
+
+:gunary_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2GrpcUnaryClient - libnghttp2 absent; the client NOT exercised
+goto :after_gunary
+
+:gunary_buildfail
+echo    FAIL  Nghttp2GrpcUnaryClient did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2GrpcUnaryClient.buildlog"
+echo.
+echo    Full log: Nghttp2GrpcUnaryClient.buildlog
+set /a FAILED+=1
+goto :after_gunary
+
+:no_gunary
+echo -- Nghttp2GrpcUnaryClient ---------------------------------------------------------------
+echo    SKIP  Nghttp2GrpcUnaryClient.dpr not present
+
+:after_gunary
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in

@@ -57,6 +57,28 @@ const
     is this value under its pre-1.28.0 name. }
   GRPC_DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 
+  { GC2. The full gRPC status code table (grpc/doc/statuscodes.md), here so
+    the client and the server share one copy. Nghttp2.Grpc.Dispatcher still
+    declares the five it has always exported, with the same names and values,
+    so existing code that uses them from there is unaffected. }
+  GRPC_STATUS_OK                  = 0;
+  GRPC_STATUS_CANCELLED           = 1;
+  GRPC_STATUS_UNKNOWN             = 2;
+  GRPC_STATUS_INVALID_ARGUMENT    = 3;
+  GRPC_STATUS_DEADLINE_EXCEEDED   = 4;
+  GRPC_STATUS_NOT_FOUND           = 5;
+  GRPC_STATUS_ALREADY_EXISTS      = 6;
+  GRPC_STATUS_PERMISSION_DENIED   = 7;
+  GRPC_STATUS_RESOURCE_EXHAUSTED  = 8;
+  GRPC_STATUS_FAILED_PRECONDITION = 9;
+  GRPC_STATUS_ABORTED             = 10;
+  GRPC_STATUS_OUT_OF_RANGE        = 11;
+  GRPC_STATUS_UNIMPLEMENTED       = 12;
+  GRPC_STATUS_INTERNAL            = 13;
+  GRPC_STATUS_UNAVAILABLE         = 14;
+  GRPC_STATUS_DATA_LOSS           = 15;
+  GRPC_STATUS_UNAUTHENTICATED     = 16;
+
 type
   { Result of one TGrpcMessageReassembler.TryNext call. }
   TGrpcFrameResult = (
@@ -128,6 +150,11 @@ function GrpcEncodeStatusMessage(const AText: string): string;
   rather than raising, because an error message that cannot be decoded is
   still better shown than lost. }
 function GrpcDecodeStatusMessage(const AText: string): string;
+
+{ GC2. The canonical name of a status code ('NOT_FOUND' for 5), or
+  'CODE_<n>' for a number outside 0..16 - a peer may send one, and the
+  number must survive into the error rather than be replaced. }
+function GrpcStatusName(AStatus: Integer): string;
 
 implementation
 
@@ -392,6 +419,20 @@ begin
   SetLength(LBytes, LCount);
   { The inverse of the encoder's TEncoding.UTF8.GetBytes, on both compilers. }
   Result := TEncoding.UTF8.GetString(LBytes);
+end;
+
+function GrpcStatusName(AStatus: Integer): string;
+const
+  NAMES: array[0..16] of string = (
+    'OK', 'CANCELLED', 'UNKNOWN', 'INVALID_ARGUMENT', 'DEADLINE_EXCEEDED',
+    'NOT_FOUND', 'ALREADY_EXISTS', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED',
+    'FAILED_PRECONDITION', 'ABORTED', 'OUT_OF_RANGE', 'UNIMPLEMENTED',
+    'INTERNAL', 'UNAVAILABLE', 'DATA_LOSS', 'UNAUTHENTICATED');
+begin
+  if (AStatus >= Low(NAMES)) and (AStatus <= High(NAMES)) then
+    Result := NAMES[AStatus]
+  else
+    Result := 'CODE_' + IntToStr(AStatus);
 end;
 
 end.

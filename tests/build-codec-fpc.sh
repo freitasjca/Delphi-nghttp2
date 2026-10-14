@@ -33,6 +33,11 @@
 #                                       + HeadersOnly. Part B needs python h2 for
 #                                       client-trailers-peer.py and SKIPS LOUDLY
 #                                       without it; Part A always runs.)
+#    4l Nghttp2GrpcUnaryClient         build + run   (gates; GC2 — TGrpcChannel.Unary +
+#                                       EGrpcClientError. Part B = python grpcio
+#                                       (grpc-probe-peer.py), Part C = python h2
+#                                       malformed replies; each SKIPS LOUDLY
+#                                       without its python; Part A always runs.)
 #                                       TLS 1.2/1.3 cipher setters read back
 #                                       from OpenSSL. Skips LOUDLY when
 #                                       OpenSSL is absent. Same name as the
@@ -904,6 +909,103 @@ else
     echo "  FAIL  Nghttp2ClientTrailers.dpr did not compile"
     grep -E "Error|Fatal" "$CTOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $CTOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── 4l · gRPC unary client (GC2, B2 gRPC client plan) ─────────────────────────
+# TGrpcChannel.Unary: a decoded reply with grpc-status 0, or EGrpcClientError
+# with the EXACT code. Part A: our own dispatcher, in process. Part B:
+# grpc-probe-peer.py on python grpcio - an independent gRPC server, stubs made
+# at start-up by grpc_tools.protoc from gctest.proto. Part C: the /gctest.Raw/*
+# routes of client-trailers-peer.py (python h2) - replies no real server sends.
+# Interpreters: GRPC_PYTHON / H2_PYTHON if set, else the protogen venv, else
+# python3 - whichever can import the package. RegisterMethod only, so
+# -dNGHTTP2_GRPC_NO_FFI: nothing reaches TRttiMethod.Invoke.
+echo
+echo "── gRPC unary client (GC2) ───────────────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2GrpcUnaryClient.dpr" ]]; then
+  echo "  SKIP  Nghttp2GrpcUnaryClient.dpr not present"
+else
+  GUOUT="$OUT/grpc-unary"
+  mkdir -p "$GUOUT"
+  rm -f "$GUOUT"/*.ppu "$GUOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+       -FU"$GUOUT" -FE"$GUOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2GrpcUnaryClient.dpr" > "$GUOUT/build.log" 2>&1 \
+     && [[ -x "$GUOUT/Nghttp2GrpcUnaryClient" ]]; then
+
+    GU_GPY=""
+    for CAND in "${GRPC_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import grpc, grpc_tools' > /dev/null 2>&1; then GU_GPY="$CAND"; break; fi
+    done
+    GU_HPY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then GU_HPY="$CAND"; break; fi
+    done
+
+    GU_ARGS=""
+    GU_PIDS=""
+    if [[ -n "$GU_GPY" ]]; then
+      "$GU_GPY" "$HERE/grpc-probe-peer.py" 19324 --lifetime 60 > "$GUOUT/grpc-peer.log" 2>&1 &
+      GU_PIDS="$GU_PIDS $!"
+    else
+      echo "  NOTE  no python with grpcio + grpcio-tools - Part B will SKIP"
+    fi
+    if [[ -n "$GU_HPY" ]]; then
+      "$GU_HPY" "$HERE/client-trailers-peer.py" 19322 --lifetime 60 > "$GUOUT/raw-peer.log" 2>&1 &
+      GU_PIDS="$GU_PIDS $!"
+    else
+      echo "  NOTE  no python with h2 - Part C will SKIP"
+    fi
+    for _ in $(seq 1 100); do
+      GU_READY=1
+      [[ -n "$GU_GPY" ]] && ! grep -q '^READY' "$GUOUT/grpc-peer.log" 2>/dev/null && GU_READY=0
+      [[ -n "$GU_HPY" ]] && ! grep -q '^READY' "$GUOUT/raw-peer.log" 2>/dev/null && GU_READY=0
+      [[ $GU_READY -eq 1 ]] && break
+      sleep 0.1
+    done
+    if [[ -n "$GU_GPY" ]]; then
+      if grep -q '^READY' "$GUOUT/grpc-peer.log" 2>/dev/null; then
+        GU_ARGS="$GU_ARGS grpcio=19324"
+      else
+        echo "  NOTE  the grpcio peer did not start - see $GUOUT/grpc-peer.log"
+      fi
+    fi
+    if [[ -n "$GU_HPY" ]]; then
+      if grep -q '^READY' "$GUOUT/raw-peer.log" 2>/dev/null; then
+        GU_ARGS="$GU_ARGS raw=19322"
+      else
+        echo "  NOTE  the h2 peer did not start - see $GUOUT/raw-peer.log"
+      fi
+    fi
+
+    timeout 90 "$GUOUT/Nghttp2GrpcUnaryClient" $GU_ARGS < /dev/null | sed 's/^/  /'
+    GU_RC=${PIPESTATUS[0]}
+    for P in $GU_PIDS; do kill "$P" 2>/dev/null; wait "$P" 2>/dev/null; done
+
+    case "$GU_RC" in
+      0)   if [[ "$GU_ARGS" == *grpcio=* && "$GU_ARGS" == *raw=* ]]; then
+             echo "  grpc unary client: PASSED (all three parts)"
+           else
+             echo "  grpc unary client: Part A PASSED - a python part SKIPPED; see the"
+             echo "        SKIP lines: the independent-peer checks did NOT run"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - the gRPC client was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 90s"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  gRPC unary client"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2GrpcUnaryClient.dpr did not compile"
+    grep -E "Error|Fatal" "$GUOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $GUOUT/build.log"
     RC=2
   fi
 fi

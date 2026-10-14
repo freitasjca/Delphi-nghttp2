@@ -1,0 +1,29 @@
+// gctest.proto - the contract of the GC2 gRPC client test (Nghttp2GrpcUnaryClient).
+// Implemented three times: by the Pascal test server (our dispatcher), by
+// grpc-probe-peer.py (python grpcio, an independent implementation), and as
+// hand-framed malformed replies in client-trailers-peer.py.
+syntax = "proto3";
+
+package gctest;
+
+message EchoRequest {
+  string text = 1;
+  int32  num  = 2;
+}
+
+message EchoReply {
+  string text = 1;
+  int32  num  = 2;
+}
+
+// Fail answers with grpc-status = code and grpc-message = message.
+message FailRequest {
+  int32  code    = 1;
+  string message = 2;
+}
+
+service Probe {
+  rpc Echo  (EchoRequest) returns (EchoReply);   // text -> "echo:" + text, num -> num + 1
+  rpc Fail  (FailRequest) returns (EchoReply);
+  rpc Empty (EchoRequest) returns (EchoReply);   // all defaults: a zero-length message
+}

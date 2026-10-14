@@ -16,6 +16,20 @@ never produce the response shapes the GC1 client change has to tell apart:
   /empty-data      HEADERS, then an empty DATA(END_STREAM): no body, no
                    trailers, and NOT headers-only (the control for the first)
 
+GC2 adds /gctest.Raw/* - gRPC replies a real gRPC server never sends, for
+Nghttp2GrpcUnaryClient part C: each must become a specific gRPC status, never
+a decoded "success". The message bytes are EchoReply{text: "raw"}.
+
+  NoStatus      body + trailers without grpc-status          -> 13
+  TwoMessages   two framed messages + status 0               -> 13
+  Compressed    compressed flag set, no grpc-encoding        -> 13
+  NotGrpc       HTTP 200, content-type text/html             -> 13
+  Http503       HTTP 503, no gRPC fields at all              -> 14
+  OkNoMessage   status 0 in trailers, no DATA payload        -> 13
+  TrailersOnlyOk  headers-only with grpc-status 0 (no message) -> 13
+  BadStatus     grpc-status: abc                             -> 2
+  Truncated     header says 10 bytes, 3 present, status 0    -> 13
+
 Uses the `h2` package only (pip install h2). h2c with prior knowledge, one
 connection at a time, exits after --lifetime seconds without a connection.
 
@@ -30,8 +44,51 @@ import h2.connection
 import h2.events
 
 
+RAW_MSG = b'\x0a\x03raw'          # EchoReply{text: "raw"}
+GRPC_CT = ('content-type', 'application/grpc')
+
+
+def frame(payload, flag=0):
+    return bytes([flag]) + len(payload).to_bytes(4, 'big') + payload
+
+
+def respond_raw(conn, stream_id, name):
+    if name == 'Http503':
+        conn.send_headers(stream_id, [(':status', '503')], end_stream=True)
+        return
+    if name == 'NotGrpc':
+        conn.send_headers(stream_id, [(':status', '200'), ('content-type', 'text/html')])
+        conn.send_data(stream_id, b'<html>not grpc</html>', end_stream=True)
+        return
+    if name == 'TrailersOnlyOk':
+        conn.send_headers(stream_id, [(':status', '200'), GRPC_CT, ('grpc-status', '0')],
+                          end_stream=True)
+        return
+    conn.send_headers(stream_id, [(':status', '200'), GRPC_CT])
+    trailers = [('grpc-status', '0')]
+    if name == 'NoStatus':
+        conn.send_data(stream_id, frame(RAW_MSG))
+        trailers = [('x-not-a-status', '1')]
+    elif name == 'TwoMessages':
+        conn.send_data(stream_id, frame(RAW_MSG) + frame(RAW_MSG))
+    elif name == 'Compressed':
+        conn.send_data(stream_id, frame(RAW_MSG, flag=1))
+    elif name == 'OkNoMessage':
+        conn.send_data(stream_id, b'')
+    elif name == 'BadStatus':
+        conn.send_data(stream_id, frame(RAW_MSG))
+        trailers = [('grpc-status', 'abc')]
+    elif name == 'Truncated':
+        conn.send_data(stream_id, bytes([0, 0, 0, 0, 10]) + RAW_MSG[:3])
+    else:
+        trailers = [('grpc-status', '12'), ('grpc-message', 'no%20such%20raw%20route')]
+    conn.send_headers(stream_id, trailers, end_stream=True)
+
+
 def respond(conn, stream_id, path):
-    if path == '/trailers-only':
+    if path.startswith('/gctest.Raw/'):
+        respond_raw(conn, stream_id, path[len('/gctest.Raw/'):])
+    elif path == '/trailers-only':
         conn.send_headers(stream_id, [
             (':status', '200'),
             ('content-type', 'application/grpc'),
