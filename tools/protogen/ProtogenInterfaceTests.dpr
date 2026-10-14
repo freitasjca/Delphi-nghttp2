@@ -409,6 +409,27 @@ begin
   Result := '';
 end;
 
+{ GC7. The warehouse sample's directory, holding inventory.proto and the
+  committed Sample.Inventory.Client.pas. Tried relative to the executable
+  (Windows: tools/protogen; Linux: tests/.fpc-out/protogen-iface) and to the
+  working directory; PROTOGEN_INVENTORY_DIR overrides. }
+function InventoryDir: string;
+var
+  LCand: array[0..5] of string;
+  I: Integer;
+begin
+  LCand[0] := GetEnvironmentVariable('PROTOGEN_INVENTORY_DIR');
+  LCand[1] := Join(ExeDir, '..' + PathDelim + '..' + PathDelim + 'samples' + PathDelim + 'inventory');
+  LCand[2] := Join(ExeDir, '..' + PathDelim + '..' + PathDelim + '..' + PathDelim + 'samples' + PathDelim + 'inventory');
+  LCand[3] := Join(GetCurrentDir, 'samples' + PathDelim + 'inventory');
+  LCand[4] := Join(GetCurrentDir, '..' + PathDelim + 'samples' + PathDelim + 'inventory');
+  LCand[5] := Join(GetCurrentDir, '..' + PathDelim + '..' + PathDelim + 'samples' + PathDelim + 'inventory');
+  for I := Low(LCand) to High(LCand) do
+    if (LCand[I] <> '') and FileExists(Join(LCand[I], 'inventory.proto')) then
+      Exit(LCand[I]);
+  Result := '';
+end;
+
 // Strips a UTF-8 BOM in both its 3-byte (FPC/AnsiString) and single-#$FEFF
 // (Delphi/Unicode) forms — invisible in an editor, but it survives Normalize
 // and would fail the comparison on its own.
@@ -880,6 +901,38 @@ begin
   end;
 end;
 
+// GC7. The inventory sample's client unit is checked in so the sample builds
+// without running the generator - so it must stay EXACTLY what the generator
+// emits, or the sample would demonstrate code protogen does not produce.
+procedure TestClientEmitterInventory;
+var
+  LFile: TProtoFileNode;
+  LDir, LGot, LWant: string;
+begin
+  Section('GC7: the inventory sample client is generated output');
+  LDir := InventoryDir;
+  if LDir = '' then
+  begin
+    Skip('GC7 inventory client', 'samples/inventory not found; set PROTOGEN_INVENTORY_DIR');
+    Exit;
+  end;
+  WriteLn('  proto: ', Join(LDir, 'inventory.proto'));
+  LFile := nil;
+  try
+    LFile := Parse(ReadFileText(Join(LDir, 'inventory.proto')));
+    Check('inventory parse ok', LFile <> nil);
+    if LFile = nil then Exit;
+    LGot  := Normalize(EmitClient(LFile, 'Sample.Inventory'));
+    LWant := Normalize(ReadFileText(Join(LDir, 'Sample.Inventory.Client.pas')));
+    Check('Sample.Inventory.Client.pas is exactly what protogen --client emits',
+      LGot = LWant, FirstDifference(LWant, LGot));
+    Check('  ... and it carries WatchStock as a typed stream',
+      Pos(TightenPunctuation('function WatchStock(ARequest: TGetProductRequest): TInventoryServiceWatchStockStream; overload;'), LGot) > 0);
+  finally
+    LFile.Free;
+  end;
+end;
+
 // Needs no sibling checkout: inline schemas for the naming rules.
 procedure TestClientEmitterRules;
 const
@@ -997,6 +1050,7 @@ begin
   TestStreamingEmitters;
   TestClientEmitterGreeter;
   TestClientEmitterRules;
+  TestClientEmitterInventory;
   WriteLn;
   WriteLn('Result: ', GPass, ' passed, ', GFail, ' failed, ', GSkip, ' skipped');
   if GFail > 0 then

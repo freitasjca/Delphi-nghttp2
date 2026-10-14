@@ -27,18 +27,20 @@ program Nghttp2InventoryServer;
 //  life, while a streamed message is handed off and forgotten immediately.
 //
 //  ---------------------------------------------------------------------
-//  NO CLIENT HERE, AND THAT IS A CURRENT LIMITATION, NOT A CHOICE
+//  THE CLIENT HALF (B2 client plan, GC7)
 //  ---------------------------------------------------------------------
 //
-//  This library serves gRPC; it does not yet call it. TNghttp2Client speaks
-//  HTTP/2 but knows nothing of gRPC framing, status trailers or deadlines, so
-//  there is no `Client.GetProduct(Request)` to show. Until roadmap item B2
-//  lands, drive this with grpcurl - see document.md.
+//  Once the server is up, this program calls its own three RPCs from Pascal
+//  through the GENERATED stubs (Sample.Inventory.Client, protogen --client)
+//  and checks every answer - see Sample.Inventory.ClientDemo. The contract is
+//  exercised from both ends in one process. Nghttp2InventoryClient.dpr runs
+//  the same checks against any server, including inventory_server.py, an
+//  independent python grpcio implementation.
 //
-//  When B2 arrives, the client half belongs in this sample: the same three
-//  RPCs called from Pascal, against this same server, so the contract is
-//  exercised from both ends in one place. The section marked
-//  "B2 PLACEHOLDER" below is where it goes.
+//    Nghttp2InventoryServer               serve, self-check, then wait for
+//                                         ENTER (drive it with grpcurl)
+//    Nghttp2InventoryServer --self-test   serve, self-check, stop; the exit
+//                                         code is the number of failed checks
 //
 //  Build (Delphi):
 //    dcc64 -U..\..\src Nghttp2InventoryServer.dpr
@@ -67,7 +69,9 @@ uses
   Nghttp2.Server,
   Nghttp2.Grpc.Registry,
   Nghttp2.Grpc.Dispatcher,
-  Sample.Inventory.Messages in 'Sample.Inventory.Messages.pas';
+  Sample.Inventory.Messages in 'Sample.Inventory.Messages.pas',
+  Sample.Inventory.Client in 'Sample.Inventory.Client.pas',
+  Sample.Inventory.ClientDemo in 'Sample.Inventory.ClientDemo.pas';
 
 const
   PORT = 19010;
@@ -103,9 +107,12 @@ type
   end;
 
 var
-  GService: TInventoryService;
-  GServer:  TNghttp2Server;
-  GConfig:  TNghttp2Config;
+  GService:  TInventoryService;
+  GServer:   TNghttp2Server;
+  GConfig:   TNghttp2Config;
+  GSelfTest: Boolean;
+  GFailed:   Integer;
+  GArg:      Integer;
 
 function TInventoryService.IndexOfBarcode(const ABarcode: string): Integer;
 var
@@ -251,6 +258,11 @@ begin
 end;
 
 begin
+  GSelfTest := False;
+  for GArg := 1 to ParamCount do
+    if SameText(ParamStr(GArg), '--self-test') then
+      GSelfTest := True;
+  GFailed   := 0;
   GService := TInventoryService.Create;
   try
     { The path is `/<proto package>.<service>/<rpc>`, exactly as it appears in
@@ -282,21 +294,20 @@ begin
       WriteLn('  /inventory.InventoryService/WatchStock      server streaming');
       WriteLn('  /healthz                                    plain HTTP/2');
       WriteLn;
-      WriteLn('Drive it with grpcurl - see document.md. ENTER to stop.');
-      ReadLn;
 
-      // ===================================================================
-      //  B2 PLACEHOLDER - the Pascal client half
-      //
-      //  When the gRPC client lands (roadmap B2), this sample should call
-      //  its own three RPCs from Pascal right here, before stopping the
-      //  server: GetProduct for the unary path, CreateShipment for a
-      //  repeated field on the way out, and WatchStock for reading a stream.
-      //
-      //  That turns the sample from "a server you poke with grpcurl" into a
-      //  round trip that proves the contract from both ends in one process,
-      //  which is also the cheapest possible regression test for the client.
-      // ===================================================================
+      { The client half: the same three RPCs, called from Pascal through the
+        generated stubs, against the server this process just started. The
+        server log lines above and the client's PASS lines interleave, which
+        is the point - both ends of every call are visible. }
+      GFailed := RunInventoryClient('127.0.0.1', PORT);
+      WriteLn;
+
+      if not GSelfTest then
+      begin
+        WriteLn('Server still running - drive it with grpcurl too, see document.md.');
+        WriteLn('ENTER to stop.');
+        ReadLn;
+      end;
 
       GServer.Stop;
     finally
@@ -308,4 +319,5 @@ begin
     TGrpcRegistry.Shutdown;
     GService.Free;
   end;
+  ExitCode := GFailed;
 end.

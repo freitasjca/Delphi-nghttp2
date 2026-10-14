@@ -5,7 +5,7 @@ unit Sample.Inventory.Messages;
 //  sample. Mirrors inventory.proto; that file is the contract, this one is
 //  its Pascal shadow.
 //
-//  This is what `Protogen -i inventory.proto -o . --unit-prefix Sample.Inventory`
+//  This is what `Protogen -i inventory.proto -o <dir> --unit-prefix Sample`
 //  emits, kept in the repository so the sample builds without running the
 //  generator first.
 //

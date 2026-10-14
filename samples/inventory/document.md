@@ -22,12 +22,18 @@ Change a field **name** and you have not: the tag is the contract.
 ```
 inventory.proto
       |
-      |  Protogen -i inventory.proto -o . --unit-prefix Sample.Inventory
+      |  Protogen -i inventory.proto -o <dir> --unit-prefix Sample --client
       v
 Sample.Inventory.Messages.pas          <- protobuf half: types + codec metadata
+Sample.Inventory.Client.pas            <- gRPC client stubs (generated, --client)
       |
-      v
-Nghttp2InventoryServer.dpr             <- gRPC half: registration + handlers
+      +--> Nghttp2InventoryServer.dpr  <- gRPC server: registration + handlers,
+      |                                   then calls itself through the stubs
+      +--> Nghttp2InventoryClient.dpr  <- the same calls against ANY server
+                                          (Sample.Inventory.ClientDemo.pas)
+
+inventory_server.py                     <- the same service in python grpcio,
+                                           an independent implementation
 ```
 
 Three RPCs, chosen to cover the three shapes a real service needs:
@@ -49,6 +55,7 @@ dispatcher does not recognise falls through to ordinary handling.
 
 ```
 dcc64 -U..\..\src Nghttp2InventoryServer.dpr
+dcc64 -U..\..\src Nghttp2InventoryClient.dpr
 ```
 
 **FPC trunk 3.3.1** — the gRPC layer needs trunk, because 3.2.2's `Rtti` unit
@@ -56,6 +63,7 @@ declares no `TCustomAttribute`:
 
 ```
 fpc -MDelphi -dNGHTTP2_GRPC_NO_FFI -Fu../../src Nghttp2InventoryServer.dpr
+fpc -MDelphi -Fu../../src Nghttp2InventoryClient.dpr
 ```
 
 `NGHTTP2_GRPC_NO_FFI` is safe here because the sample registers with
@@ -95,8 +103,10 @@ Nghttp2InventoryServer.exe
 ./Nghttp2InventoryServer
 ```
 
-It prints its routes and then waits on ENTER. Leave it running — every command
-below goes in a **second terminal**.
+It prints its routes, then calls its own three RPCs through the generated
+client and checks every answer (the server's log lines and the client's PASS
+lines interleave - both ends of each call are visible), and then waits on
+ENTER. Leave it running — every command below goes in a **second terminal**.
 
 ```
 inventory service on h2c port 19010
@@ -104,7 +114,17 @@ inventory service on h2c port 19010
   /inventory.InventoryService/CreateShipment  unary
   /inventory.InventoryService/WatchStock      server streaming
   /healthz                                    plain HTTP/2
+
+client: calling 127.0.0.1:19010
+  GetProduct(ABC123) -> Mechanical keyboard, stock 17
+  PASS  GetProduct(ABC123): found, the catalogue entry
+  ...
+client: every check passed
 ```
+
+`Nghttp2InventoryServer --self-test` does the same and stops instead of
+waiting; its exit code is the number of failed checks. That is how the test
+runners use it (stage 4m).
 
 The server logs each call as it handles it, so keep both terminals visible —
 the client side shows what came back, the server side shows what it did.
@@ -127,8 +147,9 @@ is wrong" — worth doing first when something does not answer.
 
 ### 4. Call the RPCs
 
-Needs [`grpcurl`](https://github.com/fullstorydev/grpcurl). There is no Pascal
-client yet — see [below](#the-missing-half-a-pascal-client).
+Needs [`grpcurl`](https://github.com/fullstorydev/grpcurl). The Pascal client
+is [below](#the-client-half); grpcurl stays useful as a client that shares no
+code with this library.
 
 **Unary, a hit:**
 
@@ -258,12 +279,21 @@ domain, it has to be carried explicitly.
 
 ## Regenerating the messages
 
-`Sample.Inventory.Messages.pas` is checked in so the sample builds without
-running the generator, but it is generated output:
+`Sample.Inventory.Messages.pas` and `Sample.Inventory.Client.pas` are checked
+in so the sample builds without running the generator, but they are generated
+output:
 
 ```bash
-Protogen -i inventory.proto -o . --unit-prefix Sample.Inventory
+Protogen -i inventory.proto -o /tmp/inv --unit-prefix Sample --client
 ```
+
+The per-file part of a unit name comes from the `.proto`'s own path (IMPORT-1),
+so `--unit-prefix Sample` with `inventory.proto` yields `Sample.Inventory.*`.
+Generate into a scratch directory and copy the two units back: the generator
+also writes server-side units (`.Interfaces`, `.Service`, `.Registration`)
+that this sample does not use, because it registers its handlers by hand.
+Stage C3 of the test runners fails if `Sample.Inventory.Client.pas` stops
+being exactly what `--client` emits.
 
 Three rules govern that unit, and all three are load-bearing — they are in its
 header too, because each one fails *silently*:
@@ -277,37 +307,72 @@ header too, because each one fails *silently*:
 
 ### What the generator refuses
 
-If you extend `inventory.proto`, note that `sint32`/`sint64`,
-`fixed*`/`sfixed*` are **refused at build time**. That is deliberate and it
-protects you: the codec selects a wire type from the Pascal type, and RTTI
-cannot express the zigzag/fixed-width distinction — so generating code for
-them would put *wrong bytes* on the wire that a peer decodes as a different
-value with no error anywhere. A build-time refusal is the cheap version of
-that discovery.
+If you extend `inventory.proto`: proto2 (`required`, `group`), and the
+reflection well-known types (`google.protobuf.Api`, `DescriptorProto` and
+friends) are **refused at build time, with the reason**. A refusal at
+generation is the cheap version of finding out at run time.
 
-`map`, `oneof`, `optional`, the `Struct` family, `Any`, and the whole `import`
-closure are all supported.
+Everything a proto3 service normally uses is supported: every scalar type
+including `sint32`/`sint64` and `fixed*`/`sfixed*` (since library 1.20.0,
+WIRE-FORM-1 - each gets its own wire form), `repeated`, `map`, `oneof`,
+`optional`, the `Struct` family, `Any`, and the whole `import` closure.
 
 ---
 
-## The missing half: a Pascal client
+## The client half
 
-This library **serves** gRPC; it does not yet **call** it.
+`protogen --client` generates `Sample.Inventory.Client.pas`: one
+`TInventoryServiceClient` over a `TGrpcChannel`, with a method per rpc.
+`Sample.Inventory.ClientDemo.pas` uses it like this:
 
-`TNghttp2Client` speaks HTTP/2, but it knows nothing of gRPC's length-prefixed
-framing, `grpc-status` trailers, or deadlines — so there is no
-`Client.GetProduct(Request)` to show, and writing one by hand here would mean
-reimplementing the framing this library already contains on the server side.
+```pascal
+LChannel := TGrpcChannel.Create('127.0.0.1', 19010);   // h2c, connects lazily
+LClient  := TInventoryServiceClient.Create(LChannel);  // borrows the channel
 
-That is roadmap item **B2**. When it lands, the client half belongs in *this*
-sample: the same three RPCs called from Pascal against this same server, so
-the contract is exercised from both ends in one process. The `.dpr` carries a
-`B2 PLACEHOLDER` block marking exactly where it goes.
+LReq := TGetProductRequest.Create;
+LReq.barcode := 'ABC123';
+LReply := LClient.GetProduct(LReq);                     // caller frees LReply
+if LReply.found then
+  WriteLn(LReply.product.name, ' ', LReply.product.stock);
 
-Until then, `grpcurl` is the client — and it has one advantage worth keeping
-even afterwards: it is an **independent implementation**. A bug shared between
-our client and our server is invisible to a test that uses both, and visible
-immediately to one that does not.
+LStream := LClient.WatchStock(LReq);                    // caller frees LStream
+while LStream.MoveNext do
+  WriteLn(LStream.Current.stock);                       // Current: TProduct
+```
+
+The ownership rule is the mirror image of the server's:
+
+| | who frees what |
+|---|---|
+| **unary** | the stub returns a **new** reply: the caller frees it. The request is never freed by the stub. |
+| **streaming** | the caller frees the stream object. Each `Current` belongs to the stream and is freed by the next `MoveNext`, so copy what you need to keep. |
+
+A call that does not end with `grpc-status 0` raises `EGrpcClientError` with
+the status and message; `MoveNext` raises the same way when a stream ends badly,
+after delivering every message before the failure. "No such product" is not an
+error here, which is why `GetProductResponse` carries `found`.
+
+Pass `TGrpcCallOptions` for a deadline or metadata:
+
+```pascal
+LOpts := TGrpcCallOptions.Default;
+LOpts.DeadlineMS := 5000;
+LReply := LClient.GetProduct(LReq, LOpts);
+```
+
+### Against a server that is not ours
+
+A bug shared by our client and our server is invisible to a test that uses
+both. `inventory_server.py` is the same service in python grpcio, which shares
+none of this library's code, and `Nghttp2InventoryClient` runs the same checks
+against it:
+
+```bash
+python3 inventory_server.py 19335 &        # needs grpcio + grpcio-tools
+./Nghttp2InventoryClient 127.0.0.1 19335
+```
+
+Both test runners do exactly this in stage 4m.
 
 ---
 

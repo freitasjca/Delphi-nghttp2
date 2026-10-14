@@ -6,9 +6,13 @@
 //  written against the shapes it defines. Change a field number here and you
 //  have changed the wire format; change a field NAME and you have not.
 //
-//  Generate the Pascal messages with:
+//  Generate the Pascal units with:
 //
-//    Protogen -i inventory.proto -o . --unit-prefix Sample.Inventory
+//    Protogen -i inventory.proto -o <dir> --unit-prefix Sample --client
+//
+//  That yields Sample.Inventory.Messages.pas and, with --client,
+//  Sample.Inventory.Client.pas - the two units this sample uses (see
+//  document.md, "Regenerating the messages").
 //
 //  Three RPCs, chosen to cover the three things a real service does:
 //    GetProduct      unary          - one in, one out

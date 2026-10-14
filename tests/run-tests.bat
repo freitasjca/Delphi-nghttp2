@@ -44,6 +44,9 @@ REM    4l Nghttp2GrpcUnaryClient         build + run   (gates) - GC2
 REM                                       TGrpcChannel.Unary. Part B needs
 REM                                       Python grpcio + grpcio-tools, Part C
 REM                                       Python h2; each SKIPS LOUDLY.
+REM    4m samples\inventory programs   build + run   (gates) - GC7
+REM                                       server --self-test, then the client
+REM                                       against python grpcio (SKIPS LOUDLY).
 REM                                       TLS 1.2/1.3 cipher setters, read
 REM                                       back from OpenSSL. Skips LOUDLY
 REM                                       when OpenSSL is absent.)
@@ -719,6 +722,88 @@ echo -- Nghttp2GrpcUnaryClient -------------------------------------------------
 echo    SKIP  Nghttp2GrpcUnaryClient.dpr not present
 
 :after_gunary
+
+REM -- Stage 4m. Inventory sample, both halves (GC7, B2 gRPC client plan). ----
+REM
+REM samples\inventory: the server sample calls its own three RPCs through the
+REM GENERATED client stubs and checks every answer. Part A runs
+REM Nghttp2InventoryServer --self-test (exit code = failed checks). Part B runs
+REM Nghttp2InventoryClient against inventory_server.py on python grpcio - the
+REM same service, none of this library's code - and SKIPS LOUDLY without it.
+REM Built and run from samples\inventory, so tests\ (nghttp2.dll) goes on PATH
+REM for this stage, as for C6a. The peer is killed by window title.
+if not exist "..\samples\inventory\Nghttp2InventoryServer.dpr" goto :no_inventory
+echo -- Inventory sample (GC7) ---------------------------------------------------------------
+pushd "..\samples\inventory"
+set "SAVEDPATH=!PATH!"
+set "PATH=%~dp0;!PATH!"
+"!DCC!" -CC -B -U"..\..\src" "Nghttp2InventoryServer.dpr" > "Nghttp2InventoryServer.buildlog" 2>&1
+if errorlevel 1 goto :inv_buildfail
+if not exist "Nghttp2InventoryServer.exe" goto :inv_buildfail
+"!DCC!" -CC -B -U"..\..\src" "Nghttp2InventoryClient.dpr" > "Nghttp2InventoryClient.buildlog" 2>&1
+if errorlevel 1 goto :inv_buildfail
+if not exist "Nghttp2InventoryClient.exe" goto :inv_buildfail
+
+echo    -- A  Nghttp2InventoryServer --self-test (our server, our client)
+Nghttp2InventoryServer.exe --self-test < nul > "Nghttp2InventoryServer.run.log" 2>&1
+set "INV_A=!errorlevel!"
+type "Nghttp2InventoryServer.run.log"
+
+set "INVPY="
+for %%P in (py python) do if not defined INVPY (
+  %%P -c "import grpc, grpc_tools" > nul 2>&1
+  if not errorlevel 1 set "INVPY=%%P"
+)
+set "INV_B=skip"
+if not defined INVPY goto :inv_nopy
+start "NGHTTP2INVPEER" /min !INVPY! "inventory_server.py" 19335 --lifetime 60 --interval 0.05
+REM grpcio generates its stubs before listening: give it a few seconds.
+ping -n 5 127.0.0.1 > nul
+echo    -- B  Nghttp2InventoryClient against inventory_server.py (python grpcio)
+Nghttp2InventoryClient.exe 127.0.0.1 19335 < nul > "Nghttp2InventoryClient.run.log" 2>&1
+set "INV_B=!errorlevel!"
+type "Nghttp2InventoryClient.run.log"
+taskkill /FI "WINDOWTITLE eq NGHTTP2INVPEER" /T /F > nul 2>&1
+goto :inv_verdict
+
+:inv_nopy
+echo    SKIP  Part B: no Python with grpcio + grpcio-tools - the client was NOT
+echo          run against an independent server
+
+:inv_verdict
+set "PATH=!SAVEDPATH!"
+popd
+echo.
+if not "!INV_A!"=="0" goto :inv_fail
+if "!INV_B!"=="skip" goto :inv_partial
+if not "!INV_B!"=="0" goto :inv_fail
+echo    PASS  Inventory sample - both parts
+goto :after_inventory
+
+:inv_partial
+set /a SKIPPED+=1
+echo    PASS  Inventory sample - Part A only; Part B did NOT run
+goto :after_inventory
+
+:inv_fail
+echo    FAIL  Inventory sample - Part A exit !INV_A!, Part B !INV_B!
+set /a FAILED+=1
+goto :after_inventory
+
+:inv_buildfail
+set "PATH=!SAVEDPATH!"
+echo    FAIL  an inventory sample program did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2InventoryServer.buildlog" "Nghttp2InventoryClient.buildlog"
+echo    Full logs: samples\inventory\*.buildlog
+popd
+set /a FAILED+=1
+goto :after_inventory
+
+:no_inventory
+echo -- Inventory sample (GC7) ---------------------------------------------------------------
+echo    SKIP  samples\inventory not present
+
+:after_inventory
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in

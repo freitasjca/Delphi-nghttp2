@@ -42,6 +42,11 @@
 #                                       server, server certificate VERIFIED
 #                                       (certs-tls/); Part E = the same against
 #                                       the grpcio peer's TLS ports.)
+#    4m samples/inventory, both halves  build + run   (gates; GC7 — the server
+#                                       sample calls itself through the generated
+#                                       client (--self-test), and the standalone
+#                                       client calls inventory_server.py, python
+#                                       grpcio; that part SKIPS LOUDLY without it.)
 #                                       TLS 1.2/1.3 cipher setters read back
 #                                       from OpenSSL. Skips LOUDLY when
 #                                       OpenSSL is absent. Same name as the
@@ -1013,6 +1018,83 @@ else
     grep -E "Error|Fatal" "$GUOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $GUOUT/build.log"
     RC=2
+  fi
+fi
+
+# ── 4m · inventory sample, both halves (GC7, B2 gRPC client plan) ─────────────
+# samples/inventory: the server sample now calls its own three RPCs through the
+# GENERATED client stubs (Sample.Inventory.Client) and checks every answer.
+# Part A: Nghttp2InventoryServer --self-test (server and client in one process;
+# exit code = failed checks). Part B: Nghttp2InventoryClient against
+# inventory_server.py - python grpcio, the same service in an implementation
+# that shares none of this library's code. Part B SKIPS LOUDLY without grpcio.
+# RegisterMethod / RegisterServerStream only: -dNGHTTP2_GRPC_NO_FFI is honest.
+echo
+echo "── inventory sample, client + server (GC7) ───────────────────────────"
+INVSRC="$HERE/../samples/inventory"
+if [[ ! -f "$INVSRC/Nghttp2InventoryServer.dpr" || ! -f "$INVSRC/Nghttp2InventoryClient.dpr" ]]; then
+  echo "  SKIP  samples/inventory programs not present"
+else
+  INVOUT="$OUT/inventory"
+  mkdir -p "$INVOUT"
+  rm -f "$INVOUT"/*.ppu "$INVOUT"/*.o 2>/dev/null || true
+  INV_OK=1
+  for INV_PRG in Nghttp2InventoryServer Nghttp2InventoryClient; do
+    if ! "$TRUNK" -MDelphi -O1 -dNGHTTP2_GRPC_NO_FFI \
+           -FU"$INVOUT" -FE"$INVOUT" -Fu"$SRC" -Fu"$INVSRC" \
+           $TRUNK_UNIT_PATHS \
+           "$INVSRC/$INV_PRG.dpr" > "$INVOUT/$INV_PRG.build.log" 2>&1 \
+       || [[ ! -x "$INVOUT/$INV_PRG" ]]; then
+      echo "  FAIL  $INV_PRG.dpr did not compile"
+      grep -E "Error|Fatal" "$INVOUT/$INV_PRG.build.log" | head -12 | sed 's/^/    /'
+      echo "    full log: $INVOUT/$INV_PRG.build.log"
+      INV_OK=0
+      RC=2
+    fi
+  done
+
+  if [[ $INV_OK -eq 1 ]]; then
+    echo "  -- A  Nghttp2InventoryServer --self-test (our server, our client)"
+    timeout 60 "$INVOUT/Nghttp2InventoryServer" --self-test < /dev/null \
+      | tee "$INVOUT/server.run.log" | sed 's/^/    /'
+    INV_A=${PIPESTATUS[0]}
+
+    INV_GPY=""
+    for CAND in "${GRPC_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import grpc, grpc_tools' > /dev/null 2>&1; then INV_GPY="$CAND"; break; fi
+    done
+    INV_B=skip
+    if [[ -n "$INV_GPY" ]]; then
+      "$INV_GPY" "$INVSRC/inventory_server.py" 19335 --lifetime 60 --interval 0.05 \
+        > "$INVOUT/py-server.log" 2>&1 &
+      INV_PID=$!
+      for _ in $(seq 1 100); do
+        grep -q '^READY' "$INVOUT/py-server.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$INVOUT/py-server.log" 2>/dev/null; then
+        echo "  -- B  Nghttp2InventoryClient against inventory_server.py (python grpcio)"
+        timeout 60 "$INVOUT/Nghttp2InventoryClient" 127.0.0.1 19335 < /dev/null \
+          | tee "$INVOUT/client.run.log" | sed 's/^/    /'
+        INV_B=${PIPESTATUS[0]}
+      else
+        echo "  NOTE  inventory_server.py did not start - see $INVOUT/py-server.log"
+      fi
+      kill "$INV_PID" 2>/dev/null; wait "$INV_PID" 2>/dev/null
+    else
+      echo "  SKIP  Part B: no python with grpcio + grpcio-tools - the client was NOT"
+      echo "        run against an independent server"
+    fi
+
+    if [[ "$INV_A" -eq 0 && "$INV_B" == "0" ]]; then
+      echo "  inventory sample: PASSED (both parts)"
+    elif [[ "$INV_A" -eq 0 && "$INV_B" == "skip" ]]; then
+      echo "  inventory sample: PASSED Part A only - Part B did NOT run"
+    else
+      echo "  FAIL  inventory sample (Part A exit $INV_A, Part B $INV_B)"
+      [[ $RC -eq 0 ]] && RC=1
+    fi
   fi
 fi
 
