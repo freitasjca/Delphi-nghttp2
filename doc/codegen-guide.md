@@ -2,7 +2,9 @@
 
 `protogen` turns a proto3 schema into the Pascal units this library's gRPC
 layer needs. One command produces four units; you implement your handlers in
-one of them and never touch the other three again.
+one of them and never touch the other three again. With `--client` it also
+writes a fifth unit: typed stubs for **calling** the service (since 1.28.0; see
+[`grpc-client.md`](grpc-client.md)).
 
 This guide is the *how*. For which proto3 constructs are supported and why the
 rest are refused, see [`protogen.md`](protogen.md) — that list is the contract,
@@ -85,6 +87,7 @@ root-unit-file: Sample.Greeter.Messages.pas
 | `-o`, `--output` | directory to write into (created if absent) |
 | `-I`, `--proto-path` | directory to resolve imports against; repeatable, searched in order. Defaults to the input's own directory. |
 | `--unit-prefix` | dotted prefix; see **Unit names** below |
+| `--client` | also write `<prefix>.Client.pas`, typed client stubs (1.28.0); see [`grpc-client.md`](grpc-client.md) |
 | `--dry-run` | report what would be written, touch nothing |
 | `-h` | usage |
 
@@ -207,6 +210,16 @@ IInvokable shape to reflect over.
 precisely the file that must track the `.proto`. If it were preserved like
 `.Service.pas`, adding an RPC would leave it unregistered — and that surfaces
 at run time as an unimplemented path, with nothing in the build to explain it.
+
+### `<prefix>.Client.pas` — only with `--client`, always regenerated
+
+The client side of the same `.proto`. It has a `T<Service>Client` per service,
+with one method per unary and server-streaming RPC (plain and with
+`TGrpcCallOptions`), and a typed `T<Service><Rpc>Stream` per server-streaming
+RPC. Each stub calls the same path that the registration unit registers. A
+client-only program needs this unit and `<prefix>.Messages.pas`, nothing else.
+Client and bidi streaming RPCs are named in a comment but get no method yet.
+Usage, ownership and error handling are in [`grpc-client.md`](grpc-client.md).
 
 ---
 

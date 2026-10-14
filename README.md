@@ -18,6 +18,13 @@ HTTP/2 transport primitives — session state, HPACK, streams, callbacks — pac
 
 The gRPC layer takes an `INghttp2Stream` and nothing else — no web framework is involved on either side, so any host that owns a stream can serve gRPC with it. `horse-provider-nghttp2` is one such host, not a prerequisite. [`samples/grpc-server`](samples/grpc-server) is a working server that proves it: two RPCs and a plain HTTP/2 route on one port, in about sixty lines, with no framework in the uses clause.
 
+Since 1.28.0 it **calls** gRPC too. `TGrpcChannel` makes unary and
+server-streaming calls with deadlines, metadata, TLS and mTLS, and
+`protogen --client` generates typed stubs for a service.
+[`samples/inventory`](samples/inventory) is a service together with its
+generated client, checked against a python `grpcio` server. See
+[`doc/grpc-client.md`](doc/grpc-client.md).
+
 Parallels the ecosystem's proven pattern:
 
 | Transport library | Horse glue |
@@ -37,6 +44,7 @@ flowchart TB
         DISP["Grpc.Dispatcher<br/>application/grpc interception, framing, trailers"]
         REG["Grpc.Registry<br/>service + method lookup"]
         STRM["Grpc.StreamReader / Grpc.StreamWriter<br/>client-, server- and bidi-streaming"]
+        GCLI["Grpc.Client<br/>TGrpcChannel: unary + server streaming"]
         CODEC["Protobuf + Protobuf.Rtti<br/>wire codec, RTTI field mapping"]
     end
 
@@ -59,11 +67,14 @@ flowchart TB
         OSSL["OpenSSL<br/>auto-detect 3.x / 1.1.x"]
     end
 
-    PROTOGEN["tools/protogen<br/>.proto to message, interface,<br/>service and registration units"]
+    PROTOGEN["tools/protogen<br/>.proto to message, interface,<br/>service, registration and client units"]
 
     APP --> SERVER
     APP --> CLIENT
     APP --> DISP
+    APP --> GCLI
+    GCLI --> CLIENT
+    GCLI --> CODEC
     DISP --> REG
     DISP --> STRM
     DISP --> CODEC
@@ -130,6 +141,11 @@ arrived here in **1.0.0**.
 | **Code generation** — `.proto` → message, interface and service-skeleton units | **✓** `protogen` emits all four unit kinds; generated code is compiled *and run* by the test suite, not just diffed. **7,239 of 7,301** real googleapis schemas generate code that **compiles** — parsed, emitted, and accepted by the compiler, with **zero** emitter defects remaining (2026-09-20, post-1.21.0) |
 | **Non-contiguous enum fields no longer silently lost — ENUMRTTI-1** | **✓** (1.21.0 — a proto enum with non-contiguous values (`0,1,2,13,14` or `0,100,150,200`) produced a Pascal enum with no RTTI; the codec's RTTI walk never saw the property and the field was silently absent on the wire. Fix: `protogen` now orders enum members by proto number and emits `System.Int32` (or `TArray<System.Int32>` when repeated) for any enum that remains non-contiguous after sorting. **1,405 of 7,289 real-world schemas** were affected; `compile-check.sh --all` went from 5,633 "will not be published" warnings to **0**. Generated output changes only where the enum was non-contiguous — a previously-compiling schema with only contiguous enums is unaffected) |
 | **`import` closure** — `protogen` follows imports and emits one unit per file | **✓** (IMPORT-1, 1.16.0 — path-derived unit names, qualified cross-file references) |
+| **gRPC client** — `TGrpcChannel`: unary and server-streaming calls, deadlines (`grpc-timeout`, enforced locally), metadata, TLS + mTLS with server verification | **✓** (1.28.0, B2 plan GC0–GC4. A call returns a decoded reply with `grpc-status 0` or raises `EGrpcClientError` with the exact status; malformed replies map to a code, never to a default object. Tested against our own server, python `grpcio` and a raw HTTP/2 peer, on both compilers — stage 4l, 71 checks. See [`doc/grpc-client.md`](doc/grpc-client.md)) |
+| **Client verifies the server** — `TTlsClientContext.LoadVerifyLocations` / `UseSystemTrustStore`, certificate name check (DNS or IP), SNI | **✓** (1.28.0, GC2b — before it a client could not trust a CA or check a name, so every TLS client had to be `SetInsecure`) |
+| **Generated client stubs** — `protogen --client` → `<prefix>.Client.pas` | **✓** (1.28.0, GC6/GC7 — typed `T<Service>Client` and per-RPC stream wrappers; opt-in, so output without the flag is unchanged. `samples/inventory` calls itself and a grpcio server through them, stage 4m) |
+| **gRPC error replies carry no message — GRPC-STATUSONLY-1** | **✓** (1.28.0 — the dispatcher sent a zero-length MESSAGE before every error trailer (unknown method, decode error, handler exception), so a streaming client saw one empty message and then the error. Now an empty body, then the trailer. Found by the GC6 control run) |
+| gRPC client streaming and bidi from the client side | planned (GC5) — the server side of both has shipped since 1.0.0 |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
@@ -323,6 +339,9 @@ src/
   Nghttp2.Grpc.Dispatcher.pas — application/grpc interception, framing, trailers
   Nghttp2.Grpc.StreamWriter.pas — IGrpcStreamWriter (server-streaming, bidi out)
   Nghttp2.Grpc.StreamReader.pas — IGrpcStreamReader (client-streaming, bidi in)
+  Nghttp2.Grpc.Framing.pas    — gRPC message framing, shared by client and server
+  Nghttp2.Grpc.Client.pas     — gRPC client: TGrpcChannel, EGrpcClientError,
+                                TGrpcCallOptions, IGrpcClientStream
 
 tools/
   protogen/                   — .proto parser, code generator, verdict CLI, and
@@ -333,6 +352,8 @@ samples/
   grpc-server/                — a gRPC server on this library alone, no framework
   rest-and-grpc/              — REST through Horse and gRPC through this library,
                                 one binary, two listeners
+  inventory/                  — a proto-first gRPC service AND its generated
+                                client, checked against a python grpcio server
 
 tests/                        — the gates. run-tests.bat (Windows) and
                                 build-codec-fpc.sh (FPC) drive every .dpr here:
@@ -364,6 +385,10 @@ disambiguated when two of them share a leaf name, and type names resolve
 **innermost-outward** from the enclosing scope as proto requires. Where your
 schemas already produced compiling code the output is unchanged — the renames
 land where the old output did not compile or bound the wrong type.
+
+Add `--client` to also generate `<prefix>.Client.pas`, typed stubs for
+calling the service from Pascal (1.28.0); see
+[`doc/grpc-client.md`](doc/grpc-client.md).
 
 It **never overwrites** a service implementation you have edited — that one is
 written as `.new.pas` beside the original, and the other three are regenerated
