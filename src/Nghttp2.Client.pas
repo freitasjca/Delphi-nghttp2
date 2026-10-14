@@ -95,6 +95,15 @@ const
 type
   ENghttp2Client = class(Exception);
 
+  { GC3 (1.28.0). A request ran out of its time budget (SubmitRequest /
+    PumpAll ATimeoutMS) with the peer still connected. A subclass, so every
+    existing `on E: ENghttp2Client` handler still catches it; a caller that
+    must tell "too slow" from "broken" (the gRPC client maps it to 4
+    DEADLINE_EXCEEDED) catches this one first. The stream it gave up on is
+    still open on the connection - call Disconnect (or Reconnect) before
+    relying on the client again. }
+  ENghttp2Timeout = class(ENghttp2Client);
+
   { Simple name/value header pair — HTTP/2 pseudo-headers (:method, :path,
     :authority, :scheme) are added automatically by SubmitRequest; callers
     provide only regular headers here. }
@@ -836,6 +845,15 @@ begin
   FConnected      := False;
   FGoAwayReceived := False;   { [CL4] fresh slate for the next Connect }
   FPingPending    := False;   { [CL4] }
+
+  { [FIX-SLOT-RESET-1, GC3] Stream slots belong to the session just deleted.
+    Kept, they did two kinds of damage after a timed-out request: the slot
+    that never completed made AnyPending True for good, so every later
+    PumpAll on the new connection waited on it and timed out too; and the new
+    session numbers its streams from 1 again, so the stale slot could capture
+    the frames of an unrelated new stream with the same id. A response not
+    taken before Disconnect is gone - its stream id means nothing now. }
+  SetLength(FStreams, 0);
 end;
 
 { [CL2c] Reads with a deadline.
@@ -968,7 +986,7 @@ begin
       the old strict > sent us round the loop to spin until the clock ticked
       past. Harmless on Linux; Now has ~15 ms granularity on Windows. }
     if MilliSecondsSince(LStart) >= ATimeoutMS then
-      raise ENghttp2Client.CreateFmt(
+      raise ENghttp2Timeout.CreateFmt(
         'request timed out after %d ms - %d stream(s) still open',
         [ATimeoutMS, PendingStreams]);
 

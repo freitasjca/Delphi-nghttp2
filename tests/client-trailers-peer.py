@@ -20,6 +20,8 @@ GC2 adds /gctest.Raw/* - gRPC replies a real gRPC server never sends, for
 Nghttp2GrpcUnaryClient part C: each must become a specific gRPC status, never
 a decoded "success". The message bytes are EchoReply{text: "raw"}.
 
+  EchoHeaders   GC3: a VALID reply whose text is the request's grpc-timeout and
+                x-* headers exactly as they arrived (not an error case)
   NoStatus      body + trailers without grpc-status          -> 13
   TwoMessages   two framed messages + status 0               -> 13
   Compressed    compressed flag set, no grpc-encoding        -> 13
@@ -52,7 +54,25 @@ def frame(payload, flag=0):
     return bytes([flag]) + len(payload).to_bytes(4, 'big') + payload
 
 
-def respond_raw(conn, stream_id, name):
+def string_reply(text):
+    # EchoReply{text: <text>} - field 1, wire type 2, one-byte varint length
+    data = text.encode('utf-8')
+    assert len(data) < 128
+    return b'\x0a' + bytes([len(data)]) + data
+
+
+def respond_raw(conn, stream_id, name, headers=()):
+    if name == 'EchoHeaders':
+        # GC3: the request headers exactly as they arrived on the wire -
+        # grpc-timeout (or "-") then the x-* metadata, sorted.
+        hdrs = dict(headers)
+        xs = sorted((k, v) for k, v in headers if k.startswith('x-'))
+        text = 'grpc-timeout=%s|%s' % (hdrs.get('grpc-timeout', '-'),
+                                       ';'.join('%s=%s' % kv for kv in xs))
+        conn.send_headers(stream_id, [(':status', '200'), GRPC_CT])
+        conn.send_data(stream_id, frame(string_reply(text)))
+        conn.send_headers(stream_id, [('grpc-status', '0')], end_stream=True)
+        return
     if name == 'Http503':
         conn.send_headers(stream_id, [(':status', '503')], end_stream=True)
         return
@@ -85,9 +105,9 @@ def respond_raw(conn, stream_id, name):
     conn.send_headers(stream_id, trailers, end_stream=True)
 
 
-def respond(conn, stream_id, path):
+def respond(conn, stream_id, path, headers=()):
     if path.startswith('/gctest.Raw/'):
-        respond_raw(conn, stream_id, path[len('/gctest.Raw/'):])
+        respond_raw(conn, stream_id, path[len('/gctest.Raw/'):], headers)
     elif path == '/trailers-only':
         conn.send_headers(stream_id, [
             (':status', '200'),
@@ -129,7 +149,7 @@ def serve(sock):
         for event in conn.receive_data(data):
             if isinstance(event, h2.events.RequestReceived):
                 path = dict(event.headers).get(':path', '')
-                respond(conn, event.stream_id, path)
+                respond(conn, event.stream_id, path, event.headers)
             elif isinstance(event, h2.events.ConnectionTerminated):
                 out = conn.data_to_send()
                 if out:

@@ -39,6 +39,18 @@ program Nghttp2GrpcUnaryClient;
 //  Part E - grpcio over TLS and mTLS: the same positive and negative cases
 //           against a TLS stack (BoringSSL) that is not OpenSSL.
 //
+//  ── GC3: deadlines and metadata ──
+//
+//  Part A: a deadline against our server's Slow handler raises 4 within the
+//  deadline + 10% (+50 ms clock slack), the SAME channel works right after it
+//  (FIX-SLOT-RESET-1), deadline 0 waits as long as CallTimeoutMS, and invalid
+//  options raise EArgumentException before anything is sent. Our dispatcher
+//  ignores grpc-timeout, so Part A proves LOCAL enforcement only.
+//  Part C: /gctest.Raw/EchoHeaders reports the request headers as they
+//  arrived, so the exact grpc-timeout value and metadata are asserted ON THE
+//  WIRE. Part B: grpcio's application sees the metadata and the deadline
+//  (context.time_remaining), and enforces it too.
+//
 //  The verification failures are asserted by their X509_V_* CODE through
 //  TNghttp2Client (ENghttp2TlsCertVerify.VerifyResult), never by the text,
 //  which differs between OpenSSL versions; at the gRPC level every TLS
@@ -134,6 +146,7 @@ type
     procedure Echo(const AReq: TObject; const AResp: TObject);
     procedure Fail(const AReq: TObject; const AResp: TObject);
     procedure Empty(const AReq: TObject; const AResp: TObject);
+    procedure Slow(const AReq: TObject; const AResp: TObject);
   end;
 
   { GC2b: what a test client context trusts, and which certificate it shows. }
@@ -208,6 +221,16 @@ end;
 procedure TProbeService.Empty(const AReq: TObject; const AResp: TObject);
 begin
   // leave every field at its default: a zero-length message on the wire
+end;
+
+{ GC3: sleeps num ms. Our dispatcher ignores grpc-timeout, so this always
+  runs to the end - the client's deadline is the only thing that can stop
+  the call short. }
+procedure TProbeService.Slow(const AReq: TObject; const AResp: TObject);
+begin
+  Sleep(TEchoRequest(AReq).num);
+  TEchoReply(AResp).text := 'slept';
+  TEchoReply(AResp).num  := TEchoRequest(AReq).num;
 end;
 
 procedure HandleRequest(const AStream: INghttp2Stream);
@@ -286,6 +309,107 @@ begin
   Result.msg  := AMessage;
 end;
 
+// ── GC3 helpers ─────────────────────────────────────────────────────────────
+
+function MsSince(const AStart: TDateTime): Int64;
+begin
+  Result := Round((Now - AStart) * 86400.0 * 1000.0);
+end;
+
+function Opts(ADeadlineMS: Integer): TGrpcCallOptions;
+begin
+  Result := TGrpcCallOptions.Default;
+  Result.DeadlineMS := ADeadlineMS;
+end;
+
+{ A call that must fail with exactly AStatus; returns how long it took (ms),
+  or -1 when it did not fail that way. }
+function ExpectStatusOpt(AChannel: TGrpcChannel; const AName, APath: string;
+  ARequest: TObject; const AOptions: TGrpcCallOptions; AStatus: Integer): Int64;
+var
+  LObj:   TObject;
+  LStart: TDateTime;
+begin
+  Result := -1;
+  LObj := nil;
+  LStart := Now;
+  try
+    LObj := AChannel.Unary(APath, ARequest, TEchoReply, AOptions);
+    Check(AName, False, 'returned a reply instead of raising');
+  except
+    on E: EGrpcClientError do
+      if E.Status <> AStatus then
+        Check(AName, False, Format('status %d %s, expected %d %s - "%s"',
+          [E.Status, GrpcStatusName(E.Status), AStatus, GrpcStatusName(AStatus),
+           E.GrpcMessage]))
+      else
+      begin
+        Result := MsSince(LStart);
+        Check(AName, True);
+      end;
+    on E: Exception do
+      Check(AName, False, 'raised ' + E.ClassName + ', not EGrpcClientError: ' + E.Message);
+  end;
+  LObj.Free;
+end;
+
+{ A call that must succeed with options; caller frees the reply. }
+function CallOkOpt(AChannel: TGrpcChannel; const AName, APath: string;
+  ARequest: TObject; const AOptions: TGrpcCallOptions): TEchoReply;
+var
+  LObj: TObject;
+begin
+  Result := nil;
+  try
+    LObj := AChannel.Unary(APath, ARequest, TEchoReply, AOptions);
+    if LObj is TEchoReply then
+      Result := TEchoReply(LObj)
+    else
+    begin
+      LObj.Free;
+      Check(AName + ': reply is a TEchoReply', False);
+    end;
+  except
+    on E: Exception do
+      Check(AName, False, E.ClassName + ': ' + E.Message);
+  end;
+end;
+
+{ Options that must be refused with EArgumentException BEFORE any I/O: the
+  channel points at a dead port, so reaching the network would show up as
+  14 UNAVAILABLE instead. }
+procedure ExpectArgRefused(const AName: string; const AOptions: TGrpcCallOptions);
+var
+  LChannel: TGrpcChannel;
+  LReq:     TEchoRequest;
+  LObj:     TObject;
+begin
+  LObj := nil;
+  LChannel := TGrpcChannel.Create('127.0.0.1', DEAD_PORT);
+  LReq := NewEcho('x', 1);
+  try
+    try
+      LObj := LChannel.Unary('/gctest.Probe/Echo', LReq, TEchoReply, AOptions);
+      Check(AName, False, 'returned a reply');
+    except
+      on E: EArgumentException do
+        Check(AName, True);
+      on E: Exception do
+        Check(AName, False, 'raised ' + E.ClassName + ' (sent anyway?): ' + E.Message);
+    end;
+  finally
+    LObj.Free;
+    LReq.Free;
+    LChannel.Free;
+  end;
+end;
+
+function WithMeta(ADeadlineMS: Integer; const AName, AValue: string): TGrpcCallOptions;
+begin
+  Result := Opts(ADeadlineMS);
+  Result.AddMetadata(AName, AValue);
+end;
+
 { The part every peer that implements gctest.Probe must pass: Echo, Empty,
   an unknown method. Returns nothing; records checks. }
 procedure CommonCalls(AChannel: TGrpcChannel; const APrefix: string);
@@ -333,6 +457,94 @@ end;
 
 // ── the parts ───────────────────────────────────────────────────────────────
 
+{ GC3 against our own server. Our dispatcher ignores grpc-timeout, so every
+  deadline here is enforced by the CLIENT alone. }
+procedure GC3PartA(AChannel: TGrpcChannel);
+const
+  DEADLINE = 400;
+var
+  LSlow, LEcho: TEchoRequest;
+  LReply:       TEchoReply;
+  LMs:          Int64;
+  LOpt:         TGrpcCallOptions;
+begin
+  WriteLn;
+  WriteLn('-- A3  GC3: deadlines (client-enforced) and call options');
+  LSlow := NewEcho('', 2000);
+  LEcho := NewEcho('after', 1);
+  { 3 s rather than the 30 s default: no call here needs more, and a broken
+    recovery then costs seconds, not minutes, before it is reported. }
+  AChannel.CallTimeoutMS := 3000;
+  try
+    LMs := ExpectStatusOpt(AChannel, 'A deadline 400 ms vs a 2 s handler -> 4 DEADLINE_EXCEEDED',
+      '/gctest.Probe/Slow', LSlow, Opts(DEADLINE), GRPC_STATUS_DEADLINE_EXCEEDED);
+    if LMs >= 0 then
+      Check('A ... and it gave up between the deadline and deadline + 10% (+50 ms clock slack)',
+        (LMs >= DEADLINE - 20) and (LMs <= (DEADLINE * 11) div 10 + 50),
+        Format('took %d ms', [LMs]))
+    else
+      Check('A ... and it gave up between the deadline and deadline + 10% (+50 ms clock slack)',
+        False, 'no deadline failure to time');
+
+    { FIX-SLOT-RESET-1: before it, the abandoned stream's slot survived the
+      reconnect, so this call waited on it and timed out as well. }
+    LReply := CallOkOpt(AChannel, 'A the SAME channel answers right after a deadline',
+      '/gctest.Probe/Echo', LEcho, Opts(3000));
+    if LReply <> nil then
+    try
+      Check('A the SAME channel answers right after a deadline', LReply.text = 'echo:after',
+        Format('text "%s"', [LReply.text]));
+    finally
+      LReply.Free;
+    end;
+
+    LSlow.num := 300;
+    LReply := CallOkOpt(AChannel, 'A deadline 0 = none: a 300 ms handler completes',
+      '/gctest.Probe/Slow', LSlow, Opts(0));
+    if LReply <> nil then
+    try
+      Check('A deadline 0 = none: a 300 ms handler completes',
+        (LReply.text = 'slept') and (LReply.num = 300));
+    finally
+      LReply.Free;
+    end;
+
+    LSlow.num := 100;
+    LReply := CallOkOpt(AChannel, 'A a generous deadline (5 s) does not fire on a 100 ms handler',
+      '/gctest.Probe/Slow', LSlow, Opts(5000));
+    if LReply <> nil then
+    try
+      Check('A a generous deadline (5 s) does not fire on a 100 ms handler', LReply.num = 100);
+    finally
+      LReply.Free;
+    end;
+
+    { Without a deadline, CallTimeoutMS is the backstop - and it is 4 too. }
+    LSlow.num := 2000;
+    AChannel.CallTimeoutMS := 300;
+    try
+      ExpectStatusOpt(AChannel, 'A no deadline, CallTimeoutMS 300 vs a 2 s handler -> 4',
+        '/gctest.Probe/Slow', LSlow, Opts(0), GRPC_STATUS_DEADLINE_EXCEEDED);
+    finally
+      AChannel.CallTimeoutMS := 3000;
+    end;
+  finally
+    AChannel.CallTimeoutMS := DEFAULT_REQUEST_TIMEOUT_MS;
+    LEcho.Free;
+    LSlow.Free;
+  end;
+
+  ExpectArgRefused('A negative deadline -> EArgumentException, nothing sent', Opts(-1));
+  ExpectArgRefused('A metadata name with uppercase -> EArgumentException',
+    WithMeta(0, 'X-Trace', 'a'));
+  ExpectArgRefused('A reserved name grpc-timeout as metadata -> EArgumentException',
+    WithMeta(0, 'grpc-timeout', '1S'));
+  ExpectArgRefused('A a value with CR LF -> EArgumentException',
+    WithMeta(0, 'x-trace', 'a'#13#10'b'));
+  LOpt := WithMeta(0, 'x-blob-bin', 'AAEC');
+  ExpectArgRefused('A binary (-bin) metadata -> EArgumentException (not supported yet)', LOpt);
+end;
+
 procedure PartA;
 var
   LServer:  TNghttp2Server;
@@ -362,6 +574,8 @@ begin
       finally
         LFail.Free;
       end;
+
+      GC3PartA(LChannel);
     finally
       LChannel.Free;
     end;
@@ -383,6 +597,46 @@ begin
     end;
   finally
     LChannel.Free;
+  end;
+end;
+
+{ GC3 against grpcio: its APPLICATION sees what we sent. }
+procedure GC3PartB(AChannel: TGrpcChannel);
+var
+  LReq:   TEchoRequest;
+  LReply: TEchoReply;
+  LOpt:   TGrpcCallOptions;
+begin
+  LReq := NewEcho('', 2000);
+  try
+    LOpt := Opts(1500);
+    LOpt.AddMetadata('x-trace', 'abc-123');
+    LOpt.AddMetadata('x-tenant', 't1');
+    LReply := CallOkOpt(AChannel, 'B GC3 Meta call', '/gctest.Probe/Meta', LReq, LOpt);
+    if LReply <> nil then
+    try
+      Check('B GC3: the metadata reached the grpcio application exactly',
+        LReply.text = 'x-tenant=t1;x-trace=abc-123', Format('got "%s"', [LReply.text]));
+      Check('B GC3: the grpcio application saw the deadline (0 < time left <= 1500 ms)',
+        (LReply.num > 0) and (LReply.num <= 1500), Format('time left %d ms', [LReply.num]));
+    finally
+      LReply.Free;
+    end;
+
+    LReply := CallOkOpt(AChannel, 'B GC3 Meta call without a deadline',
+      '/gctest.Probe/Meta', LReq, Opts(0));
+    if LReply <> nil then
+    try
+      Check('B GC3: deadline 0 = the grpcio application sees NO deadline',
+        LReply.num = -1, Format('time left %d ms', [LReply.num]));
+    finally
+      LReply.Free;
+    end;
+
+    ExpectStatusOpt(AChannel, 'B GC3: deadline 300 ms vs grpcio Slow(2000) -> 4 DEADLINE_EXCEEDED',
+      '/gctest.Probe/Slow', LReq, Opts(300), GRPC_STATUS_DEADLINE_EXCEEDED);
+  finally
+    LReq.Free;
   end;
 end;
 
@@ -413,6 +667,8 @@ begin
     finally
       LFail.Free;
     end;
+
+    GC3PartB(LChannel);
   finally
     LChannel.Free;
   end;
@@ -422,6 +678,7 @@ procedure PartC(APort: Integer);
 var
   LChannel: TGrpcChannel;
   LReq:     TEchoRequest;
+  LReply:   TEchoReply;
 
   procedure Raw(const AName: string; AStatus: Integer);
   begin
@@ -444,6 +701,26 @@ begin
     Raw('TrailersOnlyOk', GRPC_STATUS_INTERNAL);
     Raw('BadStatus',      GRPC_STATUS_UNKNOWN);
     Raw('Truncated',      GRPC_STATUS_INTERNAL);
+
+    { GC3: what actually went on the wire. }
+    LReply := CallOkOpt(LChannel, 'C GC3 EchoHeaders',
+      '/gctest.Raw/EchoHeaders', LReq, WithMeta(1500, 'x-trace', 'abc-123'));
+    if LReply <> nil then
+    try
+      Check('C GC3: on the wire grpc-timeout is exactly "1500m" and the metadata arrived',
+        LReply.text = 'grpc-timeout=1500m|x-trace=abc-123', Format('got "%s"', [LReply.text]));
+    finally
+      LReply.Free;
+    end;
+    LReply := CallOkOpt(LChannel, 'C GC3 EchoHeaders without options',
+      '/gctest.Raw/EchoHeaders', LReq, Opts(0));
+    if LReply <> nil then
+    try
+      Check('C GC3: deadline 0 sends NO grpc-timeout', LReply.text = 'grpc-timeout=-|',
+        Format('got "%s"', [LReply.text]));
+    finally
+      LReply.Free;
+    end;
   finally
     LReq.Free;
     LChannel.Free;
@@ -714,7 +991,7 @@ var
   GService: TProbeService;
 
 begin
-  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS)');
+  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS, GC3 deadlines/metadata)');
 
   if not NghttpLoad then
   begin
@@ -734,6 +1011,8 @@ begin
       TFailRequest, TEchoReply, GService.Fail);
     TGrpcRegistry.RegisterMethod('/gctest.Probe/Empty',
       TEchoRequest, TEchoReply, GService.Empty);
+    TGrpcRegistry.RegisterMethod('/gctest.Probe/Slow',
+      TEchoRequest, TEchoReply, GService.Slow);
     try
       try
         PartA;

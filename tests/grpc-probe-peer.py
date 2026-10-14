@@ -22,6 +22,7 @@ Prints "READY <port>" once serving; exits after --lifetime seconds.
 import os
 import sys
 import tempfile
+import time
 from concurrent import futures
 
 import grpc
@@ -72,6 +73,23 @@ def main():
 
         def Empty(self, request, context):
             return pb2.EchoReply()
+
+        def Slow(self, request, context):
+            time.sleep(request.num / 1000.0)
+            return pb2.EchoReply(text='slept', num=request.num)
+
+        def Meta(self, request, context):
+            md = sorted((k, v) for k, v in context.invocation_metadata()
+                        if k.startswith('x-'))
+            # grpcio reports "no deadline" as an enormous time_remaining, not
+            # None (measured, grpcio 1.84) - anything past int32 ms is "none".
+            left = context.time_remaining()
+            if left is None or left * 1000 > 2147483647:
+                left_ms = -1
+            else:
+                left_ms = int(left * 1000)
+            return pb2.EchoReply(text=';'.join('%s=%s' % kv for kv in md),
+                                 num=left_ms)
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     pb2_grpc.add_ProbeServicer_to_server(Probe(), server)

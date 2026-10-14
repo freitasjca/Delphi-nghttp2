@@ -44,10 +44,32 @@ unit Nghttp2.Grpc.Client;
 //  grpc-message is percent-decoded (Nghttp2.Grpc.Framing) before it reaches
 //  EGrpcClientError.GrpcMessage.
 //
+//  ── Deadlines and metadata (GC3) ──
+//
+//    LOpt := TGrpcCallOptions.Default;
+//    LOpt.DeadlineMS := 500;                     // 0 = no deadline
+//    LOpt.AddMetadata('x-request-id', 'abc');    // ASCII metadata
+//    LReply := LChannel.Unary(APath, LReq, TReply, LOpt);
+//
+//  A deadline is SENT (grpc-timeout: 500m) and ENFORCED HERE: when it passes
+//  the call raises 4 DEADLINE_EXCEEDED whether or not the server honours the
+//  header - our own TGrpcDispatcher does not, today. The time spent
+//  connecting counts against it. After a deadline the channel drops its
+//  connection (the abandoned stream is still open on it) and the next call
+//  opens a fresh one. Without a deadline the call waits at most
+//  CallTimeoutMS, and running out of THAT is 4 as well: the call ran out of
+//  time either way.
+//
+//  Metadata names follow the gRPC spec: lowercase a-z 0-9 - _ . only, not
+//  grpc-*, content-type or te (the client sends those itself), and values
+//  printable ASCII (0x20..0x7E). Binary metadata (-bin) is refused until it
+//  is implemented. A bad name or value raises EArgumentException before
+//  anything is sent: it is a bug in the caller, not a call status.
+//
 //  ── Not here yet ──
 //
-//  Deadlines sent as grpc-timeout and call metadata are GC3; server streaming
-//  is GC4; client and bidi streaming are deferred (plan decision D1).
+//  Server streaming is GC4; client and bidi streaming are deferred (plan
+//  decision D1).
 //
 //  ── TLS (GC2b) ──
 //
@@ -96,6 +118,17 @@ type
     property GrpcMessage: string  read FGrpcMessage;
   end;
 
+  { GC3. Per-call options. Use TGrpcCallOptions.Default, then set fields -
+    a record declared without it holds whatever the stack held. }
+  TGrpcCallOptions = record
+    { ms; 0 = none. Sent as grpc-timeout and enforced locally (4). }
+    DeadlineMS: Integer;
+    { Sent as request headers, in order. See the unit header for the rules. }
+    Metadata:   TNghttp2Headers;
+    class function Default: TGrpcCallOptions; static;
+    procedure AddMetadata(const AName, AValue: string);
+  end;
+
   TGrpcChannel = class
   private
     FClient:          TNghttp2Client;
@@ -116,10 +149,14 @@ type
       new AResponseClass instance that the CALLER owns. Raises
       EGrpcClientError for every failure - see the unit header. }
     function Unary(const APath: string; ARequest: TObject;
-      AResponseClass: TClass): TObject;
+      AResponseClass: TClass): TObject; overload;
+    { GC3: the same with a deadline and/or metadata. Raises EArgumentException
+      for a negative deadline or invalid metadata, before sending anything. }
+    function Unary(const APath: string; ARequest: TObject;
+      AResponseClass: TClass; const AOptions: TGrpcCallOptions): TObject; overload;
 
-    { How long one call may wait for its response, in ms. Local only: GC3
-      adds the grpc-timeout header that tells the server too. }
+    { How long a call WITHOUT a deadline may wait for its response, in ms.
+      Local only - nothing is sent. A call with a deadline uses the deadline. }
     property CallTimeoutMS: Integer read FCallTimeoutMS write FCallTimeoutMS;
 
     { Ceiling on one received message; defaults to 4 MB like the server. }
@@ -186,6 +223,78 @@ begin
   raise EGrpcClientError.CreateStatus(AStatus, AMessage);
 end;
 
+{ ── GC3 helpers ─────────────────────────────────────────────────────────── }
+
+{ Same arithmetic as TNghttp2Client.MilliSecondsSince, without DateUtils. }
+function ElapsedMS(const AStart: TDateTime): Int64;
+begin
+  Result := Round((Now - AStart) * 86400.0 * 1000.0);
+end;
+
+{ grpc-timeout = TimeoutValue TimeoutUnit, the value at most 8 digits. Every
+  Integer number of ms fits as seconds; up to 99,999,999 ms it goes out exact.
+  Rounding to seconds rounds UP, so the server never sees a shorter deadline
+  than the client enforces. }
+function GrpcTimeoutValue(AMS: Integer): string;
+begin
+  if AMS <= 99999999 then
+    Result := IntToStr(AMS) + 'm'
+  else
+    Result := IntToStr((Int64(AMS) + 999) div 1000) + 'S';
+end;
+
+procedure ValidateMetadata(const AList: TNghttp2Headers);
+var
+  I, J: Integer;
+  LName, LValue: string;
+begin
+  for I := 0 to High(AList) do
+  begin
+    LName  := AList[I].Name;
+    LValue := AList[I].Value;
+    if LName = '' then
+      raise EArgumentException.Create('gRPC metadata: empty name');
+    for J := 1 to Length(LName) do
+      case LName[J] of
+        'a'..'z', '0'..'9', '-', '_', '.': ;
+      else
+        raise EArgumentException.CreateFmt('gRPC metadata name "%s": only ' +
+          'lowercase a-z, 0-9, "-", "_" and "." are allowed (HTTP/2 header ' +
+          'names are lowercase; pseudo-headers are set by the client)', [LName]);
+      end;
+    if (Copy(LName, 1, 5) = 'grpc-') or (LName = 'content-type') or (LName = 'te') then
+      raise EArgumentException.CreateFmt('gRPC metadata name "%s" is reserved: ' +
+        'the client sets it itself (deadlines go in TGrpcCallOptions.DeadlineMS)',
+        [LName]);
+    if (Length(LName) > 4) and (Copy(LName, Length(LName) - 3, 4) = '-bin') then
+      raise EArgumentException.CreateFmt('gRPC metadata name "%s": binary ' +
+        'metadata (-bin) is not supported by this client yet', [LName]);
+    for J := 1 to Length(LValue) do
+      if (Ord(LValue[J]) < $20) or (Ord(LValue[J]) > $7E) then
+        raise EArgumentException.CreateFmt('gRPC metadata "%s": the value must ' +
+          'be printable ASCII (0x20..0x7E); character %d is $%.2x', [LName, J,
+          Ord(LValue[J])]);
+  end;
+end;
+
+{ ── TGrpcCallOptions ────────────────────────────────────────────────────── }
+
+class function TGrpcCallOptions.Default: TGrpcCallOptions;
+begin
+  Result.DeadlineMS := 0;
+  Result.Metadata   := nil;
+end;
+
+procedure TGrpcCallOptions.AddMetadata(const AName, AValue: string);
+var
+  LIdx: Integer;
+begin
+  LIdx := Length(Metadata);
+  SetLength(Metadata, LIdx + 1);
+  Metadata[LIdx].Name  := AName;
+  Metadata[LIdx].Value := AValue;
+end;
+
 { ── TGrpcChannel ────────────────────────────────────────────────────────── }
 
 constructor TGrpcChannel.Create(const AHost: string; APort: Word;
@@ -218,6 +327,12 @@ end;
 
 function TGrpcChannel.Unary(const APath: string; ARequest: TObject;
   AResponseClass: TClass): TObject;
+begin
+  Result := Unary(APath, ARequest, AResponseClass, TGrpcCallOptions.Default);
+end;
+
+function TGrpcChannel.Unary(const APath: string; ARequest: TObject;
+  AResponseClass: TClass; const AOptions: TGrpcCallOptions): TObject;
 var
   LHeaders:    TNghttp2Headers;
   LBody:       TBytes;
@@ -228,12 +343,21 @@ var
   LStatus:     Integer;
   LError:      string;
   LObj:        TObject;
+  LBudgetMS:   Integer;
+  LLeftMS:     Int64;
+  LStart:      TDateTime;
+  I:           Integer;
 begin
   Result := nil;
   if ARequest = nil then
     raise EArgumentException.Create('TGrpcChannel.Unary: ARequest is nil');
   if AResponseClass = nil then
     raise EArgumentException.Create('TGrpcChannel.Unary: AResponseClass is nil');
+  if AOptions.DeadlineMS < 0 then
+    raise EArgumentException.CreateFmt(
+      'TGrpcChannel.Unary: DeadlineMS is %d - use 0 for no deadline',
+      [AOptions.DeadlineMS]);
+  ValidateMetadata(AOptions.Metadata);
 
   try
     LBody := GrpcFrameMessage(TProtoSerializer.Serialize(ARequest));
@@ -249,11 +373,49 @@ begin
   LHeaders[0].Value := 'application/grpc';
   LHeaders[1].Name  := 'te';
   LHeaders[1].Value := 'trailers';
+  { GC3. Call-Definitions order (gRPC over HTTP/2): grpc-timeout before the
+    custom metadata. }
+  if AOptions.DeadlineMS > 0 then
+  begin
+    SetLength(LHeaders, 3);
+    LHeaders[2].Name  := 'grpc-timeout';
+    LHeaders[2].Value := GrpcTimeoutValue(AOptions.DeadlineMS);
+    LBudgetMS := AOptions.DeadlineMS;
+  end
+  else
+    LBudgetMS := FCallTimeoutMS;
+  for I := 0 to High(AOptions.Metadata) do
+  begin
+    SetLength(LHeaders, Length(LHeaders) + 1);
+    LHeaders[High(LHeaders)] := AOptions.Metadata[I];
+  end;
 
+  LStart := Now;
   try
     EnsureConnected;
-    LResp := FClient.SubmitRequest('POST', APath, LHeaders, LBody, FCallTimeoutMS);
+    { The deadline covers the whole call, connecting included. }
+    LLeftMS := LBudgetMS - ElapsedMS(LStart);
+    if LLeftMS <= 0 then
+      raise ENghttp2Timeout.CreateFmt('used up while connecting (%d ms)',
+        [ElapsedMS(LStart)]);
+    LResp := FClient.SubmitRequest('POST', APath, LHeaders, LBody, Integer(LLeftMS));
   except
+    on E: ENghttp2Timeout do
+    begin
+      { The abandoned stream is still open on this connection; a fresh one
+        for the next call (FIX-SLOT-RESET-1 makes that safe). }
+      try
+        FClient.Disconnect;
+      except
+      end;
+      if AOptions.DeadlineMS > 0 then
+        Fail(GRPC_STATUS_DEADLINE_EXCEEDED, Format(
+          'deadline of %d ms exceeded after %d ms (%s)',
+          [AOptions.DeadlineMS, ElapsedMS(LStart), E.Message]))
+      else
+        Fail(GRPC_STATUS_DEADLINE_EXCEEDED, Format(
+          'no reply within CallTimeoutMS = %d ms (%s)', [LBudgetMS, E.Message]));
+    end;
     on E: Exception do
       Fail(GRPC_STATUS_UNAVAILABLE, E.ClassName + ': ' + E.Message);
   end;

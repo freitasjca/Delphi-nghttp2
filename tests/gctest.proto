@@ -26,4 +26,10 @@ service Probe {
   rpc Echo  (EchoRequest) returns (EchoReply);   // text -> "echo:" + text, num -> num + 1
   rpc Fail  (FailRequest) returns (EchoReply);
   rpc Empty (EchoRequest) returns (EchoReply);   // all defaults: a zero-length message
+  // GC3. Slow sleeps num ms, then answers text "slept", num = num.
+  rpc Slow  (EchoRequest) returns (EchoReply);
+  // GC3 (grpcio only - our dispatcher exposes no metadata, plan D4): text =
+  // the x-* metadata the SERVER APPLICATION received, "k=v" sorted and joined
+  // by ";"; num = the deadline the server saw, in ms left (-1 = none).
+  rpc Meta  (EchoRequest) returns (EchoReply);
 }
