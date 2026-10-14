@@ -26,12 +26,31 @@ program Nghttp2GrpcUnaryClient;
 //  B and C need python; without the peer the part prints SKIP - a skip is
 //  not a pass. All three implement tests/gctest.proto.
 //
+//  ── GC2b: TLS, with the server VERIFIED ──
+//
+//  Part D - our own server over TLS (tests/certs-tls, a private CA): the
+//           client trusts that CA and must check the certificate's NAME too.
+//           Negatives first-class: nothing trusted / the wrong CA trusted
+//           (X509_V_ERR 20), a valid chain for the wrong name - by IP (64) and
+//           by DNS name (62) - and mTLS without a client certificate, or with
+//           one from another issuer (14). One CONTROL: an insecure context
+//           accepts the wrong-name certificate, so the refusals above come
+//           from verification and not from a server that cannot serve.
+//  Part E - grpcio over TLS and mTLS: the same positive and negative cases
+//           against a TLS stack (BoringSSL) that is not OpenSSL.
+//
+//  The verification failures are asserted by their X509_V_* CODE through
+//  TNghttp2Client (ENghttp2TlsCertVerify.VerifyResult), never by the text,
+//  which differs between OpenSSL versions; at the gRPC level every TLS
+//  failure is 14 UNAVAILABLE.
+//
 //  Exit codes:  0 = pass   1 = failed   3 = skipped, libnghttp2 absent
 //
 //  Build (Windows):  dcc64 -CC -B -U..\src Nghttp2GrpcUnaryClient.dpr
 //  Build (FPC):      fpc -MDelphi -dNGHTTP2_GRPC_NO_FFI -Fu../src Nghttp2GrpcUnaryClient.dpr
 //                    (RegisterMethod only - nothing reaches TRttiMethod.Invoke)
 //  Run:              Nghttp2GrpcUnaryClient [grpcio=19324] [raw=19322]
+//                      [certs=<tests/certs-tls>] [grpcio-tls=19330 grpcio-mtls=19331]
 // ============================================================================
 
 {$APPTYPE CONSOLE}
@@ -52,7 +71,10 @@ uses
   Nghttp2.Grpc.Registry,
   Nghttp2.Grpc.Dispatcher,
   Nghttp2.Grpc.Framing,
-  Nghttp2.Grpc.Client;
+  Nghttp2.Grpc.Client,
+  Nghttp2.OpenSSL,
+  Nghttp2.Tls,
+  Nghttp2.Client;
 
 {$IF DEFINED(FPC)}
   {$RTTI EXPLICIT PROPERTIES([vcPublished]) FIELDS([vcPublic]) METHODS([vcPublic])}
@@ -63,6 +85,10 @@ const
     peers' ports come from the command line; 19324 / 19322 by convention. }
   PORT      = 19323;
   DEAD_PORT = 19329;   // nothing listens here: the connection-refused case
+  { GC2b, Part D: our own TLS servers. }
+  PORT_TLS       = 19325;   // server.crt
+  PORT_MTLS      = 19326;   // server.crt + client certificate required
+  PORT_WRONGNAME = 19327;   // wrongname.crt: valid chain, SAN wrong-name.invalid
 
   EXIT_PASS = 0;
   EXIT_FAIL = 1;
@@ -110,10 +136,16 @@ type
     procedure Empty(const AReq: TObject; const AResp: TObject);
   end;
 
+  { GC2b: what a test client context trusts, and which certificate it shows. }
+  TTrust      = (trNothing, trCa, trWrongCa, trInsecure);
+  TClientCert = (ccNone, ccTrusted, ccUntrusted);
+
 var
   GPass: Integer = 0;
   GFail: Integer = 0;
   GSkip: Integer = 0;
+  GCertDir:  string = '';   // tests/certs-tls, with a trailing delimiter
+  GKeypwDir: string = '';   // tests/certs-keypw: an UNRELATED self-signed cert
 
 procedure Check(const AName: string; APassed: Boolean; const ADetail: string = '');
 begin
@@ -418,23 +450,271 @@ begin
   end;
 end;
 
-function PortArg(const AKey: string): Integer;
+// ── GC2b: TLS helpers ───────────────────────────────────────────────────────
+
+function NewServerTls(const ACertName, AKeyName, AClientCaName: string): TTlsServerContext;
+begin
+  Result := TTlsServerContext.Create;
+  try
+    Result.LoadCertificateFile(GCertDir + ACertName);
+    Result.LoadPrivateKeyFile(GCertDir + AKeyName);
+    Result.CheckKeyMatch;
+    Result.EnableHttp2Alpn;
+    if AClientCaName <> '' then
+      Result.EnableClientCertVerification(GCertDir + AClientCaName);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function StartTlsServer(APort: Integer; ACtx: TTlsServerContext): TNghttp2Server;
+var
+  LConfig: TNghttp2Config;
+begin
+  Result := TNghttp2Server.Create;
+  try
+    Result.OnRequest  := HandleRequest;
+    Result.TlsContext := ACtx;          // borrowed; freed by the caller after Stop
+    LConfig      := TNghttp2Config.Default;
+    LConfig.Port := APort;
+    Result.Start(LConfig);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure StopAndFree(var AServer: TNghttp2Server);
+begin
+  if AServer = nil then
+    Exit;
+  try
+    AServer.Stop;
+  finally
+    FreeAndNil(AServer);
+  end;
+end;
+
+function NewClientTls(ATrust: TTrust; ACert: TClientCert): TTlsClientContext;
+begin
+  Result := TTlsClientContext.Create;
+  try
+    case ATrust of
+      trNothing:  ;                      // verify ON, nothing trusted: the default
+      trCa:       Result.LoadVerifyLocations(GCertDir + 'ca.crt');
+      trWrongCa:  Result.LoadVerifyLocations(GKeypwDir + 'cert.pem');
+      trInsecure: Result.SetInsecure;
+    end;
+    case ACert of
+      ccNone:      ;
+      ccTrusted:   Result.SetClientCertificate(GCertDir + 'client.crt', GCertDir + 'client.key');
+      ccUntrusted: Result.SetClientCertificate(GKeypwDir + 'cert.pem', GKeypwDir + 'key-plain.pem');
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+{ A verified (or, for the control, insecure) Echo over TLS that must succeed. }
+procedure EchoTls(const AName, AHost: string; APort: Integer; ATrust: TTrust;
+  ACert: TClientCert);
+var
+  LCtx:     TTlsClientContext;
+  LChannel: TGrpcChannel;
+  LReq:     TEchoRequest;
+  LReply:   TEchoReply;
+begin
+  LCtx := nil;
+  LChannel := nil;
+  LReq := nil;
+  try
+    try
+      LCtx := NewClientTls(ATrust, ACert);
+      LChannel := TGrpcChannel.Create(AHost, APort, LCtx);
+      LChannel.CallTimeoutMS := 5000;
+      LReq := NewEcho('tls', 7);
+      LReply := CallOk(LChannel, AName, '/gctest.Probe/Echo', LReq);
+      if LReply <> nil then
+      try
+        Check(AName, (LReply.text = 'echo:tls') and (LReply.num = 8),
+          Format('text "%s", num %d', [LReply.text, LReply.num]));
+      finally
+        LReply.Free;
+      end;
+    except
+      on E: Exception do
+        Check(AName, False, 'setup raised ' + E.ClassName + ': ' + E.Message);
+    end;
+  finally
+    LReq.Free;
+    LChannel.Free;     // before the context it borrows
+    LCtx.Free;
+  end;
+end;
+
+{ A TLS call that must fail as 14 UNAVAILABLE; when AMustName is not empty the
+  grpc-message must also name it (the underlying exception class). }
+procedure Unavailable(const AName, AHost: string; APort: Integer; ATrust: TTrust;
+  ACert: TClientCert; const AMustName: string);
+var
+  LCtx:     TTlsClientContext;
+  LChannel: TGrpcChannel;
+  LReq:     TEchoRequest;
+  LObj:     TObject;
+begin
+  LCtx := nil;
+  LChannel := nil;
+  LReq := nil;
+  LObj := nil;
+  try
+    try
+      LCtx := NewClientTls(ATrust, ACert);
+      LChannel := TGrpcChannel.Create(AHost, APort, LCtx);
+      LChannel.CallTimeoutMS := 5000;
+      LReq := NewEcho('tls', 7);
+      LObj := LChannel.Unary('/gctest.Probe/Echo', LReq, TEchoReply);
+      Check(AName, False, 'returned a reply instead of raising');
+    except
+      on E: EGrpcClientError do
+        if E.Status <> GRPC_STATUS_UNAVAILABLE then
+          Check(AName, False, Format('status %d %s, expected 14 UNAVAILABLE - "%s"',
+            [E.Status, GrpcStatusName(E.Status), E.GrpcMessage]))
+        else if (AMustName <> '') and (Pos(AMustName, E.GrpcMessage) = 0) then
+          Check(AName, False, Format('"%s" does not name %s', [E.GrpcMessage, AMustName]))
+        else
+          Check(AName, True);
+      on E: Exception do
+        Check(AName, False, 'raised ' + E.ClassName + ', not EGrpcClientError: ' + E.Message);
+    end;
+  finally
+    LObj.Free;
+    LReq.Free;
+    LChannel.Free;
+    LCtx.Free;
+  end;
+end;
+
+{ The client must refuse the server's certificate with exactly X509_V_* code
+  ACode - asserted on TNghttp2Client.Connect, where the class and the code
+  are still intact (the gRPC layer folds every TLS failure into 14). }
+procedure RefusedCert(const AName, AHost: string; APort: Integer; ATrust: TTrust;
+  ACode: Integer);
+var
+  LCtx:    TTlsClientContext;
+  LClient: TNghttp2Client;
+begin
+  LCtx := nil;
+  LClient := nil;
+  try
+    try
+      LCtx := NewClientTls(ATrust, ccNone);
+      LClient := TNghttp2Client.Create;
+      LClient.TlsContext := LCtx;
+      LClient.Connect(AHost, APort);
+      Check(AName, False, 'connected - the certificate was ACCEPTED');
+    except
+      on E: ENghttp2TlsCertVerify do
+        Check(AName, E.VerifyResult = ACode,
+          Format('X509_V_ERR %d, expected %d - %s', [E.VerifyResult, ACode, E.Message]));
+      on E: Exception do
+        Check(AName, False, 'raised ' + E.ClassName + ', not ENghttp2TlsCertVerify: ' + E.Message);
+    end;
+  finally
+    LClient.Free;
+    LCtx.Free;
+  end;
+end;
+
+procedure PartD;
+var
+  LTlsCtx, LMtlsCtx, LWrongCtx: TTlsServerContext;
+  LTls, LMtls, LWrong:          TNghttp2Server;
+begin
+  WriteLn;
+  WriteLn('-- D   TLS against our own server: verified ', PORT_TLS, ', mTLS ', PORT_MTLS,
+    ', wrong-name certificate ', PORT_WRONGNAME);
+  LTlsCtx := nil; LMtlsCtx := nil; LWrongCtx := nil;
+  LTls := nil;    LMtls := nil;    LWrong := nil;
+  try
+    LTlsCtx   := NewServerTls('server.crt',    'server.key',    '');
+    LMtlsCtx  := NewServerTls('server.crt',    'server.key',    'ca.crt');
+    LWrongCtx := NewServerTls('wrongname.crt', 'wrongname.key', '');
+    LTls   := StartTlsServer(PORT_TLS,       LTlsCtx);
+    LMtls  := StartTlsServer(PORT_MTLS,      LMtlsCtx);
+    LWrong := StartTlsServer(PORT_WRONGNAME, LWrongCtx);
+
+    EchoTls('D verified TLS, by IP 127.0.0.1: Echo',
+      '127.0.0.1', PORT_TLS, trCa, ccNone);
+    EchoTls('D verified TLS, by name localhost: Echo (DNS name check + SNI)',
+      'localhost', PORT_TLS, trCa, ccNone);
+    RefusedCert('D nothing trusted -> refused, X509_V_ERR 20',
+      '127.0.0.1', PORT_TLS, trNothing, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+    RefusedCert('D another CA trusted -> refused, X509_V_ERR 20',
+      '127.0.0.1', PORT_TLS, trWrongCa, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+    RefusedCert('D valid chain, wrong name, by IP -> refused, X509_V_ERR 64',
+      '127.0.0.1', PORT_WRONGNAME, trCa, X509_V_ERR_IP_ADDRESS_MISMATCH);
+    RefusedCert('D valid chain, wrong name, by DNS name -> refused, X509_V_ERR 62',
+      'localhost', PORT_WRONGNAME, trCa, X509_V_ERR_HOSTNAME_MISMATCH);
+    EchoTls('D CONTROL: an insecure context accepts that same wrong-name server',
+      '127.0.0.1', PORT_WRONGNAME, trInsecure, ccNone);
+    Unavailable('D gRPC: wrong-name certificate -> 14 UNAVAILABLE, naming ENghttp2TlsCertVerify',
+      '127.0.0.1', PORT_WRONGNAME, trCa, ccNone, 'ENghttp2TlsCertVerify');
+    EchoTls('D mTLS with the client certificate: Echo',
+      '127.0.0.1', PORT_MTLS, trCa, ccTrusted);
+    Unavailable('D mTLS WITHOUT a client certificate -> 14 UNAVAILABLE',
+      '127.0.0.1', PORT_MTLS, trCa, ccNone, '');
+    Unavailable('D mTLS with a client certificate from another issuer -> 14 UNAVAILABLE',
+      '127.0.0.1', PORT_MTLS, trCa, ccUntrusted, '');
+  finally
+    StopAndFree(LWrong);
+    StopAndFree(LMtls);
+    StopAndFree(LTls);
+    LWrongCtx.Free;
+    LMtlsCtx.Free;
+    LTlsCtx.Free;
+  end;
+end;
+
+procedure PartE(ATlsPort, AMtlsPort: Integer);
+begin
+  WriteLn;
+  WriteLn('-- E   TLS against grpcio (BoringSSL): verified ', ATlsPort, ', mTLS ', AMtlsPort);
+  EchoTls('E verified TLS, by IP 127.0.0.1: Echo',
+    '127.0.0.1', ATlsPort, trCa, ccNone);
+  EchoTls('E verified TLS, by name localhost: Echo',
+    'localhost', ATlsPort, trCa, ccNone);
+  RefusedCert('E nothing trusted -> refused, X509_V_ERR 20',
+    '127.0.0.1', ATlsPort, trNothing, X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+  EchoTls('E mTLS with the client certificate: Echo',
+    '127.0.0.1', AMtlsPort, trCa, ccTrusted);
+  Unavailable('E mTLS WITHOUT a client certificate -> 14 UNAVAILABLE',
+    '127.0.0.1', AMtlsPort, trCa, ccNone, '');
+end;
+
+function ArgValue(const AKey: string): string;
 var
   I: Integer;
   LPrefix: string;
 begin
-  Result := 0;
+  Result := '';
   LPrefix := AKey + '=';
   for I := 1 to ParamCount do
     if SameText(Copy(ParamStr(I), 1, Length(LPrefix)), LPrefix) then
-      Result := StrToIntDef(Copy(ParamStr(I), Length(LPrefix) + 1, MaxInt), 0);
+      Result := Copy(ParamStr(I), Length(LPrefix) + 1, MaxInt);
+end;
+
+function PortArg(const AKey: string): Integer;
+begin
+  Result := StrToIntDef(ArgValue(AKey), 0);
 end;
 
 var
   GService: TProbeService;
 
 begin
-  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError');
+  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS)');
 
   if not NghttpLoad then
   begin
@@ -488,6 +768,47 @@ begin
         WriteLn;
         Skip('Part C: malformed replies',
           'no raw=<port> - run client-trailers-peer.py (needs python h2)');
+      end;
+
+      { GC2b. The fixtures are committed, so a missing certs= is a runner
+        problem - but it is still reported as a skip, never a pass. }
+      GCertDir := ArgValue('certs');
+      if GCertDir = '' then
+      begin
+        WriteLn;
+        Skip('Parts D + E: TLS', 'no certs=<dir> - pass tests/certs-tls');
+      end
+      else if not NghttpsslLoad then
+      begin
+        WriteLn;
+        Skip('Parts D + E: TLS', 'OpenSSL is not loadable: ' + NghttpsslLoadError);
+      end
+      else
+      begin
+        GCertDir  := IncludeTrailingPathDelimiter(GCertDir);
+        GKeypwDir := GCertDir + '..' + PathDelim + 'certs-keypw' + PathDelim;
+        WriteLn;
+        WriteLn('  OpenSSL: ', NghttpsslVersion);
+        try
+          PartD;
+        except
+          on E: Exception do
+            Check('Part D ran to the end', False, E.ClassName + ': ' + E.Message);
+        end;
+
+        if (PortArg('grpcio-tls') > 0) and (PortArg('grpcio-mtls') > 0) then
+        try
+          PartE(PortArg('grpcio-tls'), PortArg('grpcio-mtls'));
+        except
+          on E: Exception do
+            Check('Part E ran to the end', False, E.ClassName + ': ' + E.Message);
+        end
+        else
+        begin
+          WriteLn;
+          Skip('Part E: TLS against grpcio',
+            'no grpcio-tls=/grpcio-mtls= - run grpc-probe-peer.py with --certs');
+        end;
       end;
     finally
       TGrpcRegistry.Shutdown;

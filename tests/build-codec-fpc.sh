@@ -37,7 +37,11 @@
 #                                       EGrpcClientError. Part B = python grpcio
 #                                       (grpc-probe-peer.py), Part C = python h2
 #                                       malformed replies; each SKIPS LOUDLY
-#                                       without its python; Part A always runs.)
+#                                       without its python; Part A always runs.
+#                                       GC2b: Part D = TLS + mTLS against our own
+#                                       server, server certificate VERIFIED
+#                                       (certs-tls/); Part E = the same against
+#                                       the grpcio peer's TLS ports.)
 #                                       TLS 1.2/1.3 cipher setters read back
 #                                       from OpenSSL. Skips LOUDLY when
 #                                       OpenSSL is absent. Same name as the
@@ -949,10 +953,11 @@ else
       if "$CAND" -c 'import h2' > /dev/null 2>&1; then GU_HPY="$CAND"; break; fi
     done
 
-    GU_ARGS=""
+    GU_ARGS="certs=$HERE/certs-tls"     # GC2b, Part D (Part E also needs grpcio)
     GU_PIDS=""
     if [[ -n "$GU_GPY" ]]; then
-      "$GU_GPY" "$HERE/grpc-probe-peer.py" 19324 --lifetime 60 > "$GUOUT/grpc-peer.log" 2>&1 &
+      "$GU_GPY" "$HERE/grpc-probe-peer.py" 19324 --lifetime 60 \
+        --certs "$HERE/certs-tls" --tls 19330 --mtls 19331 > "$GUOUT/grpc-peer.log" 2>&1 &
       GU_PIDS="$GU_PIDS $!"
     else
       echo "  NOTE  no python with grpcio + grpcio-tools - Part B will SKIP"
@@ -972,7 +977,7 @@ else
     done
     if [[ -n "$GU_GPY" ]]; then
       if grep -q '^READY' "$GUOUT/grpc-peer.log" 2>/dev/null; then
-        GU_ARGS="$GU_ARGS grpcio=19324"
+        GU_ARGS="$GU_ARGS grpcio=19324 grpcio-tls=19330 grpcio-mtls=19331"
       else
         echo "  NOTE  the grpcio peer did not start - see $GUOUT/grpc-peer.log"
       fi
@@ -985,16 +990,17 @@ else
       fi
     fi
 
-    timeout 90 "$GUOUT/Nghttp2GrpcUnaryClient" $GU_ARGS < /dev/null | sed 's/^/  /'
+    timeout 90 "$GUOUT/Nghttp2GrpcUnaryClient" $GU_ARGS < /dev/null \
+      | tee "$GUOUT/run.log" | sed 's/^/  /'
     GU_RC=${PIPESTATUS[0]}
     for P in $GU_PIDS; do kill "$P" 2>/dev/null; wait "$P" 2>/dev/null; done
 
     case "$GU_RC" in
-      0)   if [[ "$GU_ARGS" == *grpcio=* && "$GU_ARGS" == *raw=* ]]; then
-             echo "  grpc unary client: PASSED (all three parts)"
+      0)   if ! grep -q '^  SKIP  Part' "$GUOUT/run.log"; then
+             echo "  grpc unary client: PASSED (all five parts)"
            else
-             echo "  grpc unary client: Part A PASSED - a python part SKIPPED; see the"
-             echo "        SKIP lines: the independent-peer checks did NOT run"
+             echo "  grpc unary client: PASSED what ran - a part SKIPPED; see the"
+             echo "        SKIP lines: those checks did NOT run"
            fi ;;
       3)   echo "  SKIP  libnghttp2 absent - the gRPC client was NOT exercised" ;;
       124) echo "  FAIL  timed out after 90s"

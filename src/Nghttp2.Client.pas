@@ -695,7 +695,9 @@ begin
         Per-connection application keeps every property CL2b wanted: applied on
         every Connect, independent of assignment order, always exactly 'h2' -
         and adds the one it lacked, which is that it touches nothing shared. }
-      FTlsConn := TTlsClientConnection.Create(FTlsContext, FSocket);
+      { GC2b (1.28.0): FHost goes in as the peer name, so a verifying context
+        also checks that the certificate is FOR this host (and sends SNI). }
+      FTlsConn := TTlsClientConnection.Create(FTlsContext, FSocket, FHost);
       FTlsConn.DoHandshake;
 
       { Two different failures, deliberately worded apart.
@@ -773,6 +775,12 @@ begin
           '(alert 120, RFC 7301 3.2), so the connection never completed. Use ' +
           'an HTTP/2 server, or h2c (no TlsContext) if the endpoint is ' +
           'cleartext HTTP/2. [%s]', [FHost, FPort, E.Message]);
+      { GC2b: same reason - name the endpoint - but the class and its
+        VerifyResult survive, because a caller tells "untrusted issuer" from
+        "wrong host" by that code, not by the text. }
+      on E: ENghttp2TlsCertVerify do
+        raise ENghttp2TlsCertVerify.CreateVerify(E.VerifyResult,
+          Format('%s:%d - %s', [FHost, FPort, E.Message]));
     else
       raise;
     end;
@@ -1467,8 +1475,8 @@ begin
     begin
       // Convenience-mode TLS: skip cert verification (self-signed OK for
       // local testing). Production callers should construct their own
-      // TTlsClientContext with proper CA setup and use TNghttp2Client
-      // directly rather than this helper.
+      // TTlsClientContext - LoadVerifyLocations(ca) or UseSystemTrustStore,
+      // GC2b 1.28.0 - and use TNghttp2Client directly rather than this helper.
       LTls := TTlsClientContext.Create;
       LTls.SetInsecure;
       LTls.EnableHttp2Alpn;

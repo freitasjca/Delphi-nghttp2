@@ -47,8 +47,23 @@ unit Nghttp2.Grpc.Client;
 //  ── Not here yet ──
 //
 //  Deadlines sent as grpc-timeout and call metadata are GC3; server streaming
-//  is GC4; client and bidi streaming are deferred (plan decision D1). TLS is
-//  the TNghttp2Client's: pass a TTlsClientContext.
+//  is GC4; client and bidi streaming are deferred (plan decision D1).
+//
+//  ── TLS (GC2b) ──
+//
+//  Pass a TTlsClientContext. It verifies the server by default, against what
+//  YOU tell it to trust - nothing until then, so call one of
+//
+//    LTls.LoadVerifyLocations('ca.pem');   // a private CA, or a bundle file
+//    LTls.UseSystemTrustStore;             // OpenSSL's default paths
+//
+//  and the certificate must also be issued for the host given to Create (a
+//  DNS name or an IP literal). mTLS: LTls.SetClientCertificate(cert, key).
+//  Every TLS failure - untrusted or wrong-name certificate, a server that
+//  wants a client certificate we did not send - is 14 UNAVAILABLE, like any
+//  other transport failure; the underlying ENghttp2TlsCertVerify (with its
+//  X509_V_* code) is named in GrpcMessage. SetInsecure skips verification:
+//  for tests only.
 //
 //  ── Threads ──
 //

@@ -61,6 +61,21 @@ type
     change. }
   ENghttp2TlsAlpnRefused = class(ENghttp2Tls);
 
+  { GC2b (1.28.0). The CLIENT refused the server's certificate: untrusted
+    issuer, expired, or a name / IP that is not the one connected to.
+    VerifyResult is OpenSSL's X509_V_* code (Nghttp2.OpenSSL: 20 = issuer not
+    trusted, 62 = hostname mismatch, 64 = IP address mismatch). Test the code,
+    never the message: the text differs between OpenSSL versions. Raised only
+    when the context verifies (not after SetInsecure), so a handshake that
+    failed for another reason is never blamed on the certificate. }
+  ENghttp2TlsCertVerify = class(ENghttp2Tls)
+  private
+    FVerifyResult: Integer;
+  public
+    constructor CreateVerify(AVerifyResult: Integer; const AMessage: string);
+    property VerifyResult: Integer read FVerifyResult;
+  end;
+
   { Outcome of a non-blocking TLS operation.
 
     The two WANT states are NOT errors. They name the readiness the caller
@@ -333,19 +348,43 @@ type
     then create per-request TTlsClientConnection instances against it. }
   TTlsClientContext = class
   strict private
-    FCtx:      PSSL_CTX;
-    FPassword: RawByteString; // key-password bytes — same lifetime and encoding rules as server
+    FCtx:        PSSL_CTX;
+    FPassword:   RawByteString; // key-password bytes — same lifetime and encoding rules as server
+    FVerifyPeer: Boolean;
     function GetHandle: PSSL_CTX;
   public
     // Constructs an empty client context. Raises ENghttp2Tls if OpenSSL
     // isn't loadable. Cert verification is ENABLED by default (SSL_VERIFY_PEER)
     // — call SetInsecure to disable for testing against self-signed certs.
+    //
+    // GC2b (1.28.0): verification needs something to verify AGAINST. A new
+    // context trusts NOTHING - not even the system store - so until one of
+    // LoadVerifyLocations / UseSystemTrustStore is called every server is
+    // refused (X509_V_ERR 20). That is deliberate: refusing is loud, while
+    // trusting a store the caller never chose is the silent kind of wrong.
     constructor Create;
     destructor  Destroy; override;
 
     // Disable server certificate verification. Use ONLY for local testing
     // against self-signed certs — production clients must verify.
     procedure SetInsecure;
+
+    // GC2b. Trust the CA certificate(s) in a PEM file (one cert or a bundle),
+    // e.g. a private CA that signed the server. Additive: may be called more
+    // than once, and combines with UseSystemTrustStore. Raises ENghttp2Tls
+    // when the file cannot be read or holds no certificate.
+    procedure LoadVerifyLocations(const ACaFile: string);
+
+    // GC2b. Trust the platform's default CA store (OpenSSL's built-in paths;
+    // the SSL_CERT_FILE / SSL_CERT_DIR environment variables override them).
+    // On Windows OpenSSL does NOT read the Windows certificate store, so
+    // there this usually trusts nothing - use LoadVerifyLocations with a
+    // bundle file instead. Raises when the runtime lacks the call.
+    procedure UseSystemTrustStore;
+
+    // GC2b. True unless SetInsecure was called. TTlsClientConnection checks
+    // the server's NAME only while this is True (see its constructor).
+    property VerifyPeer: Boolean read FVerifyPeer;
 
     // Advertise 'h2' as the sole ALPN protocol. The server picks it (if it
     // supports h2) or declines. We fail hard on any other selection —
@@ -377,8 +416,19 @@ type
     FReadTimeoutMS: Integer;   { [CL2c] 0 = block forever, the old behaviour }
     function FlushOut: Boolean;
     function FeedIn: Integer;
+    procedure ApplyPeerName(const APeerName: string);
+    procedure RaiseHandshake(const AWhere: string; ARet: Integer);
   public
-    constructor Create(const AContext: TTlsClientContext; ASocket: Integer);
+    // GC2b (1.28.0): APeerName is the host the caller connected to. When it
+    // is not empty, the server certificate must be issued for it - a DNS
+    // name is matched against the certificate's DNS SANs (and sent as SNI),
+    // an IP literal (brackets allowed) against its IP SANs (and never sent
+    // as SNI, RFC 6066 §3). Only while AContext.VerifyPeer is True: after
+    // SetInsecure nothing is checked, exactly as before. Empty = no name
+    // check (the pre-1.28.0 behaviour, kept for direct callers);
+    // TNghttp2Client always passes its host.
+    constructor Create(const AContext: TTlsClientContext; ASocket: Integer;
+      const APeerName: string = '');
     destructor  Destroy; override;
 
     // Runs SSL_connect, blocks until handshake completes or fails.
@@ -446,6 +496,13 @@ begin
     SSL_ERROR_WANT_ACCEPT:      Result := 'WANT_ACCEPT';
   else                          Result := 'UNKNOWN(' + IntToStr(ACode) + ')';
   end;
+end;
+
+constructor ENghttp2TlsCertVerify.CreateVerify(AVerifyResult: Integer;
+  const AMessage: string);
+begin
+  inherited Create(AMessage);
+  FVerifyResult := AVerifyResult;
 end;
 
 procedure RaiseTls(const AWhere: string; AResult: Integer; ASsl: PSSL);
@@ -1358,6 +1415,7 @@ begin
 
   // Default: verify server cert. Callers explicitly opt into insecure mode.
   SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil);
+  FVerifyPeer := True;
   InstallPasswordCallback(FCtx);   // KEYPW-1: never prompt
 end;
 
@@ -1379,6 +1437,33 @@ end;
 procedure TTlsClientContext.SetInsecure;
 begin
   SSL_CTX_set_verify(FCtx, SSL_VERIFY_NONE, nil);
+  FVerifyPeer := False;
+end;
+
+procedure TTlsClientContext.LoadVerifyLocations(const ACaFile: string);
+var
+  LCaAnsi: AnsiString;
+begin
+  { Same call TTlsServerContext.EnableClientCertVerification makes for the
+    mTLS CA - here it is the store the SERVER's chain is checked against. }
+  LCaAnsi := AnsiString(ACaFile);
+  if SSL_CTX_load_verify_locations(FCtx, PAnsiChar(LCaAnsi), nil) <> 1 then
+    raise ENghttp2Tls.CreateFmt(
+      'SSL_CTX_load_verify_locations(%s) [client trust store] failed: %s' + sLineBreak +
+      'Ensure the CA file exists and is a PEM-encoded X.509 certificate or bundle.',
+      [ACaFile, NghttpsslLastError]);
+end;
+
+procedure TTlsClientContext.UseSystemTrustStore;
+begin
+  if not Assigned(SSL_CTX_set_default_verify_paths) then
+    raise ENghttp2Tls.CreateFmt(
+      'UseSystemTrustStore: SSL_CTX_set_default_verify_paths is not exported by ' +
+      'the loaded OpenSSL (%s). Use LoadVerifyLocations with a CA bundle file.',
+      [NghttpsslVersion]);
+  if SSL_CTX_set_default_verify_paths(FCtx) <> 1 then
+    raise ENghttp2Tls.CreateFmt(
+      'SSL_CTX_set_default_verify_paths failed: %s', [NghttpsslLastError]);
 end;
 
 procedure TTlsClientContext.SetClientCertificate(const ACertFile, AKeyFile: string;
@@ -1442,7 +1527,8 @@ end;
 
 // ─── TTlsClientConnection ──────────────────────────────────────────────
 
-constructor TTlsClientConnection.Create(const AContext: TTlsClientContext; ASocket: Integer);
+constructor TTlsClientConnection.Create(const AContext: TTlsClientContext; ASocket: Integer;
+  const APeerName: string);
 var
   LProtos: array[0..2] of Byte;
 begin
@@ -1502,6 +1588,102 @@ begin
 
   // SSL owns both BIOs from here; SSL_free releases them.
   SSL_set_bio(FSSL, FBioIn, FBioOut);
+
+  { GC2b. Last, so a raise here leaves a fully built object for the destructor
+    to free (a constructor that raises runs Destroy on both compilers). }
+  ApplyPeerName(APeerName);
+end;
+
+{ GC2b. Tells OpenSSL which name the certificate must carry, and sends SNI.
+
+  Through the SSL's X509_VERIFY_PARAM, not SSL_set1_host: that function only
+  learned to treat an IP literal as an IP in OpenSSL 3.0, so on 1.1.1 a client
+  connecting to "127.0.0.1" would compare it with DNS names and refuse every
+  correct certificate. set1_ip_asc answers "is this an IP?" itself (1 = parsed
+  and stored), which keeps the decision with OpenSSL's own address parser.
+
+  Missing symbols: when the context verifies, refusing is the only honest
+  answer - a client that silently skipped the name check would accept any
+  certificate the CA ever signed, for anyone. When it does not verify, nothing
+  would be checked anyway, so the connection goes ahead without SNI. }
+procedure TTlsClientConnection.ApplyPeerName(const APeerName: string);
+var
+  LName:  string;
+  LAnsi:  AnsiString;
+  LParam: Pointer;
+  LIsIp:  Boolean;
+begin
+  LName := APeerName;
+  if (Length(LName) >= 2) and (LName[1] = '[') and (LName[Length(LName)] = ']') then
+    LName := Copy(LName, 2, Length(LName) - 2);
+  if LName = '' then
+    Exit;
+
+  if not (Assigned(SSL_get0_param) and Assigned(X509_VERIFY_PARAM_set1_host)
+          and Assigned(X509_VERIFY_PARAM_set1_ip_asc)) then
+  begin
+    if FCtx.VerifyPeer then
+      raise ENghttp2Tls.CreateFmt(
+        'cannot verify that the server is "%s": the loaded OpenSSL (%s) does ' +
+        'not export SSL_get0_param / X509_VERIFY_PARAM_set1_host / ' +
+        'X509_VERIFY_PARAM_set1_ip_asc (OpenSSL 1.1.0 or newer has them). ' +
+        'Refusing rather than accepting any certificate the CA signed.',
+        [LName, NghttpsslVersion]);
+    Exit;
+  end;
+
+  LAnsi  := AnsiString(LName);
+  LParam := SSL_get0_param(FSSL);
+  LIsIp  := X509_VERIFY_PARAM_set1_ip_asc(LParam, PAnsiChar(LAnsi)) = 1;
+  { A name that is not an address may leave an entry on this thread's error
+    queue. SSL_get_error consults that queue, so a stale entry would turn the
+    handshake's ordinary WANT_READ into a fatal SSL_ERROR_SSL. Drain it. }
+  while ERR_get_error() <> 0 do
+    ;
+
+  if not LIsIp then
+  begin
+    if X509_VERIFY_PARAM_set1_host(LParam, PAnsiChar(LAnsi), 0) <> 1 then
+      raise ENghttp2Tls.CreateFmt('X509_VERIFY_PARAM_set1_host(%s) failed: %s',
+        [LName, NghttpsslLastError]);
+    { SNI: a DNS name only. Optional symbol - without it the server simply
+      sees no server_name, which every server handles (it picks its default
+      certificate); the NAME CHECK above is what security rests on. }
+    if Assigned(SSL_ctrl) then
+      if SSL_ctrl(FSSL, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name,
+                  PAnsiChar(LAnsi)) <> 1 then
+        raise ENghttp2Tls.CreateFmt('SNI (SSL_set_tlsext_host_name %s) failed: %s',
+          [LName, NghttpsslLastError]);
+  end;
+end;
+
+{ GC2b. A failed SSL_connect, classified. When this client verifies and
+  OpenSSL recorded a certificate verdict, THAT is the reason, and it is
+  raised with its X509_V_* code; anything else goes through RaiseTls as
+  before. Only while verifying: after SetInsecure the verdict is still
+  recorded (e.g. 20 for an unknown issuer) but did not cause the failure. }
+procedure TTlsClientConnection.RaiseHandshake(const AWhere: string; ARet: Integer);
+var
+  LVerify: Integer;
+  LText:   string;
+  LErr:    string;
+begin
+  if FCtx.VerifyPeer and Assigned(SSL_get_verify_result) then
+  begin
+    LVerify := Integer(SSL_get_verify_result(FSSL));
+    if LVerify <> X509_V_OK then
+    begin
+      LErr := NghttpsslLastError;   // pop the "certificate verify failed" entry
+      if Assigned(X509_verify_cert_error_string) then
+        LText := string(AnsiString(X509_verify_cert_error_string(LVerify)))
+      else
+        LText := 'X509_V_ERR ' + IntToStr(LVerify);
+      raise ENghttp2TlsCertVerify.CreateVerify(LVerify, Format(
+        'the server certificate was rejected: %s (X509_V_ERR=%d) [%s, ERR=%s]',
+        [LText, LVerify, AWhere, LErr]));
+    end;
+  end;
+  RaiseTls(AWhere, ARet, FSSL);
 end;
 
 function TTlsClientConnection.FlushOut: Boolean;
@@ -1606,7 +1788,7 @@ begin
       SSL_ERROR_WANT_WRITE:
         ;
     else
-      RaiseTls('SSL_connect', LRet, FSSL);
+      RaiseHandshake('SSL_connect', LRet);
     end;
   until False;
 end;

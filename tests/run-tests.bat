@@ -640,6 +640,9 @@ REM (stubs generated at start-up from gctest.proto). Part C: the /gctest.Raw/*
 REM malformed replies of client-trailers-peer.py on python h2. Each python part
 REM SKIPS LOUDLY without its package. Peers are started in TITLED windows and
 REM killed by title with /T, never by image name.
+REM GC2b: Part D = TLS + mTLS against our own server with the server
+REM certificate VERIFIED (certs-tls\); Part E = the same against the grpcio
+REM peer's TLS ports. Any part that did not run prints "SKIP  Part ...".
 if not exist "Nghttp2GrpcUnaryClient.dpr" goto :no_gunary
 echo -- Nghttp2GrpcUnaryClient ---------------------------------------------------------------
 "!DCC!" -CC -B -U"..\src" "Nghttp2GrpcUnaryClient.dpr" > "Nghttp2GrpcUnaryClient.buildlog" 2>&1
@@ -656,11 +659,11 @@ for %%P in (py python) do if not defined HPY (
   %%P -c "import h2" > nul 2>&1
   if not errorlevel 1 set "HPY=%%P"
 )
-set "GUARGS="
+set "GUARGS=certs=certs-tls"
 set "GUPARTS=0"
 if defined GPY (
-  start "NGHTTP2GRPCPEER" /min !GPY! "grpc-probe-peer.py" 19324 --lifetime 60
-  set "GUARGS=!GUARGS! grpcio=19324"
+  start "NGHTTP2GRPCPEER" /min !GPY! "grpc-probe-peer.py" 19324 --lifetime 60 --certs certs-tls --tls 19330 --mtls 19331
+  set "GUARGS=!GUARGS! grpcio=19324 grpcio-tls=19330 grpcio-mtls=19331"
   set /a GUPARTS+=1
 ) else (
   echo    NOTE  no Python with grpcio + grpcio-tools - Part B will SKIP
@@ -675,21 +678,22 @@ if defined HPY (
 REM grpcio generates its stubs before listening: give it a few seconds.
 if not "!GUPARTS!"=="0" ping -n 5 127.0.0.1 > nul
 
-Nghttp2GrpcUnaryClient.exe !GUARGS! < nul
+Nghttp2GrpcUnaryClient.exe !GUARGS! < nul > "Nghttp2GrpcUnaryClient.run.log" 2>&1
 set "GU_RC=!errorlevel!"
+type "Nghttp2GrpcUnaryClient.run.log"
 if defined GPY taskkill /FI "WINDOWTITLE eq NGHTTP2GRPCPEER" /T /F > nul 2>&1
 if defined HPY taskkill /FI "WINDOWTITLE eq NGHTTP2RAWPEER" /T /F > nul 2>&1
 echo.
 if "!GU_RC!"=="3" goto :gunary_skip
 if not "!GU_RC!"=="0" goto :gunary_fail
-if not "!GUPARTS!"=="2" goto :gunary_partial
-echo    PASS  Nghttp2GrpcUnaryClient - all three parts
+findstr /C:"SKIP  Part" "Nghttp2GrpcUnaryClient.run.log" > nul && goto :gunary_partial
+echo    PASS  Nghttp2GrpcUnaryClient - all five parts
 goto :after_gunary
 
 :gunary_partial
 set /a SKIPPED+=1
-echo    PASS  Nghttp2GrpcUnaryClient - Part A only or A + one python part. A
-echo          SKIPPED part did NOT run: see the SKIP lines above
+echo    PASS  Nghttp2GrpcUnaryClient - what ran passed, but a part SKIPPED and
+echo          did NOT run: see the SKIP lines above
 goto :after_gunary
 
 :gunary_fail

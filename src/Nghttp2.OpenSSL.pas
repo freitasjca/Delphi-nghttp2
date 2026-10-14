@@ -127,6 +127,18 @@ const
   SSL_CTRL_SET_MIN_PROTO_VERSION  = 123;
   SSL_CTRL_GET_MIN_PROTO_VERSION  = 130;
 
+  // ─── Client-side server verification (GC2b, 1.28.0) ─────────────────────
+  // SSL_set_tlsext_host_name is a macro over SSL_ctrl (openssl/tls1.h).
+  SSL_CTRL_SET_TLSEXT_HOSTNAME    = 55;
+  TLSEXT_NAMETYPE_host_name       = 0;
+  // SSL_get_verify_result values (openssl/x509_vfy.h). Stable since 1.0.2 -
+  // the codes, unlike the text, do not change between OpenSSL versions.
+  X509_V_OK                                    = 0;
+  X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT       = 18;
+  X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY = 20;
+  X509_V_ERR_HOSTNAME_MISMATCH                 = 62;
+  X509_V_ERR_IP_ADDRESS_MISMATCH               = 64;
+
 var
   // ─── Method factories (unified TLS_*_method since 1.1.0) ────────────────
   TLS_server_method: function: PSSL_METHOD; cdecl;
@@ -270,6 +282,35 @@ var
   // cipher-suite value; Nghttp2.Tls masks it and looks it up in the RFC 7540
   // Appendix A block list. Serves only TTlsServerContext.RequireHttp2Tls12Cipher.
   SSL_CIPHER_get_id:        function(c: PSSL_CIPHER): Cardinal; cdecl;
+
+  // ─── Client-side server verification (GC2b, 1.28.0) ─────────────────────
+  // OPTIONAL, same rule as above: they serve only TTlsClientContext's trust
+  // store and TTlsClientConnection's peer-name check. Every one exists from
+  // 1.1.0 (SSL_get0_param from 1.0.2). A caller that NEEDS one - verification
+  // on and a host to check - raises when it is nil instead of skipping the
+  // check: skipping would be a client that looks verified and is not.
+  //
+  // The peer name goes through the X509_VERIFY_PARAM of the SSL rather than
+  // SSL_set1_host, on purpose: SSL_set1_host treats an IP literal as an IP
+  // only from OpenSSL 3.0 (1.1.1 compares it against DNS names and never
+  // matches), while set1_ip_asc + set1_host behave the same on 1.1.x and 3.x.
+  SSL_CTX_set_default_verify_paths: function(ctx: PSSL_CTX): Integer; cdecl;
+  SSL_get0_param:                   function(ssl: PSSL): Pointer; cdecl;
+  // libcrypto. set1_host's namelen 0 means "NUL-terminated".
+  X509_VERIFY_PARAM_set1_host:      function(param: Pointer; const name: PAnsiChar;
+                                             namelen: NativeUInt): Integer; cdecl;
+  // libcrypto. Returns 1 when ipasc PARSES as an IPv4/IPv6 address and was
+  // stored, 0 otherwise - which is also how "is this an IP literal?" is asked.
+  X509_VERIFY_PARAM_set1_ip_asc:    function(param: Pointer;
+                                             const ipasc: PAnsiChar): Integer; cdecl;
+  // Per-SSL twin of SSL_CTX_ctrl; here only for SNI (SSL_CTRL_SET_TLSEXT_HOSTNAME).
+  SSL_ctrl:                         function(ssl: PSSL; cmd: Integer; larg: LongInt;
+                                             parg: Pointer): LongInt; cdecl;
+  // The X509_V_* outcome of the peer-certificate check, kept on the SSL after
+  // a failed handshake; the reason a client can name instead of "handshake
+  // failed". libcrypto: the text for a code (static string, never free).
+  SSL_get_verify_result:            function(ssl: PSSL): LongInt; cdecl;
+  X509_verify_cert_error_string:    function(n: LongInt): PAnsiChar; cdecl;
 
 const
   // C's OPENSSL_VERSION (0). Not given that name here: Pascal identifiers are
@@ -548,6 +589,13 @@ begin
   GetOptional(ALibSsl,    'SSL_CTX_ctrl',             Pointer(@SSL_CTX_ctrl));
   GetOptional(ALibCrypto, 'OpenSSL_version',          Pointer(@OpenSSL_version));
   GetOptional(ALibSsl,    'SSL_CIPHER_get_id',        Pointer(@SSL_CIPHER_get_id));
+  GetOptional(ALibSsl,    'SSL_CTX_set_default_verify_paths', Pointer(@SSL_CTX_set_default_verify_paths));
+  GetOptional(ALibSsl,    'SSL_get0_param',                   Pointer(@SSL_get0_param));
+  GetOptional(ALibCrypto, 'X509_VERIFY_PARAM_set1_host',      Pointer(@X509_VERIFY_PARAM_set1_host));
+  GetOptional(ALibCrypto, 'X509_VERIFY_PARAM_set1_ip_asc',    Pointer(@X509_VERIFY_PARAM_set1_ip_asc));
+  GetOptional(ALibSsl,    'SSL_ctrl',                         Pointer(@SSL_ctrl));
+  GetOptional(ALibSsl,    'SSL_get_verify_result',            Pointer(@SSL_get_verify_result));
+  GetOptional(ALibCrypto, 'X509_verify_cert_error_string',    Pointer(@X509_verify_cert_error_string));
 end;
 
 procedure ClearOptionalSymbols;
@@ -561,6 +609,13 @@ begin
   SSL_CTX_ctrl             := nil;
   OpenSSL_version          := nil;
   SSL_CIPHER_get_id        := nil;
+  SSL_CTX_set_default_verify_paths := nil;
+  SSL_get0_param                   := nil;
+  X509_VERIFY_PARAM_set1_host      := nil;
+  X509_VERIFY_PARAM_set1_ip_asc    := nil;
+  SSL_ctrl                         := nil;
+  SSL_get_verify_result            := nil;
+  X509_verify_cert_error_string    := nil;
 end;
 
 function OsLoadError: string;
