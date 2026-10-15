@@ -62,9 +62,10 @@ interface
 
 uses
 {$IF DEFINED(FPC)}
-  SysUtils, Classes, SyncObjs, Generics.Collections,
+  SysUtils, Classes, SyncObjs, DateUtils, Generics.Collections,
 {$ELSE}
-  System.SysUtils, System.Classes, System.SyncObjs, System.Generics.Collections,
+  System.SysUtils, System.Classes, System.SyncObjs, System.DateUtils,
+  System.Generics.Collections,
 {$IFEND}
   Nghttp2.Compat,   { TInterlocked shim for FPC < 3.3.1 — no-op elsewhere }
   Nghttp2.Types,
@@ -1304,16 +1305,38 @@ begin
     worker still holds a stream, and no staged response is waiting to be
     submitted. Deliberately not `not WantWrite` — the response we are
     about to flush makes that false, and waiting for it would put us back
-    in a separate burst. }
+    in a separate burst.
+
+    GOAWAY-RACE-1: two additional guards. Without them the notice and the
+    final GOAWAY fire in the SAME pump iteration: the notice is submitted
+    (queued in nghttp2 but not yet sent) and immediately the condition
+    passes, so SubmitFinalGoaway captures last_proc_stream_id BEFORE the
+    write phase has flushed the notice to the wire and before the peer
+    has had a chance to deliver any pipelined HEADERS — resulting in
+    last_stream_id = 0 for a brand-new connection. Observed in 3 of 5
+    runs of build-fpc.sh stage 8.
+
+    ShutdownNoticeSent: the notice frame must have been submitted this
+    iteration or an earlier one.
+
+    Elapsed >= GOAWAY_GRACE_MS: at least one full grace period must have
+    passed since the notice was submitted, so the notice is on the wire
+    and pipelined requests have had time to arrive and be processed by
+    FeedIncoming. For connections with an in-flight response the drain
+    itself supplies far more than GOAWAY_GRACE_MS (handlers run for
+    milliseconds to seconds), so the check is effectively free on the
+    normal path. Only an idle connection ever waits the full interval. }
   if FServer.IsDraining and (not FPeerClosed)
      and (FSession.PendingDispatch = 0)
-     and (not FSession.HasPendingResponses) then
+     and (not FSession.HasPendingResponses)
+     and FSession.ShutdownNoticeSent
+     and (MilliSecondsBetween(Now, FSession.ShutdownNoticeAt) >= GOAWAY_GRACE_MS) then
   begin
     { DRAIN-DIAG-2: log the cutoff BEFORE submitting it. This number decides on
       the wire which requests the peer must replay — everything above it is
       abandoned — so a low value is indistinguishable, at the client, from a
-      severed reply. Observed varying between 13 and 0 across runs of the same
-      single-request test while stage 8 passed both times. }
+      severed reply. The GOAWAY-RACE-1 guards above prevent a 0 here for a
+      connection that had at least GOAWAY_GRACE_MS to process incoming HEADERS. }
     if FServer.DrainDiagnostics and IsConsole then
       DrainLog(Format('[drain] %s fd=%d %s final GOAWAY cutoff '
         + 'last_proc_stream_id=%d',

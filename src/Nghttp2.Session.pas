@@ -384,11 +384,21 @@ type
       must replay: a client receiving a final GOAWAY abandons every stream
       ABOVE this number. A value of 0 says "I processed nothing", so a peer
       with one open stream correctly gives up on it — indistinguishable at the
-      client from a severed reply. build-fpc.sh stage 8 has reported this as
-      13 on some runs and 0 on others for the SAME single-request test, while
-      passing both times, because it asserts only that two GOAWAY frames
-      appeared and never that the cutoff covers the streams in flight. }
+      client from a severed reply. GOAWAY-RACE-1 (fixed by the ShutdownNoticeSent
+      + elapsed guard in Nghttp2.Server's in-loop condition) caused this to read
+      0 in 3 of 5 stage 8 runs; build-fpc.sh stage 8 now asserts 13. }
     function LastProcStreamId: Integer;
+
+    { GOAWAY-RACE-1. Read-only accessors so the pump's in-loop condition can
+      gate the final GOAWAY on time elapsed since the notice was sent —
+      ensuring the notice is on the wire and the client has had a chance to
+      drain its in-flight requests before we commit to a cutoff.
+      The pump checks: ShutdownNoticeSent AND elapsed >= GOAWAY_GRACE_MS.
+      Without this gate the notice and the final go out in the SAME write
+      burst, giving last_proc_stream_id = 0 when the client's HEADERS arrive
+      in the gap between the two submissions. }
+    property ShutdownNoticeSent: Boolean   read FShutdownNoticeSent;
+    property ShutdownNoticeAt:   TDateTime read FShutdownNoticeAt;
 
     { Graceful-shutdown notice: GOAWAY carrying last_stream_id = 2^31-1 and
       NO_ERROR. Tells the peer to stop opening new streams while leaving every
@@ -1441,12 +1451,17 @@ begin
     that was processed from one it must replay — the entire reason RFC 9113
     describes two frames rather than one.
 
-    In practice the drain supplies far more than a round trip, because it
-    waits for in-flight work. The wait below only matters for the degenerate
-    case: an idle connection, where the drain completes at once and both
-    frames would otherwise be emitted back to back. Connections do this
-    concurrently, so it costs the shutdown one grace period in total, not one
-    per connection.
+    The primary enforcement is in the pump's in-loop GOAWAY condition (see
+    Nghttp2.Server): it requires ShutdownNoticeSent AND at least GOAWAY_GRACE_MS
+    to have elapsed, so the notice is on the wire and the peer has had a full
+    round trip to flush pipelined requests before we commit to a cutoff.
+
+    The sleep here is the FALLBACK for SendFarewell — the path taken when the
+    pump is forced out before the in-loop condition could fire (e.g. FStopping
+    raised before a request arrived). In that path the in-loop condition never
+    ran, so the elapsed check here is still meaningful. Connections draining
+    through the normal in-loop path will find LElapsed >= GOAWAY_GRACE_MS and
+    the sleep is a no-op.
 
     A PING/ACK exchange would measure the real round trip instead of assuming
     one. That is the more precise design and the natural next step if this
