@@ -220,8 +220,12 @@ type
     procedure EmitBoilerplate;
     procedure EmitUsesClause;
     procedure EmitStreamClass(ASvc: TProtoServiceNode; ARpc: TProtoRpcNode);
+    procedure EmitWriterCallClass(ASvc: TProtoServiceNode; ARpc: TProtoRpcNode);
+    procedure EmitBidiStreamClass(ASvc: TProtoServiceNode; ARpc: TProtoRpcNode);
     procedure EmitClientClass(ASvc: TProtoServiceNode);
     procedure EmitStreamImpl(ASvc: TProtoServiceNode; ARpc: TProtoRpcNode);
+    procedure EmitWriterCallImpl(ASvc: TProtoServiceNode; ARpc: TProtoRpcNode);
+    procedure EmitBidiStreamImpl(ASvc: TProtoServiceNode; ARpc: TProtoRpcNode);
     procedure EmitClientImpl(ASvc: TProtoServiceNode);
   public
     procedure Emit(AFile: TProtoFileNode;
@@ -233,6 +237,10 @@ type
     class function ClientClassName(const AServiceName: string): string;
     // 'TGreeterListGreetingsStream'
     class function StreamClassName(const AServiceName, ARpcName: string): string;
+    // 'TGreeterSayHelloCall'  (client streaming)
+    class function WriterCallClassName(const AServiceName, ARpcName: string): string;
+    // 'TGreeterSayHelloBidiStream'  (bidirectional streaming)
+    class function BidiStreamClassName(const AServiceName, ARpcName: string): string;
     // The client method name for an rpc. A reserved word, a TObject member
     // (Free, Create, Destroy, ClassName ...) or the client's own Channel gets
     // a trailing underscore: an rpc called Free must never hide TObject.Free,
@@ -980,6 +988,18 @@ begin
   Result := 'T' + AServiceName + ARpcName + 'Stream';
 end;
 
+class function TClientEmitter.WriterCallClassName(const AServiceName,
+  ARpcName: string): string;
+begin
+  Result := 'T' + AServiceName + ARpcName + 'Call';
+end;
+
+class function TClientEmitter.BidiStreamClassName(const AServiceName,
+  ARpcName: string): string;
+begin
+  Result := 'T' + AServiceName + ARpcName + 'BidiStream';
+end;
+
 { Members a generated client class inherits from TObject (Delphi and FPC), plus
   the ones it declares itself. Compared case-insensitively, as Pascal does. }
 function IsClientMemberName(const AName: string): Boolean;
@@ -1012,10 +1032,10 @@ begin
     Result := ARpcName;
 end;
 
-{ The rpcs a client unit emits code for: unary and server streaming. }
+{ The rpcs a client unit emits code for: all four shapes (GC5). }
 function ClientEmitsRpc(ARpc: TProtoRpcNode): Boolean;
 begin
-  Result := RpcShapeOf(ARpc) in [rsUnary, rsServerStream];
+  Result := RpcShapeOf(ARpc) in [rsUnary, rsServerStream, rsClientStream, rsBidiStream];
 end;
 
 function TClientEmitter.TypeRef(const ATypeName: string): string;
@@ -1087,8 +1107,14 @@ begin
       LSvc := FFile.Services[I];
       Claim(ClientClassName(LSvc.Name), 'client class');
       for J := 0 to LSvc.Rpcs.Count - 1 do
-        if RpcShapeOf(LSvc.Rpcs[J]) = rsServerStream then
-          Claim(StreamClassName(LSvc.Name, LSvc.Rpcs[J].Name), 'stream class');
+        case RpcShapeOf(LSvc.Rpcs[J]) of
+          rsServerStream:
+            Claim(StreamClassName(LSvc.Name, LSvc.Rpcs[J].Name), 'server-stream class');
+          rsClientStream:
+            Claim(WriterCallClassName(LSvc.Name, LSvc.Rpcs[J].Name), 'writer-call class');
+          rsBidiStream:
+            Claim(BidiStreamClassName(LSvc.Name, LSvc.Rpcs[J].Name), 'bidi-stream class');
+        end;
     end;
   finally
     LTaken.Free;
@@ -1143,6 +1169,54 @@ begin
   W('  end;');
 end;
 
+procedure TClientEmitter.EmitWriterCallClass(ASvc: TProtoServiceNode;
+  ARpc: TProtoRpcNode);
+var
+  LCls, LReq, LResp: string;
+begin
+  LCls  := WriterCallClassName(ASvc.Name, ARpc.Name);
+  LReq  := TypeRef(ARpc.RequestType);
+  LResp := TypeRef(ARpc.ResponseType);
+  W;
+  W('  // The client-stream call of ' + TInterfacesEmitter.RpcPath(FFile, ASvc, ARpc) + '.');
+  W('  // Send messages with Send; finish and receive the reply with CloseAndReceive.');
+  W('  // Freeing before CloseAndReceive abandons the call.');
+  W('  ' + LCls + ' = class');
+  W('  private');
+  W('    FCall: IGrpcClientWriterCall;');
+  W('  public');
+  W('    constructor Create(const ACall: IGrpcClientWriterCall);');
+  W('    procedure Send(ARequest: ' + LReq + ');');
+  W('    function CloseAndReceive: ' + LResp + ';');
+  W('  end;');
+end;
+
+procedure TClientEmitter.EmitBidiStreamClass(ASvc: TProtoServiceNode;
+  ARpc: TProtoRpcNode);
+var
+  LCls, LReq, LResp: string;
+begin
+  LCls  := BidiStreamClassName(ASvc.Name, ARpc.Name);
+  LReq  := TypeRef(ARpc.RequestType);
+  LResp := TypeRef(ARpc.ResponseType);
+  W;
+  W('  // The bidi stream of ' + TInterfacesEmitter.RpcPath(FFile, ASvc, ARpc) + '.');
+  W('  // Send with Send; half-close with CloseSend; receive with MoveNext/Current.');
+  W('  // Current is owned by the stream: freed by the next MoveNext and by Free.');
+  W('  ' + LCls + ' = class');
+  W('  private');
+  W('    FStream: IGrpcBidiStream;');
+  W('    function GetCurrent: ' + LResp + ';');
+  W('  public');
+  W('    constructor Create(const AStream: IGrpcBidiStream);');
+  W('    procedure Send(ARequest: ' + LReq + ');');
+  W('    procedure CloseSend;');
+  W('    function MoveNext: Boolean;');
+  W('    function Received: Integer;');
+  W('    property Current: ' + LResp + ' read GetCurrent;');
+  W('  end;');
+end;
+
 procedure TClientEmitter.EmitClientClass(ASvc: TProtoServiceNode);
 var
   I: Integer;
@@ -1180,9 +1254,20 @@ begin
           W('      const AOptions: TGrpcCallOptions): ' + LResp + '; overload;');
         end;
       rsClientStream:
-        W('    // ' + LRpc.Name + ': client streaming - not generated, TGrpcChannel has no such call yet');
-    else
-      W('    // ' + LRpc.Name + ': bidirectional streaming - not generated, TGrpcChannel has no such call yet');
+        begin
+          LReq  := TypeRef(LRpc.RequestType);
+          LResp := WriterCallClassName(ASvc.Name, LRpc.Name);
+          W('    function ' + LName + ': ' + LResp + '; overload;');
+          W('    function ' + LName + '(');
+          W('      const AOptions: TGrpcCallOptions): ' + LResp + '; overload;');
+        end;
+      rsBidiStream:
+        begin
+          LResp := BidiStreamClassName(ASvc.Name, LRpc.Name);
+          W('    function ' + LName + ': ' + LResp + '; overload;');
+          W('    function ' + LName + '(');
+          W('      const AOptions: TGrpcCallOptions): ' + LResp + '; overload;');
+        end;
     end;
   end;
   W('    property Channel: TGrpcChannel read FChannel;');
@@ -1201,6 +1286,73 @@ begin
   W('begin');
   W('  inherited Create;');
   W('  FStream := AStream;');
+  W('end;');
+  W;
+  W('function ' + LCls + '.MoveNext: Boolean;');
+  W('begin');
+  W('  Result := FStream.MoveNext;');
+  W('end;');
+  W;
+  W('function ' + LCls + '.GetCurrent: ' + LResp + ';');
+  W('begin');
+  W('  Result := ' + LResp + '(FStream.Current);');
+  W('end;');
+  W;
+  W('function ' + LCls + '.Received: Integer;');
+  W('begin');
+  W('  Result := FStream.Received;');
+  W('end;');
+end;
+
+procedure TClientEmitter.EmitWriterCallImpl(ASvc: TProtoServiceNode;
+  ARpc: TProtoRpcNode);
+var
+  LCls, LReq, LResp: string;
+begin
+  LCls  := WriterCallClassName(ASvc.Name, ARpc.Name);
+  LReq  := TypeRef(ARpc.RequestType);
+  LResp := TypeRef(ARpc.ResponseType);
+  W;
+  W('constructor ' + LCls + '.Create(const ACall: IGrpcClientWriterCall);');
+  W('begin');
+  W('  inherited Create;');
+  W('  FCall := ACall;');
+  W('end;');
+  W;
+  W('procedure ' + LCls + '.Send(ARequest: ' + LReq + ');');
+  W('begin');
+  W('  FCall.Send(ARequest);');
+  W('end;');
+  W;
+  W('function ' + LCls + '.CloseAndReceive: ' + LResp + ';');
+  W('begin');
+  W('  Result := ' + LResp + '(FCall.CloseAndReceive);');
+  W('end;');
+end;
+
+procedure TClientEmitter.EmitBidiStreamImpl(ASvc: TProtoServiceNode;
+  ARpc: TProtoRpcNode);
+var
+  LCls, LReq, LResp: string;
+begin
+  LCls  := BidiStreamClassName(ASvc.Name, ARpc.Name);
+  LReq  := TypeRef(ARpc.RequestType);
+  LResp := TypeRef(ARpc.ResponseType);
+  W;
+  W('constructor ' + LCls + '.Create(const AStream: IGrpcBidiStream);');
+  W('begin');
+  W('  inherited Create;');
+  W('  FStream := AStream;');
+  W('end;');
+  W;
+  W('procedure ' + LCls + '.Send(ARequest: ' + LReq + ');');
+  W('begin');
+  W('  FStream.Send(ARequest);');
+  W('end;');
+  W;
+  W('procedure ' + LCls + '.CloseSend;');
+  W('begin');
+  W('  FStream.CloseSend;');
   W('end;');
   W;
   W('function ' + LCls + '.MoveNext: Boolean;');
@@ -1241,38 +1393,74 @@ begin
     LPath := TInterfacesEmitter.RpcPath(FFile, ASvc, LRpc);
     LReq  := TypeRef(LRpc.RequestType);
     LResp := TypeRef(LRpc.ResponseType);
-    if RpcShapeOf(LRpc) = rsUnary then
-    begin
-      W;
-      W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + '): ' + LResp + ';');
-      W('begin');
-      W('  Result := ' + LResp + '(FChannel.Unary(''' + LPath + ''',');
-      W('    ARequest, ' + LResp + '));');
-      W('end;');
-      W;
-      W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + ';');
-      W('  const AOptions: TGrpcCallOptions): ' + LResp + ';');
-      W('begin');
-      W('  Result := ' + LResp + '(FChannel.Unary(''' + LPath + ''',');
-      W('    ARequest, ' + LResp + ', AOptions));');
-      W('end;');
-    end
-    else
-    begin
-      LStream := StreamClassName(ASvc.Name, LRpc.Name);
-      W;
-      W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + '): ' + LStream + ';');
-      W('begin');
-      W('  Result := ' + LStream + '.Create(FChannel.ServerStream(''' + LPath + ''',');
-      W('    ARequest, ' + LResp + '));');
-      W('end;');
-      W;
-      W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + ';');
-      W('  const AOptions: TGrpcCallOptions): ' + LStream + ';');
-      W('begin');
-      W('  Result := ' + LStream + '.Create(FChannel.ServerStream(''' + LPath + ''',');
-      W('    ARequest, ' + LResp + ', AOptions));');
-      W('end;');
+    case RpcShapeOf(LRpc) of
+      rsUnary:
+        begin
+          W;
+          W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + '): ' + LResp + ';');
+          W('begin');
+          W('  Result := ' + LResp + '(FChannel.Unary(''' + LPath + ''',');
+          W('    ARequest, ' + LResp + '));');
+          W('end;');
+          W;
+          W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + ';');
+          W('  const AOptions: TGrpcCallOptions): ' + LResp + ';');
+          W('begin');
+          W('  Result := ' + LResp + '(FChannel.Unary(''' + LPath + ''',');
+          W('    ARequest, ' + LResp + ', AOptions));');
+          W('end;');
+        end;
+      rsServerStream:
+        begin
+          LStream := StreamClassName(ASvc.Name, LRpc.Name);
+          W;
+          W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + '): ' + LStream + ';');
+          W('begin');
+          W('  Result := ' + LStream + '.Create(FChannel.ServerStream(''' + LPath + ''',');
+          W('    ARequest, ' + LResp + '));');
+          W('end;');
+          W;
+          W('function ' + LCls + '.' + LName + '(ARequest: ' + LReq + ';');
+          W('  const AOptions: TGrpcCallOptions): ' + LStream + ';');
+          W('begin');
+          W('  Result := ' + LStream + '.Create(FChannel.ServerStream(''' + LPath + ''',');
+          W('    ARequest, ' + LResp + ', AOptions));');
+          W('end;');
+        end;
+      rsClientStream:
+        begin
+          LStream := WriterCallClassName(ASvc.Name, LRpc.Name);
+          W;
+          W('function ' + LCls + '.' + LName + ': ' + LStream + ';');
+          W('begin');
+          W('  Result := ' + LStream + '.Create(FChannel.ClientStream(''' + LPath + ''',');
+          W('    ' + LResp + '));');
+          W('end;');
+          W;
+          W('function ' + LCls + '.' + LName + '(');
+          W('  const AOptions: TGrpcCallOptions): ' + LStream + ';');
+          W('begin');
+          W('  Result := ' + LStream + '.Create(FChannel.ClientStream(''' + LPath + ''',');
+          W('    ' + LResp + ', AOptions));');
+          W('end;');
+        end;
+      rsBidiStream:
+        begin
+          LStream := BidiStreamClassName(ASvc.Name, LRpc.Name);
+          W;
+          W('function ' + LCls + '.' + LName + ': ' + LStream + ';');
+          W('begin');
+          W('  Result := ' + LStream + '.Create(FChannel.BidiStream(''' + LPath + ''',');
+          W('    ' + LResp + '));');
+          W('end;');
+          W;
+          W('function ' + LCls + '.' + LName + '(');
+          W('  const AOptions: TGrpcCallOptions): ' + LStream + ';');
+          W('begin');
+          W('  Result := ' + LStream + '.Create(FChannel.BidiStream(''' + LPath + ''',');
+          W('    ' + LResp + ', AOptions));');
+          W('end;');
+        end;
     end;
   end;
 end;
@@ -1305,8 +1493,11 @@ begin
   begin
     LSvc := AFile.Services[I];
     for J := 0 to LSvc.Rpcs.Count - 1 do
-      if RpcShapeOf(LSvc.Rpcs[J]) = rsServerStream then
-        EmitStreamClass(LSvc, LSvc.Rpcs[J]);
+      case RpcShapeOf(LSvc.Rpcs[J]) of
+        rsServerStream: EmitStreamClass(LSvc, LSvc.Rpcs[J]);
+        rsClientStream: EmitWriterCallClass(LSvc, LSvc.Rpcs[J]);
+        rsBidiStream:   EmitBidiStreamClass(LSvc, LSvc.Rpcs[J]);
+      end;
     EmitClientClass(LSvc);
   end;
   W;
@@ -1315,8 +1506,11 @@ begin
   begin
     LSvc := AFile.Services[I];
     for J := 0 to LSvc.Rpcs.Count - 1 do
-      if RpcShapeOf(LSvc.Rpcs[J]) = rsServerStream then
-        EmitStreamImpl(LSvc, LSvc.Rpcs[J]);
+      case RpcShapeOf(LSvc.Rpcs[J]) of
+        rsServerStream: EmitStreamImpl(LSvc, LSvc.Rpcs[J]);
+        rsClientStream: EmitWriterCallImpl(LSvc, LSvc.Rpcs[J]);
+        rsBidiStream:   EmitBidiStreamImpl(LSvc, LSvc.Rpcs[J]);
+      end;
     EmitClientImpl(LSvc);
   end;
   W;

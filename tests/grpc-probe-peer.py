@@ -90,6 +90,16 @@ def main():
                     time.sleep(delay)
                 yield pb2.EchoReply(text='item%d' % i, num=i)
 
+        def Collect(self, request_iterator, context):
+            n = 0
+            for _ in request_iterator:
+                n += 1
+            return pb2.EchoReply(text='collected', num=n)
+
+        def StreamEcho(self, request_iterator, context):
+            for req in request_iterator:
+                yield pb2.EchoReply(text='echo:' + req.text, num=req.num + 1)
+
         def Meta(self, request, context):
             md = sorted((k, v) for k, v in context.invocation_metadata()
                         if k.startswith('x-'))

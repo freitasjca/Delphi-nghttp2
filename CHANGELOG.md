@@ -13,6 +13,7 @@ The project has been on `1.x` since its first public tag.
 
 | Version | Date | Headline |
 |---|---|---|
+| [1.29.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.29.0) | 2026-10-15 | client-streaming and bidirectional-streaming gRPC calls; generated stubs for all four RPC shapes |
 | [1.28.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.28.0) | 2026-10-14 | a gRPC client, and generated client stubs (`protogen --client`) |
 | [1.27.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.27.0) | 2026-10-12 | encrypted private keys never prompt on the terminal; key passwords sent as UTF-8 on Delphi |
 | [1.26.0](https://github.com/freitasjca/Delphi-nghttp2/releases/tag/1.26.0) | 2026-10-05 | HTTP/2 TLS 1.2 cipher check against the RFC 7540 block list |

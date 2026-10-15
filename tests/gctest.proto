@@ -37,4 +37,9 @@ service Probe {
   // message "stopped at K"; our dispatcher: 13 INTERNAL, same message);
   // text "slow" waits 300 ms before each message.
   rpc Count (EchoRequest) returns (stream EchoReply);
+  // GC5 client streaming: receives N EchoRequests, returns {text "collected", num N}.
+  rpc Collect (stream EchoRequest) returns (EchoReply);
+  // GC5 bidirectional streaming: echoes each request back as {text "echo:"+text, num+1}.
+  // Each reply is sent immediately after the request is received.
+  rpc StreamEcho (stream EchoRequest) returns (stream EchoReply);
 }

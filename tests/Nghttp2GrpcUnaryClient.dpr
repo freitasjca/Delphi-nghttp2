@@ -84,8 +84,10 @@ uses
 {$IF DEFINED(FPC)}
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils,
+  Classes,
 {$ELSE}
   System.SysUtils,
+  System.Classes,
 {$IFEND}
   Nghttp2.Types,
   Nghttp2.Native,
@@ -159,11 +161,28 @@ type
     procedure Empty(const AReq: TObject; const AResp: TObject);
     procedure Slow(const AReq: TObject; const AResp: TObject);
     procedure Count(const ARequest: TObject; const AWriter: IGrpcStreamWriter);
+    { GC5 client streaming: drain requests, return the count. }
+    procedure Collect(const AReader: IGrpcStreamReader; const AResp: TObject);
+    { GC5 bidi streaming: echo each request back immediately. }
+    procedure StreamEcho(const AReader: IGrpcStreamReader;
+      const AWriter: IGrpcStreamWriter);
   end;
 
   { GC2b: what a test client context trusts, and which certificate it shows. }
   TTrust      = (trNothing, trCa, trWrongCa, trInsecure);
   TClientCert = (ccNone, ccTrusted, ccUntrusted);
+
+  { Dispatches client-streaming and bidi-streaming calls off the connection
+    thread. TGrpcStreamReader.Next blocks; BeginAsyncDispatch / EndAsyncDispatch
+    let the server's Stop wait for completion before tearing the session down. }
+  TInboundDispatchThread = class(TThread)
+  private
+    FStream: INghttp2Stream;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AStream: INghttp2Stream);
+  end;
 
 var
   GPass: Integer = 0;
@@ -216,6 +235,26 @@ begin
 end;
 
 // ── Part A server ───────────────────────────────────────────────────────────
+
+constructor TInboundDispatchThread.Create(const AStream: INghttp2Stream);
+begin
+  inherited Create(True);
+  FStream := AStream;
+  FreeOnTerminate := True;
+end;
+
+procedure TInboundDispatchThread.Execute;
+begin
+  try
+    if not TGrpcDispatcher.TryDispatch(FStream) then
+    begin
+      FStream.StatusCode := 404;
+      FStream.Send(TEncoding.UTF8.GetBytes('not grpc'));
+    end;
+  finally
+    FStream.EndAsyncDispatch;
+  end;
+end;
 
 procedure TProbeService.Echo(const AReq: TObject; const AResp: TObject);
 begin
@@ -273,12 +312,57 @@ begin
   end;
 end;
 
-procedure HandleRequest(const AStream: INghttp2Stream);
+// GC5: receive all N client messages, return text="collected", num=N.
+procedure TProbeService.Collect(const AReader: IGrpcStreamReader;
+  const AResp: TObject);
+var
+  LMsg: TObject;
 begin
+  while AReader.Next(LMsg) do
+    ;  // just drain — AReader owns LMsg
+  TEchoReply(AResp).text := 'collected';
+  TEchoReply(AResp).num  := AReader.Count;
+end;
+
+{ GC5: echo each message back immediately — proves the send side is not
+  buffered to the end. }
+procedure TProbeService.StreamEcho(const AReader: IGrpcStreamReader;
+  const AWriter: IGrpcStreamWriter);
+var
+  LMsg:   TObject;
+  LReply: TEchoReply;
+begin
+  while AReader.Next(LMsg) do
+  begin
+    LReply := TEchoReply.Create;
+    LReply.text := 'echo:' + TEchoRequest(LMsg).text;
+    LReply.num  := TEchoRequest(LMsg).num + 1;
+    AWriter.Send(LReply);   // Send takes ownership
+  end;
+end;
+
+procedure HandleRequest(const AStream: INghttp2Stream);
+var
+  LThread: TInboundDispatchThread;
+begin
+  if TGrpcRegistry.IsInboundStreaming(AStream.Header[':path']) then
+  begin
+    AStream.BeginAsyncDispatch;
+    LThread := TInboundDispatchThread.Create(AStream);
+    LThread.Start;
+    Exit;
+  end;
   if TGrpcDispatcher.TryDispatch(AStream) then
     Exit;
   AStream.StatusCode := 404;
   AStream.Send(TEncoding.UTF8.GetBytes('not grpc'));
+end;
+
+// Routes client-streaming and bidi-streaming paths to the inbound queue
+// instead of buffering them in Body — required for TGrpcStreamReader.Next.
+function HandleShouldStreamInbound(const AStream: INghttp2Stream): Boolean;
+begin
+  Result := TGrpcRegistry.IsInboundStreaming(AStream.Header[':path']);
 end;
 
 // ── call helpers ────────────────────────────────────────────────────────────
@@ -664,6 +748,89 @@ begin
   end;
 end;
 
+{ GC5: client streaming (Collect) and bidirectional streaming (StreamEcho)
+  against our own TGrpcDispatcher. }
+procedure GC5PartA(AChannel: TGrpcChannel);
+const
+  N_MESSAGES = 1000;
+var
+  I:     Integer;
+  LReq:  TEchoRequest;
+  LReply: TEchoReply;
+  LCall: IGrpcClientWriterCall;
+  LBidi: IGrpcBidiStream;
+begin
+  WriteLn;
+  WriteLn('-- A6  GC5: client streaming (Collect) and bidi (StreamEcho)');
+  LReq := TEchoRequest.Create;
+  try
+    { ── client streaming: 1000 messages, server counts them ── }
+    LCall := nil;
+    try
+      LCall := AChannel.ClientStream('/gctest.Probe/Collect', TEchoReply);
+      for I := 1 to N_MESSAGES do
+      begin
+        LReq.text := 'msg' + IntToStr(I);
+        LReq.num  := I;
+        LCall.Send(LReq);
+      end;
+      LReply := TEchoReply(LCall.CloseAndReceive);   // caller owns result
+      LCall  := nil;
+      try
+        Check('A GC5 Collect 1000: text = collected',
+          LReply.text = 'collected', Format('text "%s"', [LReply.text]));
+        Check('A GC5 Collect 1000: num = 1000',
+          LReply.num = N_MESSAGES, Format('num %d', [LReply.num]));
+      finally
+        LReply.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        LCall := nil;
+        Check('A GC5 Collect 1000', False, E.ClassName + ': ' + E.Message);
+      end;
+    end;
+
+    { ── bidi streaming: send 1, read 1, repeat — proves no buffering ── }
+    LBidi := nil;
+    try
+      LBidi := AChannel.BidiStream('/gctest.Probe/StreamEcho', TEchoReply);
+      for I := 1 to 10 do
+      begin
+        LReq.text := 'ping' + IntToStr(I);
+        LReq.num  := I;
+        LBidi.Send(LReq);
+        if not LBidi.MoveNext then
+        begin
+          Check('A GC5 StreamEcho MoveNext ' + IntToStr(I), False, 'stream ended early');
+          Break;
+        end;
+        LReply := TEchoReply(LBidi.Current);
+        Check('A GC5 StreamEcho echo text ' + IntToStr(I),
+          LReply.text = 'echo:ping' + IntToStr(I),
+          Format('"%s"', [LReply.text]));
+        Check('A GC5 StreamEcho echo num ' + IntToStr(I),
+          LReply.num = I + 1,
+          Format('%d', [LReply.num]));
+      end;
+      LBidi.CloseSend;
+      Check('A GC5 StreamEcho ends cleanly after CloseSend', not LBidi.MoveNext);
+      Check('A GC5 StreamEcho received 10 messages', LBidi.Received = 10,
+        Format('received %d', [LBidi.Received]));
+      LBidi := nil;
+    except
+      on E: Exception do
+      begin
+        LBidi := nil;
+        Check('A GC5 StreamEcho', False, E.ClassName + ': ' + E.Message);
+      end;
+    end;
+  finally
+    LReq.Free;
+  end;
+end;
+
 procedure GC3PartA(AChannel: TGrpcChannel);
 const
   DEADLINE = 400;
@@ -762,9 +929,11 @@ begin
   WriteLn('-- A   our own server (TGrpcDispatcher) on port ', PORT);
   LServer := TNghttp2Server.Create;
   try
-    LServer.OnRequest := HandleRequest;
-    LConfig      := TNghttp2Config.Default;
-    LConfig.Port := PORT;
+    LServer.OnRequest              := HandleRequest;
+    LServer.OnShouldStreamInbound  := HandleShouldStreamInbound;
+    LConfig               := TNghttp2Config.Default;
+    LConfig.Port          := PORT;
+    LConfig.AsyncDispatch := True;
     LServer.Start(LConfig);
 
     LChannel := TGrpcChannel.Create('127.0.0.1', PORT);
@@ -783,6 +952,7 @@ begin
       GC3PartA(LChannel);
       GC4PartA(LChannel);
       StatusOnlyPartA(LChannel);
+      GC5PartA(LChannel);
     finally
       LChannel.Free;
     end;
@@ -872,6 +1042,86 @@ begin
   end;
 end;
 
+{ GC5 against grpcio: client streaming + bidi. }
+procedure GC5PartB(AChannel: TGrpcChannel);
+var
+  I:     Integer;
+  LReq:  TEchoRequest;
+  LReply: TEchoReply;
+  LCall: IGrpcClientWriterCall;
+  LBidi: IGrpcBidiStream;
+begin
+  WriteLn;
+  WriteLn('-- B6  GC5: Collect + StreamEcho against grpcio');
+  LReq := TEchoRequest.Create;
+  try
+    { ── client streaming: 1000 messages ── }
+    LCall := nil;
+    try
+      LCall := AChannel.ClientStream('/gctest.Probe/Collect', TEchoReply);
+      for I := 1 to 1000 do
+      begin
+        LReq.text := 'msg' + IntToStr(I);
+        LReq.num  := I;
+        LCall.Send(LReq);
+      end;
+      LReply := TEchoReply(LCall.CloseAndReceive);
+      LCall  := nil;
+      try
+        Check('B GC5 Collect 1000: text = collected',
+          LReply.text = 'collected', Format('"%s"', [LReply.text]));
+        Check('B GC5 Collect 1000: num = 1000',
+          LReply.num = 1000, Format('%d', [LReply.num]));
+      finally
+        LReply.Free;
+      end;
+    except
+      on E: Exception do
+      begin
+        LCall := nil;
+        Check('B GC5 Collect 1000', False, E.ClassName + ': ' + E.Message);
+      end;
+    end;
+
+    { ── bidi streaming: send 1, read 1, repeat ── }
+    LBidi := nil;
+    try
+      LBidi := AChannel.BidiStream('/gctest.Probe/StreamEcho', TEchoReply);
+      for I := 1 to 10 do
+      begin
+        LReq.text := 'ping' + IntToStr(I);
+        LReq.num  := I;
+        LBidi.Send(LReq);
+        if not LBidi.MoveNext then
+        begin
+          Check('B GC5 StreamEcho MoveNext ' + IntToStr(I), False, 'stream ended early');
+          Break;
+        end;
+        LReply := TEchoReply(LBidi.Current);
+        Check('B GC5 StreamEcho echo text ' + IntToStr(I),
+          LReply.text = 'echo:ping' + IntToStr(I),
+          Format('"%s"', [LReply.text]));
+        Check('B GC5 StreamEcho echo num ' + IntToStr(I),
+          LReply.num = I + 1,
+          Format('%d', [LReply.num]));
+      end;
+      LBidi.CloseSend;
+      Check('B GC5 StreamEcho ends cleanly after CloseSend', not LBidi.MoveNext);
+      Check('B GC5 StreamEcho received 10 messages', LBidi.Received = 10,
+        Format('received %d', [LBidi.Received]));
+      LBidi := nil;
+    except
+      on E: Exception do
+      begin
+        LBidi := nil;
+        Check('B GC5 StreamEcho', False, E.ClassName + ': ' + E.Message);
+      end;
+    end;
+  finally
+    LReq.Free;
+  end;
+end;
+
 procedure PartB(APort: Integer);
 var
   LChannel: TGrpcChannel;
@@ -902,6 +1152,7 @@ begin
 
     GC3PartB(LChannel);
     GC4PartB(LChannel);
+    GC5PartB(LChannel);
   finally
     LChannel.Free;
   end;
@@ -996,10 +1247,12 @@ var
 begin
   Result := TNghttp2Server.Create;
   try
-    Result.OnRequest  := HandleRequest;
+    Result.OnRequest             := HandleRequest;
+    Result.OnShouldStreamInbound := HandleShouldStreamInbound;
     Result.TlsContext := ACtx;          // borrowed; freed by the caller after Stop
-    LConfig      := TNghttp2Config.Default;
-    LConfig.Port := APort;
+    LConfig               := TNghttp2Config.Default;
+    LConfig.Port          := APort;
+    LConfig.AsyncDispatch := True;
     Result.Start(LConfig);
   except
     Result.Free;
@@ -1236,7 +1489,7 @@ var
   GService: TProbeService;
 
 begin
-  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS, GC3 deadlines/metadata, GC4 server streaming)');
+  WriteLn('Nghttp2GrpcUnaryClient - GC2: TGrpcChannel.Unary + EGrpcClientError (+ GC2b TLS, GC3 deadlines/metadata, GC4 server streaming, GC5 client+bidi streaming)');
 
   if not NghttpLoad then
   begin
@@ -1260,6 +1513,10 @@ begin
       TEchoRequest, TEchoReply, GService.Slow);
     TGrpcRegistry.RegisterServerStream('/gctest.Probe/Count',
       TEchoRequest, TEchoReply, GService.Count);
+    TGrpcRegistry.RegisterClientStream('/gctest.Probe/Collect',
+      TEchoRequest, TEchoReply, GService.Collect);
+    TGrpcRegistry.RegisterBidiStream('/gctest.Probe/StreamEcho',
+      TEchoRequest, TEchoReply, GService.StreamEcho);
     try
       try
         PartA;

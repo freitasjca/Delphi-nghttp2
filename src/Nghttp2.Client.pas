@@ -169,6 +169,16 @@ type
       status (>= 200): a 1xx informational block is followed by the real
       response headers, which must not be mistaken for trailers. }
     HeadersDone: Boolean;
+
+    { [GC5] Deferred outbound body (client/bidi streaming). Unlike ReqBody
+      (set once at submit time), bytes arrive incrementally via SendChunk.
+      ReadRequestBodyCallback returns NGHTTP2_ERR_DEFERRED when
+      OutboundQLen = 0 and OutboundEOF = False; it sets FLAG_EOF when
+      OutboundQLen = 0 and OutboundEOF = True. }
+    OutboundDeferred: Boolean;
+    OutboundQueue:    TBytes;
+    OutboundQLen:     Integer;
+    OutboundEOF:      Boolean;
   end;
 
   TNghttp2Client = class
@@ -285,7 +295,8 @@ type
       const APath:    string;
       const AHeaders: TNghttp2Headers;
       const ABody:    TBytes;
-      AStreamResponse: Boolean = False): Int32;
+      AStreamResponse: Boolean = False;
+      ADeferred:       Boolean = False): Int32;
     procedure PumpAll(ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS);
     function  TakeResponse(AStreamId: Int32): TNghttp2Response;
     function  PendingStreams: Integer;
@@ -333,6 +344,29 @@ type
       before the body ends; TakeResponse refuses while bytes are unread. }
     function  PeekResponseHeaders(AStreamId: Int32;
       out AResponse: TNghttp2Response): Boolean;
+
+    { [GC5] Opens a client-streaming or bidi-streaming request: a
+      data_provider is wired immediately but starts deferred (no bytes
+      queued). AStreamResponse = True for bidi (incremental receive);
+      False for client-stream (one accumulated response after FinishSending).
+      Returns the stream id; pass it to SendChunk and FinishSending. }
+    function  BeginStreamingRequest(
+      const AMethod:   string;
+      const APath:     string;
+      const AHeaders:  TNghttp2Headers;
+      AStreamResponse: Boolean = False): Int32;
+
+    { [GC5] Appends AData to the outbound queue of AStreamId, resumes the
+      deferred data provider, and flushes the session. Raises if AStreamId
+      does not exist, was not opened for deferred sending, or FinishSending
+      was already called. Empty AData is a no-op. }
+    procedure SendChunk(AStreamId: Int32; const AData: TBytes);
+
+    { [GC5] Half-closes the send side: marks EOF in the outbound queue,
+      resumes the data provider, and flushes — sending the trailing
+      DATA+END_STREAM frame. SendChunk raises after this. The receive side
+      (ReadChunk / TakeResponse) continues to work. }
+    procedure FinishSending(AStreamId: Int32);
 
     property Connected:       Boolean            read FConnected;
     property Host:            string             read FHost;
@@ -582,6 +616,37 @@ begin
   begin
     data_flags^ := NGHTTP2_DATA_FLAG_EOF;
     Exit(0);
+  end;
+
+  { [GC5] Deferred outbound path (client/bidi streaming). Unlike the
+    ReqBody path below (fixed buffer set at submit time), bytes arrive
+    incrementally via SendChunk. Return NGHTTP2_ERR_DEFERRED when nothing
+    is queued and FinishSending has not been called; the provider is woken
+    again by nghttp2_session_resume_data inside SendChunk / FinishSending. }
+  if LClient.FStreams[LIdx].OutboundDeferred then
+  begin
+    if LClient.FStreams[LIdx].OutboundQLen = 0 then
+    begin
+      if LClient.FStreams[LIdx].OutboundEOF then
+      begin
+        data_flags^ := NGHTTP2_DATA_FLAG_EOF;
+        Exit(0);
+      end;
+      Exit(NGHTTP2_ERR_DEFERRED);
+    end;
+    LToRead := LClient.FStreams[LIdx].OutboundQLen;
+    if LToRead > NativeInt(length) then
+      LToRead := NativeInt(length);
+    Move(LClient.FStreams[LIdx].OutboundQueue[0], buf^, LToRead);
+    if LToRead < LClient.FStreams[LIdx].OutboundQLen then
+      Move(LClient.FStreams[LIdx].OutboundQueue[LToRead],
+           LClient.FStreams[LIdx].OutboundQueue[0],
+           LClient.FStreams[LIdx].OutboundQLen - LToRead);
+    Dec(LClient.FStreams[LIdx].OutboundQLen, LToRead);
+    if (LClient.FStreams[LIdx].OutboundQLen = 0)
+       and LClient.FStreams[LIdx].OutboundEOF then
+      data_flags^ := NGHTTP2_DATA_FLAG_EOF;
+    Exit(LToRead);
   end;
 
   LRemaining := System.Length(LClient.FStreams[LIdx].ReqBody)
@@ -1042,7 +1107,8 @@ function TNghttp2Client.BeginRequest(
   const APath:    string;
   const AHeaders: TNghttp2Headers;
   const ABody:    TBytes;
-  AStreamResponse: Boolean): Int32;
+  AStreamResponse: Boolean;
+  ADeferred:       Boolean): Int32;
 var
   LNvs:         array of Tnghttp2_nv;
   LNames:       array of AnsiString;    // hold refs so PAnsiChar stays valid
@@ -1123,10 +1189,11 @@ begin
     LNvs[I].flags    := NGHTTP2_NV_FLAG_NONE;
   end;
 
-  // Wire up a data provider only when there's actually a body. nil data_prd
-  // tells libnghttp2 to set END_STREAM on the HEADERS frame — the right
-  // choice for GET/HEAD/DELETE and empty POSTs (both are legal per RFC 7540).
-  if Length(ABody) > 0 then
+  // Wire up a data provider only when there's a body, or when ADeferred=True
+  // (client/bidi streaming: body bytes arrive via SendChunk after submit,
+  // so END_STREAM must NOT be set on the HEADERS frame). For a nil provider,
+  // libnghttp2 sets END_STREAM on HEADERS: right for GET/DELETE/empty POST.
+  if (Length(ABody) > 0) or ADeferred then
   begin
     LProvider.source.ptr    := nil;   // not used — we get Self via user_data
     LProvider.read_callback := @ReadRequestBodyCallback;
@@ -1141,11 +1208,83 @@ begin
     raise ENghttp2Client.CreateFmt('nghttp2_submit_request: %d', [LStreamId]);
 
   LIdx := AllocSlot(LStreamId);
-  FStreams[LIdx].ReqBody    := ABody;
-  FStreams[LIdx].ReqBodyPos := 0;
-  FStreams[LIdx].Streaming  := AStreamResponse;   { [CL3] }
+  FStreams[LIdx].ReqBody          := ABody;
+  FStreams[LIdx].ReqBodyPos       := 0;
+  FStreams[LIdx].Streaming        := AStreamResponse;   { [CL3] }
+  FStreams[LIdx].OutboundDeferred := ADeferred;         { [GC5] }
 
   Result := LStreamId;
+end;
+
+{ [GC5] Thin wrapper: BeginRequest with ADeferred=True wires a data_provider
+  that starts deferred — nothing is queued at submit time. }
+function TNghttp2Client.BeginStreamingRequest(
+  const AMethod, APath: string;
+  const AHeaders: TNghttp2Headers;
+  AStreamResponse: Boolean): Int32;
+begin
+  Result := BeginRequest(AMethod, APath, AHeaders, nil, AStreamResponse, True);
+end;
+
+{ [GC5] Append AData to the outbound queue of AStreamId, resume the deferred
+  data provider and flush.  Empty AData is a no-op. }
+procedure TNghttp2Client.SendChunk(AStreamId: Int32; const AData: TBytes);
+var
+  LIdx:    Integer;
+  LOldLen: Integer;
+  LRet:    Integer;
+begin
+  LIdx := FindSlot(AStreamId);
+  if LIdx < 0 then
+    raise ENghttp2Client.CreateFmt('SendChunk: no such stream %d', [AStreamId]);
+  if not FStreams[LIdx].OutboundDeferred then
+    raise ENghttp2Client.CreateFmt(
+      'SendChunk: stream %d was not opened for deferred sending '
+      + '(use BeginStreamingRequest, not BeginRequest)', [AStreamId]);
+  if FStreams[LIdx].OutboundEOF then
+    raise ENghttp2Client.CreateFmt(
+      'SendChunk: FinishSending was already called on stream %d', [AStreamId]);
+  if Length(AData) = 0 then
+    Exit;
+
+  LOldLen := FStreams[LIdx].OutboundQLen;
+  if LOldLen + Length(AData) > Length(FStreams[LIdx].OutboundQueue) then
+    SetLength(FStreams[LIdx].OutboundQueue, LOldLen + Length(AData));
+  Move(AData[0], FStreams[LIdx].OutboundQueue[LOldLen], Length(AData));
+  Inc(FStreams[LIdx].OutboundQLen, Length(AData));
+
+  { Resume the deferred data provider so nghttp2 calls it again on the
+    next FlushSession.  NGHTTP2_ERR_INVALID_ARGUMENT means the stream has
+    not yet been deferred (first call before any FlushSession has run) —
+    safe to ignore: the provider will be called for the first time during
+    the flush below and will find data waiting. }
+  LRet := nghttp2_session_resume_data(FSession, AStreamId);
+  if (LRet <> 0) and (LRet <> NGHTTP2_ERR_INVALID_ARGUMENT) then
+    raise ENghttp2Client.CreateFmt(
+      'nghttp2_session_resume_data: %d (stream %d)', [LRet, AStreamId]);
+  FlushSession;
+end;
+
+{ [GC5] Mark the send side EOF, resume the deferred provider and flush.
+  The provider will see OutboundQLen=0 + OutboundEOF=True and emit
+  DATA+END_STREAM with a zero-length body, half-closing the send side. }
+procedure TNghttp2Client.FinishSending(AStreamId: Int32);
+var
+  LIdx: Integer;
+  LRet: Integer;
+begin
+  LIdx := FindSlot(AStreamId);
+  if LIdx < 0 then
+    raise ENghttp2Client.CreateFmt('FinishSending: no such stream %d', [AStreamId]);
+  if not FStreams[LIdx].OutboundDeferred then
+    raise ENghttp2Client.CreateFmt(
+      'FinishSending: stream %d was not opened for deferred sending', [AStreamId]);
+  FStreams[LIdx].OutboundEOF := True;
+  LRet := nghttp2_session_resume_data(FSession, AStreamId);
+  if (LRet <> 0) and (LRet <> NGHTTP2_ERR_INVALID_ARGUMENT) then
+    raise ENghttp2Client.CreateFmt(
+      'nghttp2_session_resume_data: %d (stream %d)', [LRet, AStreamId]);
+  FlushSession;
 end;
 
 { ─── MULTISTREAM-1 slot bookkeeping ─────────────────────────────────────── }
