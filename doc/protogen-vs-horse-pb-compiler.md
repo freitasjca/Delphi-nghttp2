@@ -55,7 +55,7 @@ so every claim is checkable.
 | nested `message`/`enum` | hoisted with a qualified name | **corrupts state** — `}` clears message *and* service (L142–146) |
 | `uint32`/`uint64` | yes | **no** — becomes a message reference, see below |
 | well-known types | Timestamp, Duration, FieldMask, Empty, wrappers | no |
-| service GUIDs | *(planned: deterministic)* | **random per run** (L237) |
+| service GUIDs | **deterministic** — FNV-1a hash of `pkg.Service` (`GuidFromServiceName`) | **random per run** (L237) |
 | generated units on FPC | dual-compile | emits `System.Classes` (L186), which does not exist there |
 | unsupported input | refused, naming the construct and the reason | mostly accepted and mis-translated |
 

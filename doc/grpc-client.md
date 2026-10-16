@@ -228,11 +228,43 @@ channels.
 
 ---
 
+## Client-streaming and bidirectional calls (since 1.29.0)
+
+`TGrpcChannel.ClientStream` opens a client-streaming call and
+`TGrpcChannel.BidiStream` a bidirectional one; each takes the method path, the
+response class, and optionally a `TGrpcCallOptions`.
+
+**Client-streaming** returns an `IGrpcClientWriterCall`: call `Send(ARequest)` as
+many times as needed, then `CloseAndReceive` for the single decoded reply. The
+caller still owns each request it sends and owns the reply it gets back.
+
+```pascal
+LCall := Channel.ClientStream('/inventory.Inventory/AddBatch', TAddReply);
+LReply := nil;
+try
+  for LItem in LItems do
+    LCall.Send(LItem);
+  LReply := TAddReply(LCall.CloseAndReceive);
+finally
+  LReply.Free;
+end;
+```
+
+**Bidirectional** returns an `IGrpcBidiStream`: interleave `Send(ARequest)` with
+`MoveNext` / `GetCurrent` to read replies, and `CloseSend` once done writing.
+As with server streaming, `MoveNext` returns False on a clean end and raises
+`EGrpcClientError` on a non-OK status after any earlier messages were delivered;
+`Received` counts the messages read so far.
+
+One call at a time per channel still holds — opening a second while a stream is
+live raises status 9, so open more channels for concurrency.
+
+---
+
 ## What is not there yet
 
 | Missing | Notes |
 |---|---|
-| Client streaming and bidi streaming | Deferred to a later release (B2 plan, GC5). They need the HTTP/2 client to send a request body while the stream is open, which is new library surface. |
 | Binary (`-bin`) metadata | Refused with `EArgumentException` rather than sent wrong. |
 | Message compression | A compressed reply is refused with 13. Requests are never compressed. |
 | A connection pool, async calls, retries, load balancing, name resolution | Out of scope for the channel. One channel is one connection. |

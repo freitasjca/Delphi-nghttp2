@@ -145,7 +145,7 @@ arrived here in **1.0.0**.
 | **Client verifies the server** — `TTlsClientContext.LoadVerifyLocations` / `UseSystemTrustStore`, certificate name check (DNS or IP), SNI | **✓** (1.28.0, GC2b — before it a client could not trust a CA or check a name, so every TLS client had to be `SetInsecure`) |
 | **Generated client stubs** — `protogen --client` → `<prefix>.Client.pas` | **✓** (1.28.0, GC6/GC7 — typed `T<Service>Client` and per-RPC stream wrappers; opt-in, so output without the flag is unchanged. `samples/inventory` calls itself and a grpcio server through them, stage 4m) |
 | **gRPC error replies carry no message — GRPC-STATUSONLY-1** | **✓** (1.28.0 — the dispatcher sent a zero-length MESSAGE before every error trailer (unknown method, decode error, handler exception), so a streaming client saw one empty message and then the error. Now an empty body, then the trailer. Found by the GC6 control run) |
-| gRPC client streaming and bidi from the client side | planned (GC5) — the server side of both has shipped since 1.0.0 |
+| **gRPC client streaming and bidi from the client side** | **✓** (1.29.0, GC5 — `BeginStreamingRequest` on `TNghttp2Client`; `IGrpcClientWriterCall` (client-streaming) and `IGrpcBidiStream` (bidi) on `TGrpcChannel`; `protogen --client` now emits typed wrappers for all four RPC shapes. Checked against our own server and a python `grpcio` peer on both compilers — client stream 1000 messages, bidi echo 10 rounds) |
 | Reusable session pool for high-concurrency clients | planned |
 | Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
 
