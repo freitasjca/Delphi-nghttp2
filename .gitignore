@@ -113,3 +113,9 @@ tests/qualref/out/
 # Session state an assistant tool writes into whatever folder it works in.
 # Two such files reached 1.27.0 via a copied fixtures folder; never commit them.
 **/.claude/autoharness/
+
+# Captured stdout from the TLS/cipher/version test runs, one file per toolchain
+# (<probe>-dcc.txt from Delphi, <probe>-fpc.txt from FPC): errmsg, h2cipher,
+# minver, osslver. Diagnostic output, never committed.
+*-dcc.txt
+*-fpc.txt
