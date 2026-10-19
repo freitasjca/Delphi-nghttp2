@@ -888,14 +888,15 @@ begin
       Pos(TightenPunctuation('RegisterServerStream(''/greeter.Greeter/ListGreetings'''),
         Normalize(EmitReg(LFile, 'Sample.Greeter'))) > 0);
 
-    // Client and bidi streaming: no call exists yet (GC5), so no method.
-    Check('client: no method for client streaming (GC5)',
-      Pos('function JoinNames', LCli) = 0);
-    Check('client: no method for bidi streaming (GC5)',
-      Pos('function ChatGreetings', LCli) = 0);
-    Check('  ... but both are named in a comment, not silently dropped',
-      (Pos('JoinNames: client streaming', LRaw) > 0) and
-      (Pos('ChatGreetings: bidirectional streaming', LRaw) > 0));
+    // Client and bidi streaming: GC5 (1.29.0) made these typed client methods.
+    // Neither takes an ARequest - the caller sends through the returned wrapper.
+    CheckHas('client: client-streaming method (GC5)', LCli,
+      'function JoinNames: TGreeterJoinNamesCall; overload;');
+    CheckHas('client: bidi-streaming method (GC5)', LCli,
+      'function ChatGreetings: TGreeterChatGreetingsBidiStream; overload;');
+    Check('  ... and each gets its own typed wrapper class, not a dropped stub',
+      (Pos(TightenPunctuation('TGreeterJoinNamesCall = class'), LCli) > 0) and
+      (Pos(TightenPunctuation('TGreeterChatGreetingsBidiStream = class'), LCli) > 0));
   finally
     LFile.Free;
   end;
