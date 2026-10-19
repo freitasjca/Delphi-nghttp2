@@ -32,6 +32,13 @@
 #                                       MaxClientsPerKey ceiling, N threads x M
 #                                       requests, idle eviction. Starts a server;
 #                                       skips LOUDLY when libnghttp2 is absent.)
+#    4o Nghttp2ClientFailure            build + run   (gates; CL5.5 — client
+#                                       reliability: RST mid-response, GOAWAY,
+#                                       truncated body, abrupt close, each must
+#                                       raise + leave no open stream + free
+#                                       cleanly. Part A in-process control always
+#                                       runs; Part B needs python h2
+#                                       (client-failure-peer.py) and SKIPS LOUDLY.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -960,6 +967,80 @@ else
     echo "  FAIL  Nghttp2ClientTrailers.dpr did not compile"
     grep -E "Error|Fatal" "$CTOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $CTOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── client reliability: failure paths (CL5.5) ────────────────────────────────
+# TNghttp2Client under adverse peers (client-failure-peer.py, python h2): RST
+# mid-response, GOAWAY(last_stream_id=0), a truncated body, an abrupt close -
+# each must raise, leave no open stream (PendingStreams=0), and free cleanly.
+# Part A (in-process control) always runs; Part B SKIPS LOUDLY without python
+# h2, since TNghttp2Server cannot produce these shapes.
+echo
+echo "── client reliability: failure paths (CL5.5) ─────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientFailure.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientFailure.dpr not present"
+else
+  CFOUT="$OUT/client-failure"
+  mkdir -p "$CFOUT"
+  rm -f "$CFOUT"/*.ppu "$CFOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$CFOUT" -FE"$CFOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientFailure.dpr" > "$CFOUT/build.log" 2>&1 \
+     && [[ -x "$CFOUT/Nghttp2ClientFailure" ]]; then
+
+    CF_PY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then CF_PY="$CAND"; break; fi
+    done
+
+    CF_PEER_PID=""
+    CF_ARGS=""
+    if [[ -n "$CF_PY" ]]; then
+      "$CF_PY" "$HERE/client-failure-peer.py" 19328 --lifetime 60 \
+        > "$CFOUT/peer.log" 2>&1 &
+      CF_PEER_PID=$!
+      for _ in $(seq 1 50); do
+        grep -q '^READY' "$CFOUT/peer.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$CFOUT/peer.log" 2>/dev/null; then
+        CF_ARGS="peer=19328"
+      else
+        echo "  NOTE  the h2 peer did not start - see $CFOUT/peer.log"
+      fi
+    else
+      echo "  NOTE  no python with h2 (set H2_PYTHON, or pip install h2 into"
+      echo "        tools/protogen/.venv) - Part B will SKIP"
+    fi
+
+    timeout 60 "$CFOUT/Nghttp2ClientFailure" $CF_ARGS < /dev/null | sed 's/^/  /'
+    CF_RC=${PIPESTATUS[0]}
+    [[ -n "$CF_PEER_PID" ]] && kill "$CF_PEER_PID" 2>/dev/null
+    wait "$CF_PEER_PID" 2>/dev/null || true
+
+    case "$CF_RC" in
+      0)   if [[ -n "$CF_ARGS" ]]; then
+             echo "  client failure paths: PASSED (both parts)"
+           else
+             echo "  client failure paths: Part A PASSED - Part B SKIPPED, the"
+             echo "        adverse paths were NOT exercised by this run"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - the failure paths were NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s (a failure path hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  client failure paths"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientFailure.dpr did not compile"
+    grep -E "Error|Fatal" "$CFOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $CFOUT/build.log"
     RC=2
   fi
 fi

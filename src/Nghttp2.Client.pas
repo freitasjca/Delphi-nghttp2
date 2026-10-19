@@ -257,6 +257,14 @@ type
     function DoSendAll(ABuf: Pointer; ALen: Integer): Boolean;
 
     function MilliSecondsSince(const AStart: TDateTime): Int64;
+
+    { CL5.5 — mark every still-open stream closed-with-error on a connection
+      drop. OnStreamCloseCb frees a slot on RST_STREAM/GOAWAY, but a bare socket
+      EOF fires no nghttp2 callback, so without this the stream slot leaks
+      (PendingStreams stays up on a reused client, the FIX-SLOT-RESET-1 hazard).
+      Mirrors OnStreamCloseCb: Done := True plus an Error so TakeResponse raises
+      rather than handing back a partial body as success. }
+    procedure FailOpenStreams(const AReason: string);
   public
     constructor Create;
     destructor  Destroy; override;
@@ -1043,6 +1051,19 @@ begin
   Result := Round((Now - AStart) * 86400.0 * 1000.0);
 end;
 
+procedure TNghttp2Client.FailOpenStreams(const AReason: string);
+var
+  I: Integer;
+begin
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and (not FStreams[I].Done) then
+    begin
+      FStreams[I].Done := True;
+      if FStreams[I].Error = '' then
+        FStreams[I].Error := AReason;
+    end;
+end;
+
 procedure TNghttp2Client.PumpUntilDone(ATimeoutMS: Integer);
 var
   LStart: TDateTime;
@@ -1088,11 +1109,21 @@ begin
     if LTimedOut then
       Continue;
     if LRecvLen <= 0 then
+    begin
+      { CL5.5 — close the open stream slots before raising. A bare socket EOF
+        fires no on_stream_close, so without this each open stream's slot would
+        leak (PendingStreams stays up) on a client that is reused rather than
+        freed. }
+      FailOpenStreams('peer closed connection before stream end');
       raise ENghttp2Client.Create('peer closed connection before stream end');
+    end;
 
     LConsumed := nghttp2_session_mem_recv(FSession, @FRecvBuffer[0], LRecvLen);
     if LConsumed < 0 then
+    begin
+      FailOpenStreams(Format('nghttp2_session_mem_recv: %d', [LConsumed]));
       raise ENghttp2Client.CreateFmt('nghttp2_session_mem_recv: %d', [LConsumed]);
+    end;
   end;
 
   FlushSession;   // final flush of anything callbacks queued

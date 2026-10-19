@@ -28,6 +28,12 @@ REM                                       acquire/release, reuse, the ceiling, N
 REM                                       threads x M requests, idle eviction.
 REM                                       Starts a server; skips LOUDLY when
 REM                                       libnghttp2 is absent.)
+REM    4o Nghttp2ClientFailure            build + run   (gates; CL5.5 — client
+REM                                       reliability: RST, GOAWAY, truncated
+REM                                       body, abrupt close, each must raise +
+REM                                       leave no open stream + free cleanly.
+REM                                       Part A control always runs; Part B
+REM                                       needs python h2 and SKIPS LOUDLY.)
 REM    4c Nghttp2AlpnMismatch             build + run   (gates; the only stage
 REM                                       whose PEER is openssl rather than our
 REM                                       own server. Skips LOUDLY without it.)
@@ -651,6 +657,75 @@ echo -- Nghttp2ClientTrailers --------------------------------------------------
 echo    SKIP  Nghttp2ClientTrailers.dpr not present
 
 :after_trailers
+
+REM -- Stage 4o. Client reliability: failure paths (CL5.5). ----------------
+REM TNghttp2Client under adverse peers (client-failure-peer.py, python h2):
+REM RST mid-response, GOAWAY(last_stream_id=0), truncated body, abrupt close -
+REM each must raise, leave no open stream, and free cleanly. Part A (in-process
+REM control) always runs; Part B needs python h2 and SKIPS LOUDLY without it.
+REM The peer is started in a TITLED window and killed BY THAT TITLE with /T.
+if not exist "Nghttp2ClientFailure.dpr" goto :no_failure
+echo -- Nghttp2ClientFailure ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientFailure.dpr" > "Nghttp2ClientFailure.buildlog" 2>&1
+if errorlevel 1 goto :failure_buildfail
+if not exist "Nghttp2ClientFailure.exe" goto :failure_buildfail
+
+set "CFPY="
+for %%P in (py python) do if not defined CFPY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "CFPY=%%P"
+)
+set "CFARGS="
+set "CFTITLE=NGHTTP2FAILPEER"
+if not defined CFPY goto :failure_nopeer
+start "!CFTITLE!" /min !CFPY! "client-failure-peer.py" 19328 --lifetime 60
+ping -n 3 127.0.0.1 > nul
+set "CFARGS=peer=19328"
+goto :failure_run
+
+:failure_nopeer
+echo    NOTE  no Python with the h2 package ^(pip install h2^) - Part B will SKIP
+
+:failure_run
+Nghttp2ClientFailure.exe !CFARGS! < nul
+set "CF_RC=!errorlevel!"
+if defined CFPY taskkill /FI "WINDOWTITLE eq !CFTITLE!" /T /F > nul 2>&1
+echo.
+if "!CF_RC!"=="3" goto :failure_skip
+if not "!CF_RC!"=="0" goto :failure_fail
+if not defined CFPY goto :failure_partial
+echo    PASS  Nghttp2ClientFailure - both parts
+goto :after_failure
+
+:failure_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2ClientFailure - Part A only. SKIP Part B: the adverse
+echo          paths were NOT exercised by this run
+goto :after_failure
+
+:failure_fail
+echo    FAIL  Nghttp2ClientFailure - !CF_RC!
+set /a FAILED+=1
+goto :after_failure
+
+:failure_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientFailure - libnghttp2 absent; failure paths NOT exercised
+goto :after_failure
+
+:failure_buildfail
+echo    FAIL  Nghttp2ClientFailure did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientFailure.buildlog"
+echo.
+echo    Full log: Nghttp2ClientFailure.buildlog
+set /a FAILED+=1
+goto :after_failure
+
+:no_failure
+echo -- Nghttp2ClientFailure ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientFailure.dpr not present
+
+:after_failure
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM
