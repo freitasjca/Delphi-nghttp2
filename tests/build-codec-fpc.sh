@@ -27,6 +27,11 @@
 #    3c Nghttp2ServerSmoke              build + run   (gates; the only stage
 #                                       that STARTS a server. Skips LOUDLY
 #                                       when libnghttp2 is absent.)
+#    4n Nghttp2ClientPool               build + run   (gates; CL5 — session pool:
+#                                       acquire/release, connection reuse, the
+#                                       MaxClientsPerKey ceiling, N threads x M
+#                                       requests, idle eviction. Starts a server;
+#                                       skips LOUDLY when libnghttp2 is absent.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -551,6 +556,43 @@ if [[ -f "$HERE/Nghttp2ServerSmoke.dpr" ]]; then
   fi
 else
   echo "  SKIP  Nghttp2ServerSmoke.dpr not present"
+fi
+
+# ── client session pool (CL5) ────────────────────────────────────────────────
+# TNghttp2ClientPool over an in-process server: acquire/release round-trip,
+# connection reuse, MaxClientsPerKey ceiling enforcement, N threads x M requests
+# with no corruption and the ceiling respected, and observable idle eviction.
+# Same loud-skip contract as the smoke stage: exit 3 (libnghttp2 absent) is a
+# SKIP, not a pass. The pool's concurrency/lifecycle behaviour is not protocol
+# behaviour, so our own server is the correct peer here.
+echo
+echo "── client session pool (CL5) ─────────────────────────────────────────"
+if [[ -f "$HERE/Nghttp2ClientPool.dpr" ]]; then
+  CPOUT="$OUT/client-pool"
+  mkdir -p "$CPOUT"
+  rm -f "$CPOUT"/*.ppu "$CPOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$CPOUT" -FE"$CPOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientPool.dpr" > "$CPOUT/build.log" 2>&1 \
+     && [[ -x "$CPOUT/Nghttp2ClientPool" ]]; then
+    "$CPOUT/Nghttp2ClientPool" < /dev/null | sed 's/^/  /'
+    CP_RC=${PIPESTATUS[0]}
+    case "$CP_RC" in
+      0) echo "  client pool: PASSED" ;;
+      3) echo "  SKIP  libnghttp2 absent - the pool was NOT exercised by this run." ;;
+      *) echo "  FAIL  client session pool"
+         [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientPool.dpr did not compile"
+    grep -E "Error|Fatal" "$CPOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $CPOUT/build.log"
+    RC=2
+  fi
+else
+  echo "  SKIP  Nghttp2ClientPool.dpr not present"
 fi
 
 # ── ALPN refusal (CL2b) — the first stage with a peer that is NOT ours ───────

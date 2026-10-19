@@ -23,6 +23,11 @@ REM    4  Nghttp2ProtobufConformance      build + run   (gates on BROKEN only)
 REM    4b Nghttp2ServerSmoke              build + run   (gates; the only stage
 REM                                       that starts a server. Skips LOUDLY
 REM                                       when libnghttp2 is absent.)
+REM    4n Nghttp2ClientPool               build + run   (gates; CL5 — session pool:
+REM                                       acquire/release, reuse, the ceiling, N
+REM                                       threads x M requests, idle eviction.
+REM                                       Starts a server; skips LOUDLY when
+REM                                       libnghttp2 is absent.)
 REM    4c Nghttp2AlpnMismatch             build + run   (gates; the only stage
 REM                                       whose PEER is openssl rather than our
 REM                                       own server. Skips LOUDLY without it.)
@@ -189,6 +194,19 @@ REM it needs no curl, no grpcurl and no fixture. Exit 3 means libnghttp2 is
 REM absent: reported as a LOUD skip rather than a pass, because a quiet skip is
 REM indistinguishable from a green stage and that is the failure being fixed.
 set "STAGE=Nghttp2ServerSmoke"
+set "GATES=1"
+set "SKIPRC=3"
+call :build_run
+
+REM -- Stage 4n. Client session pool (CL5). Starts a server, like 4b. --
+REM
+REM TNghttp2ClientPool over an in-process server: acquire/release, connection
+REM reuse, the MaxClientsPerKey ceiling, N threads x M requests with no
+REM corruption and the ceiling respected, and observable idle eviction. Exit 3
+REM (libnghttp2 absent) is a LOUD skip, not a pass. The pool's concurrency and
+REM lifecycle behaviour is not protocol behaviour, so our own server is the
+REM correct peer. Same bare-exe shape as 4b, so :build_run drives it.
+set "STAGE=Nghttp2ClientPool"
 set "GATES=1"
 set "SKIPRC=3"
 call :build_run
