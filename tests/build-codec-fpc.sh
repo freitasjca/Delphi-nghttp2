@@ -39,6 +39,11 @@
 #                                       cleanly. Part A in-process control always
 #                                       runs; Part B needs python h2
 #                                       (client-failure-peer.py) and SKIPS LOUDLY.)
+#    4p Nghttp2ClientPoolFailure        build + run   (gates; CL5.5 — pool-level
+#                                       reliability: a failed request on a leased
+#                                       connection leaks no slot, and a re-Acquire
+#                                       on the same key yields a USABLE client.
+#                                       Reuses client-failure-peer.py; SKIPS LOUDLY.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1041,6 +1046,81 @@ else
     echo "  FAIL  Nghttp2ClientFailure.dpr did not compile"
     grep -E "Error|Fatal" "$CFOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $CFOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── pool reliability: failure under the pool (CL5.5) ─────────────────────────
+# TNghttp2ClientPool under the same adverse peer: after a request fails on a
+# leased connection, the pool must not leak the slot (InUseCount back to 0,
+# TotalCount unchanged) and must hand back a USABLE client on the next Acquire
+# for that key (capped at 1, so it is the same entry revived, not a second
+# connection). Part A (in-process control) always runs; Part B SKIPS LOUDLY
+# without python h2.
+echo
+echo "── pool reliability: failure under the pool (CL5.5) ──────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientPoolFailure.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientPoolFailure.dpr not present"
+else
+  PFOUT="$OUT/client-pool-failure"
+  mkdir -p "$PFOUT"
+  rm -f "$PFOUT"/*.ppu "$PFOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$PFOUT" -FE"$PFOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientPoolFailure.dpr" > "$PFOUT/build.log" 2>&1 \
+     && [[ -x "$PFOUT/Nghttp2ClientPoolFailure" ]]; then
+
+    PF_PY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then PF_PY="$CAND"; break; fi
+    done
+
+    PF_PEER_PID=""
+    PF_ARGS=""
+    if [[ -n "$PF_PY" ]]; then
+      "$PF_PY" "$HERE/client-failure-peer.py" 19329 --lifetime 60 \
+        > "$PFOUT/peer.log" 2>&1 &
+      PF_PEER_PID=$!
+      for _ in $(seq 1 50); do
+        grep -q '^READY' "$PFOUT/peer.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$PFOUT/peer.log" 2>/dev/null; then
+        PF_ARGS="peer=19329"
+      else
+        echo "  NOTE  the h2 peer did not start - see $PFOUT/peer.log"
+      fi
+    else
+      echo "  NOTE  no python with h2 (set H2_PYTHON, or pip install h2 into"
+      echo "        tools/protogen/.venv) - Part B will SKIP"
+    fi
+
+    timeout 60 "$PFOUT/Nghttp2ClientPoolFailure" $PF_ARGS < /dev/null | sed 's/^/  /'
+    PF_RC=${PIPESTATUS[0]}
+    [[ -n "$PF_PEER_PID" ]] && kill "$PF_PEER_PID" 2>/dev/null
+    wait "$PF_PEER_PID" 2>/dev/null || true
+
+    case "$PF_RC" in
+      0)   if [[ -n "$PF_ARGS" ]]; then
+             echo "  pool failure paths: PASSED (both parts)"
+           else
+             echo "  pool failure paths: Part A PASSED - Part B SKIPPED, the"
+             echo "        pool-level adverse paths were NOT exercised by this run"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - the pool failure paths were NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s (a pool failure path hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  pool failure paths"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientPoolFailure.dpr did not compile"
+    grep -E "Error|Fatal" "$PFOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $PFOUT/build.log"
     RC=2
   fi
 fi

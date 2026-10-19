@@ -746,8 +746,11 @@ begin
     Exit;
 
   { [CL4] Different endpoint, or a GOAWAY was received — tear down the old
-    session first, then open a fresh one below. }
-  if FConnected then
+    session first, then open a fresh one below.
+    [CL5.5 FIX-DROP-DEAD-1] Also tear down a session a mid-request drop left
+    behind: FConnected is False there, but FSession/FSocket are still open and
+    must be freed before a fresh connect rather than leaked. }
+  if FConnected or (FSession <> nil) or (FSocket <> INVALID_SOCKET_HANDLE) then
     Disconnect;
 
   FHost := AHost;
@@ -1115,6 +1118,11 @@ begin
         leak (PendingStreams stays up) on a client that is reused rather than
         freed. }
       FailOpenStreams('peer closed connection before stream end');
+      { CL5.5 pool recovery (FIX-DROP-DEAD-1): the transport is gone. Mark the
+        connection dead so the next Connect/Reconnect reopens it rather than the
+        CL4 fast-path silently reusing a session whose socket the peer closed.
+        FSession/FSocket are left for that Connect to tear down (widened guard). }
+      FConnected := False;
       raise ENghttp2Client.Create('peer closed connection before stream end');
     end;
 
@@ -1122,6 +1130,9 @@ begin
     if LConsumed < 0 then
     begin
       FailOpenStreams(Format('nghttp2_session_mem_recv: %d', [LConsumed]));
+      { CL5.5 pool recovery (FIX-DROP-DEAD-1): the session is unusable - mark it
+        dead so the next Connect/Reconnect reopens it (see the EOF branch above). }
+      FConnected := False;
       raise ENghttp2Client.CreateFmt('nghttp2_session_mem_recv: %d', [LConsumed]);
     end;
   end;
@@ -1530,7 +1541,9 @@ procedure TNghttp2Client.Reconnect;
 begin
   if FHost = '' then
     raise ENghttp2Client.Create('Reconnect: Connect was never called');
-  if FConnected then
+  { [CL5.5 FIX-DROP-DEAD-1] FConnected is False after a mid-request drop, but
+    FSession/FSocket may still be open - tear them down too, not just a live one. }
+  if FConnected or (FSession <> nil) or (FSocket <> INVALID_SOCKET_HANDLE) then
     Disconnect;   // also resets FGoAwayReceived + FPingPending
   FGoAwayReceived := False;   // Disconnect already cleared it; set once more for clarity
   Connect(FHost, FPort);

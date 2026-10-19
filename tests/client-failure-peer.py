@@ -8,8 +8,9 @@ request :path:
   /ok          HEADERS 200 + DATA "ok" + END_STREAM     (control: the peer works)
   /rst         HEADERS 200, then RST_STREAM(INTERNAL_ERROR) - the stream is reset
                after the response starts but before it finishes
-  /goaway      GOAWAY(last_stream_id=0), then the socket closes - the server
-               declares it processed NO stream, so the request is safe to replay
+  /goaway      GOAWAY(last_stream_id=0), then a GRACEFUL close (FIN + drain, so
+               the GOAWAY is delivered before any close) - the server declares it
+               processed NO stream, so the request is safe to replay
   /truncated   HEADERS 200 + a partial DATA frame WITHOUT END_STREAM, then the
                socket closes under the client (an incomplete body, not a clean end)
   /abrupt      nothing at all - the socket closes before any response byte
@@ -33,32 +34,33 @@ import h2.events
 
 
 def respond(conn, stream_id, path):
-    # Returns True to keep the connection open, False to close it now.
+    # Returns one of: 'keep' (leave the connection open), 'close' (close it now),
+    # 'goaway' (flush the GOAWAY, then close GRACEFULLY - see serve()).
     if path == '/ok':
         conn.send_headers(stream_id, [(':status', '200'),
                                       ('content-type', 'text/plain')])
         conn.send_data(stream_id, b'ok', end_stream=True)
-        return True
+        return 'keep'
     if path == '/rst':
         conn.send_headers(stream_id, [(':status', '200'),
                                       ('content-type', 'text/plain')])
         conn.reset_stream(stream_id,
                           error_code=h2.errors.ErrorCodes.INTERNAL_ERROR)
-        return True
+        return 'keep'
     if path == '/goaway':
         # last_stream_id 0 => no stream was processed; the client's request is
         # safe to replay on a fresh connection.
         conn.close_connection(error_code=h2.errors.ErrorCodes.NO_ERROR,
                               last_stream_id=0)
-        return False
+        return 'goaway'
     if path == '/truncated':
         conn.send_headers(stream_id, [(':status', '200'),
                                       ('content-type', 'text/plain')])
         # No END_STREAM: more is promised, but the socket closes below.
         conn.send_data(stream_id, b'partial', end_stream=False)
-        return False
+        return 'close'
     # /abrupt (and anything else): send nothing, close immediately.
-    return False
+    return 'close'
 
 
 def serve(sock):
@@ -70,17 +72,32 @@ def serve(sock):
         data = sock.recv(65535)
         if not data:
             return
-        keep = True
+        action = 'keep'
         for event in conn.receive_data(data):
             if isinstance(event, h2.events.RequestReceived):
                 path = dict(event.headers).get(':path', '')
-                keep = respond(conn, event.stream_id, path)
+                action = respond(conn, event.stream_id, path)
             elif isinstance(event, h2.events.ConnectionTerminated):
                 return
         out = conn.data_to_send()
         if out:
             sock.sendall(out)
-        if not keep:
+        if action == 'goaway':
+            # The GOAWAY is now on the wire. Close GRACEFULLY: send FIN after it
+            # (half-close), then drain whatever the client still sends until it
+            # closes. A plain close() here leaves the client's unread bytes in
+            # this socket's buffer, so Windows answers with an RST that discards
+            # the just-sent GOAWAY before the client reads it - and the client
+            # then never sets GoAwayReceived. Draining first avoids that RST.
+            try:
+                sock.shutdown(socket.SHUT_WR)
+                sock.settimeout(2.0)
+                while sock.recv(65535):
+                    pass
+            except OSError:
+                pass
+            return
+        if action != 'keep':
             return
 
 

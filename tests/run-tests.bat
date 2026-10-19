@@ -34,6 +34,11 @@ REM                                       body, abrupt close, each must raise +
 REM                                       leave no open stream + free cleanly.
 REM                                       Part A control always runs; Part B
 REM                                       needs python h2 and SKIPS LOUDLY.)
+REM    4p Nghttp2ClientPoolFailure        build + run   (gates; CL5.5 - pool-
+REM                                       level reliability: a failed request
+REM                                       on a leased connection leaks no slot,
+REM                                       and a re-Acquire on the same key
+REM                                       yields a USABLE client. SKIPS LOUDLY.)
 REM    4c Nghttp2AlpnMismatch             build + run   (gates; the only stage
 REM                                       whose PEER is openssl rather than our
 REM                                       own server. Skips LOUDLY without it.)
@@ -726,6 +731,74 @@ echo -- Nghttp2ClientFailure ---------------------------------------------------
 echo    SKIP  Nghttp2ClientFailure.dpr not present
 
 :after_failure
+
+REM -- Stage 4p. Pool reliability: failure under the pool (CL5.5). ----------
+REM TNghttp2ClientPool under the adverse peer: after a request fails on a
+REM leased connection the pool leaks no slot (InUseCount 0, TotalCount kept)
+REM and hands back a USABLE client on the next Acquire for that key. Part A
+REM (in-process control) always runs; Part B needs python h2 and SKIPS LOUDLY.
+if not exist "Nghttp2ClientPoolFailure.dpr" goto :no_poolfail
+echo -- Nghttp2ClientPoolFailure ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientPoolFailure.dpr" > "Nghttp2ClientPoolFailure.buildlog" 2>&1
+if errorlevel 1 goto :poolfail_buildfail
+if not exist "Nghttp2ClientPoolFailure.exe" goto :poolfail_buildfail
+
+set "PFPY="
+for %%P in (py python) do if not defined PFPY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "PFPY=%%P"
+)
+set "PFARGS="
+set "PFTITLE=NGHTTP2POOLFAILPEER"
+if not defined PFPY goto :poolfail_nopeer
+start "!PFTITLE!" /min !PFPY! "client-failure-peer.py" 19329 --lifetime 60
+ping -n 3 127.0.0.1 > nul
+set "PFARGS=peer=19329"
+goto :poolfail_run
+
+:poolfail_nopeer
+echo    NOTE  no Python with the h2 package ^(pip install h2^) - Part B will SKIP
+
+:poolfail_run
+Nghttp2ClientPoolFailure.exe !PFARGS! < nul
+set "PF_RC=!errorlevel!"
+if defined PFPY taskkill /FI "WINDOWTITLE eq !PFTITLE!" /T /F > nul 2>&1
+echo.
+if "!PF_RC!"=="3" goto :poolfail_skip
+if not "!PF_RC!"=="0" goto :poolfail_fail
+if not defined PFPY goto :poolfail_partial
+echo    PASS  Nghttp2ClientPoolFailure - both parts
+goto :after_poolfail
+
+:poolfail_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2ClientPoolFailure - Part A only. SKIP Part B: the pool
+echo          adverse paths were NOT exercised by this run
+goto :after_poolfail
+
+:poolfail_fail
+echo    FAIL  Nghttp2ClientPoolFailure - !PF_RC!
+set /a FAILED+=1
+goto :after_poolfail
+
+:poolfail_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientPoolFailure - libnghttp2 absent; failure paths NOT exercised
+goto :after_poolfail
+
+:poolfail_buildfail
+echo    FAIL  Nghttp2ClientPoolFailure did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientPoolFailure.buildlog"
+echo.
+echo    Full log: Nghttp2ClientPoolFailure.buildlog
+set /a FAILED+=1
+goto :after_poolfail
+
+:no_poolfail
+echo -- Nghttp2ClientPoolFailure ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientPoolFailure.dpr not present
+
+:after_poolfail
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM
