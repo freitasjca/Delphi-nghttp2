@@ -54,6 +54,11 @@ REM    4g Nghttp2FloodRead                compile only  (gates on compile fail;
 REM                                       RSS check is Linux-only, skipped here)
 REM    4h Nghttp2ConnectTimeout           build + run   (gates; cmd has no
 REM                                       watchdog - a hang IS the result)
+REM    4r Nghttp2ClientMaxStreams        build + run   (gates; CL5.5
+REM                                       MAXSTREAMS-1: PeerMaxConcurrentStreams
+REM                                       reads the peer's advertised limit; a
+REM                                       burst > limit still all completes.
+REM                                       In-process, always runs.)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
@@ -871,6 +876,48 @@ echo -- Nghttp2ClientRetrySafety -----------------------------------------------
 echo    SKIP  Nghttp2ClientRetrySafety.dpr not present
 
 :after_retrysafe
+
+REM -- Stage 4r. Peer stream limit: the client reads it (CL5.5). ----------
+REM In-process only: the server advertises MaxConcurrentStreams=2 and nghttp2
+REM enforces it server-side, so this needs no python peer and always runs.
+REM PeerMaxConcurrentStreams must read 2; a burst of 5 concurrent requests
+REM still all completes (nghttp2 queues the excess rather than failing it).
+if not exist "Nghttp2ClientMaxStreams.dpr" goto :no_maxstreams
+echo -- Nghttp2ClientMaxStreams ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientMaxStreams.dpr" > "Nghttp2ClientMaxStreams.buildlog" 2>&1
+if errorlevel 1 goto :maxstreams_buildfail
+if not exist "Nghttp2ClientMaxStreams.exe" goto :maxstreams_buildfail
+Nghttp2ClientMaxStreams.exe < nul
+set "MS_RC=!errorlevel!"
+echo.
+if "!MS_RC!"=="3" goto :maxstreams_skip
+if not "!MS_RC!"=="0" goto :maxstreams_fail
+echo    PASS  Nghttp2ClientMaxStreams
+goto :after_maxstreams
+
+:maxstreams_fail
+echo    FAIL  Nghttp2ClientMaxStreams - !MS_RC!
+set /a FAILED+=1
+goto :after_maxstreams
+
+:maxstreams_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientMaxStreams - libnghttp2 absent; accessor NOT exercised
+goto :after_maxstreams
+
+:maxstreams_buildfail
+echo    FAIL  Nghttp2ClientMaxStreams did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientMaxStreams.buildlog"
+echo.
+echo    Full log: Nghttp2ClientMaxStreams.buildlog
+set /a FAILED+=1
+goto :after_maxstreams
+
+:no_maxstreams
+echo -- Nghttp2ClientMaxStreams ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientMaxStreams.dpr not present
+
+:after_maxstreams
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM

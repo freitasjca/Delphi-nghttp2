@@ -49,6 +49,10 @@
 #                                       /refused + /goaway (REFUSED_STREAM), False
 #                                       for /rst + /truncated + /abrupt. Reuses
 #                                       client-failure-peer.py; SKIPS LOUDLY.)
+#    4r Nghttp2ClientMaxStreams         build + run   (gates; CL5.5 MAXSTREAMS-1 —
+#                                       PeerMaxConcurrentStreams reads the peer's
+#                                       advertised limit; a burst > limit still
+#                                       all completes. In-process, always runs.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1199,6 +1203,43 @@ else
     echo "  FAIL  Nghttp2ClientRetrySafety.dpr did not compile"
     grep -E "Error|Fatal" "$RSOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $RSOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── peer stream limit: the client reads it (CL5.5 MAXSTREAMS-1) ──────────────
+# In-process only: the server advertises MaxConcurrentStreams=2 and nghttp2
+# enforces it server-side, so this needs no python peer and always runs.
+# PeerMaxConcurrentStreams must read 2; a burst of 5 concurrent requests still
+# all complete (nghttp2 queues the excess rather than failing it).
+echo
+echo "── peer stream limit: the client reads it (CL5.5) ────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientMaxStreams.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientMaxStreams.dpr not present"
+else
+  MSOUT="$OUT/client-maxstreams"
+  mkdir -p "$MSOUT"
+  rm -f "$MSOUT"/*.ppu "$MSOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$MSOUT" -FE"$MSOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientMaxStreams.dpr" > "$MSOUT/build.log" 2>&1 \
+     && [[ -x "$MSOUT/Nghttp2ClientMaxStreams" ]]; then
+    timeout 60 "$MSOUT/Nghttp2ClientMaxStreams" < /dev/null | sed 's/^/  /'
+    MS_RC=${PIPESTATUS[0]}
+    case "$MS_RC" in
+      0)   echo "  peer stream limit: PASSED" ;;
+      3)   echo "  SKIP  libnghttp2 absent - the stream-limit accessor was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  peer stream limit"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientMaxStreams.dpr did not compile"
+    grep -E "Error|Fatal" "$MSOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $MSOUT/build.log"
     RC=2
   fi
 fi

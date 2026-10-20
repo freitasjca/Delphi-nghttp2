@@ -326,6 +326,17 @@ type
     function  TakeResponse(AStreamId: Int32): TNghttp2Response;
     function  PendingStreams: Integer;
 
+    { [CL5.5 MAXSTREAMS-1] How many streams the PEER lets this client keep open
+      at once on the connection (its advertised SETTINGS_MAX_CONCURRENT_STREAMS).
+      Meaningful only AFTER the peer's SETTINGS has arrived - i.e. after at least
+      one completed request; before that it reports the RFC 7540 initial value
+      (effectively unlimited). nghttp2 already enforces this by queuing excess
+      submitted requests, so this is observability for a pool deciding whether to
+      open another stream on a leased connection or lease a second one - HTTP/2
+      stream capacity (this) and pool capacity (connections) are SEPARATE limits.
+      0 only if not connected. }
+    function  PeerMaxConcurrentStreams: Cardinal;
+
     { [CL4] Reconnects to the same host and port as the most recent Connect call.
       If still connected, Disconnects first. Resets GOAWAY state so the new
       session is clean. Raises if Connect was never called. }
@@ -1401,6 +1412,17 @@ begin
   for I := 0 to High(FStreams) do
     if FStreams[I].InUse and (not FStreams[I].Done) then
       Inc(Result);
+end;
+
+function TNghttp2Client.PeerMaxConcurrentStreams: Cardinal;
+begin
+  { [CL5.5 MAXSTREAMS-1] Ask nghttp2 for the peer's advertised value. FSession is
+    nil only before Connect / after Disconnect — report 0 there rather than
+    dereference nil. }
+  if FSession = nil then
+    Exit(0);
+  Result := nghttp2_session_get_remote_settings(
+    FSession, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
 end;
 
 procedure TNghttp2Client.PumpAll(ATimeoutMS: Integer);

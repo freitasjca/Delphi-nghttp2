@@ -309,6 +309,16 @@ var
   nghttp2_session_get_last_proc_stream_id: function(
     session: Pnghttp2_session): Int32; cdecl;
 
+  // [CL5.5 MAXSTREAMS-1] The value the PEER advertised for a SETTINGS id, e.g.
+  // NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS — how many streams this client may
+  // keep open at once on the connection. Meaningful only after the peer's
+  // SETTINGS has been received (one completed round-trip); before that it
+  // returns the RFC 7540 initial value. nghttp2 enforces the limit itself by
+  // queuing excess submitted requests, so this is for observability, not a cap
+  // the caller must apply.
+  nghttp2_session_get_remote_settings: function(
+    session: Pnghttp2_session; id: Integer): UInt32; cdecl;
+
   // ─── I/O (mem_recv / mem_send — no send_callback in v1 for simplicity) ─
   nghttp2_session_mem_recv: function(
     session: Pnghttp2_session;
@@ -581,6 +591,8 @@ begin
                  Pointer(@nghttp2_session_terminate_session)) then Exit;
   if not GetFrom('nghttp2_session_get_last_proc_stream_id',
                  Pointer(@nghttp2_session_get_last_proc_stream_id)) then Exit;
+  if not GetFrom('nghttp2_session_get_remote_settings',
+                 Pointer(@nghttp2_session_get_remote_settings)) then Exit;
 
   // I/O
   if not GetFrom('nghttp2_session_mem_recv',
