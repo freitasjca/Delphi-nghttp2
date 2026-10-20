@@ -59,6 +59,11 @@ REM                                       MAXSTREAMS-1: PeerMaxConcurrentStreams
 REM                                       reads the peer's advertised limit; a
 REM                                       burst > limit still all completes.
 REM                                       In-process, always runs.)
+REM    4s Nghttp2ClientPoolObservability  build + run   (gates; CL5.5
+REM                                       POOLSTATS-1: TNghttp2ClientPool.Stats
+REM                                       - acquires, ceiling waits + durations,
+REM                                       evictions, connect-failures, each off
+REM                                       zero. In-process, always runs.)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
@@ -918,6 +923,47 @@ echo -- Nghttp2ClientMaxStreams ------------------------------------------------
 echo    SKIP  Nghttp2ClientMaxStreams.dpr not present
 
 :after_maxstreams
+
+REM -- Stage 4s. Pool observability counters (CL5.5 POOLSTATS-1). ---------
+REM TNghttp2ClientPool.Stats: cumulative acquires / ceiling waits + durations
+REM / evictions / connect-failures, each driven off zero. In-process, single-
+REM threaded (the ceiling wait is forced by holding the one slot), always runs.
+if not exist "Nghttp2ClientPoolObservability.dpr" goto :no_poolobs
+echo -- Nghttp2ClientPoolObservability ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientPoolObservability.dpr" > "Nghttp2ClientPoolObservability.buildlog" 2>&1
+if errorlevel 1 goto :poolobs_buildfail
+if not exist "Nghttp2ClientPoolObservability.exe" goto :poolobs_buildfail
+Nghttp2ClientPoolObservability.exe < nul
+set "OB_RC=!errorlevel!"
+echo.
+if "!OB_RC!"=="3" goto :poolobs_skip
+if not "!OB_RC!"=="0" goto :poolobs_fail
+echo    PASS  Nghttp2ClientPoolObservability
+goto :after_poolobs
+
+:poolobs_fail
+echo    FAIL  Nghttp2ClientPoolObservability - !OB_RC!
+set /a FAILED+=1
+goto :after_poolobs
+
+:poolobs_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientPoolObservability - libnghttp2 absent; counters NOT exercised
+goto :after_poolobs
+
+:poolobs_buildfail
+echo    FAIL  Nghttp2ClientPoolObservability did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientPoolObservability.buildlog"
+echo.
+echo    Full log: Nghttp2ClientPoolObservability.buildlog
+set /a FAILED+=1
+goto :after_poolobs
+
+:no_poolobs
+echo -- Nghttp2ClientPoolObservability ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientPoolObservability.dpr not present
+
+:after_poolobs
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM

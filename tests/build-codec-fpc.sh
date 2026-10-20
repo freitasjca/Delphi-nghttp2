@@ -53,6 +53,10 @@
 #                                       PeerMaxConcurrentStreams reads the peer's
 #                                       advertised limit; a burst > limit still
 #                                       all completes. In-process, always runs.)
+#    4s Nghttp2ClientPoolObservability  build + run   (gates; CL5.5 POOLSTATS-1 —
+#                                       TNghttp2ClientPool.Stats: acquires, ceiling
+#                                       waits + durations, evictions, connect-
+#                                       failures, each off zero. In-process, runs.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1240,6 +1244,42 @@ else
     echo "  FAIL  Nghttp2ClientMaxStreams.dpr did not compile"
     grep -E "Error|Fatal" "$MSOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $MSOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── pool observability counters (CL5.5 POOLSTATS-1) ──────────────────────────
+# TNghttp2ClientPool.Stats: cumulative acquires / ceiling waits + durations /
+# evictions / connect-failures, each driven off zero. In-process, single-
+# threaded (the ceiling wait is forced by holding the one slot), always runs.
+echo
+echo "── pool observability counters (CL5.5) ───────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientPoolObservability.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientPoolObservability.dpr not present"
+else
+  OBOUT="$OUT/client-pool-obs"
+  mkdir -p "$OBOUT"
+  rm -f "$OBOUT"/*.ppu "$OBOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$OBOUT" -FE"$OBOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientPoolObservability.dpr" > "$OBOUT/build.log" 2>&1 \
+     && [[ -x "$OBOUT/Nghttp2ClientPoolObservability" ]]; then
+    timeout 60 "$OBOUT/Nghttp2ClientPoolObservability" < /dev/null | sed 's/^/  /'
+    OB_RC=${PIPESTATUS[0]}
+    case "$OB_RC" in
+      0)   echo "  pool observability: PASSED" ;;
+      3)   echo "  SKIP  libnghttp2 absent - the pool counters were NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  pool observability"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientPoolObservability.dpr did not compile"
+    grep -E "Error|Fatal" "$OBOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $OBOUT/build.log"
     RC=2
   fi
 fi

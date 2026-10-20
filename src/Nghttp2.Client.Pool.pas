@@ -95,12 +95,36 @@ type
     destructor Destroy; override;
   end;
 
+  // [CL5.5 POOLSTATS-1] A consistent snapshot of the pool, read under one lock.
+  // The first three are instantaneous (same values as TotalCount/IdleCount/
+  // InUseCount); the rest are CUMULATIVE since the pool was created, the numbers
+  // a concurrency problem is diagnosed from.
+  TNghttp2ClientPoolStats = record
+    Total:           Integer;   // connections the pool holds right now
+    Idle:            Integer;   // of those, available to Acquire
+    InUse:           Integer;   // of those, leased out
+    Acquires:        Int64;     // successful Acquire calls
+    AcquireWaits:    Int64;     // Acquires that had to wait at the ceiling
+                                // (whether they then succeeded or timed out)
+    WaitMS:          Int64;     // total milliseconds spent waiting at the ceiling
+    MaxWaitMS:       Int64;     // the longest single ceiling wait
+    Evictions:       Int64;     // idle clients closed + dropped (lazy or Sweep)
+    ConnectFailures: Int64;     // Acquire calls whose Connect raised
+  end;
+
   TNghttp2ClientPool = class
   private
     FLock:       TCriticalSection;
     FEntries:    TList<TNghttp2PooledClient>;   // non-owning; entries freed by hand
     FConfig:     TNghttp2ClientPoolConfig;
     FTlsContext: TTlsClientContext;   // not owned
+    // [CL5.5 POOLSTATS-1] cumulative counters, all touched only under FLock.
+    FStatAcquires:        Int64;
+    FStatAcquireWaits:    Int64;
+    FStatWaitMS:          Int64;
+    FStatMaxWaitMS:       Int64;
+    FStatEvictions:       Int64;
+    FStatConnectFailures: Int64;
     function  MakeKey(const AHost: string; APort: Word; AUseTls: Boolean): string;
     // All of these run WITH FLock held.
     function  CountForKeyLocked(const AKey: string): Integer;
@@ -108,6 +132,7 @@ type
     procedure ExtractIdleVictimsLocked(const AKey: string;
       AOnlyKey: Boolean; AVictims: TList<TNghttp2PooledClient>);
     function  CountLocked(AInUse: Boolean): Integer;
+    procedure RecordWaitLocked(AWaitStart: TDateTime);
   public
     constructor Create; overload;
     constructor Create(const AConfig: TNghttp2ClientPoolConfig); overload;
@@ -127,6 +152,8 @@ type
     function  TotalCount: Integer;
     function  IdleCount: Integer;
     function  InUseCount: Integer;
+    // [CL5.5 POOLSTATS-1] a consistent cumulative + instantaneous snapshot.
+    function  Stats: TNghttp2ClientPoolStats;
 
     property TlsContext: TTlsClientContext read FTlsContext write FTlsContext;
   end;
@@ -267,6 +294,7 @@ begin
       // outside the lock so teardown never blocks another thread.
       AVictims.Add(LEntry);
       FEntries.Delete(I);
+      Inc(FStatEvictions);   // [CL5.5 POOLSTATS-1] run under FLock by the caller
     end;
   end;
 end;
@@ -281,9 +309,13 @@ var
   LAtCeiling: Boolean;
   LNew:      Boolean;
   I:         Integer;
+  LWaited:    Boolean;     { [CL5.5 POOLSTATS-1] did this Acquire wait at the ceiling? }
+  LWaitStart: TDateTime;   { [CL5.5 POOLSTATS-1] when the first ceiling wait began }
 begin
   LKey := MakeKey(AHost, APort, AUseTls);
   LDeadline := IncMilliSecond(Now, FConfig.AcquireTimeoutMS);
+  LWaited := False;
+  LWaitStart := 0;
   LVictims := TList<TNghttp2PooledClient>.Create;
   try
     while True do
@@ -340,11 +372,22 @@ begin
           FLock.Enter;
           try
             FEntries.Remove(LEntry);
+            Inc(FStatConnectFailures);   // [CL5.5 POOLSTATS-1]
           finally
             FLock.Leave;
           end;
           LEntry.Free;
           raise;
+        end;
+        { [CL5.5 POOLSTATS-1] A connection is in hand: count the acquire, and the
+          wait if we had to poll at the ceiling for it. }
+        FLock.Enter;
+        try
+          Inc(FStatAcquires);
+          if LWaited then
+            RecordWaitLocked(LWaitStart);
+        finally
+          FLock.Leave;
         end;
         Result := LEntry.Client;
         Exit;
@@ -353,10 +396,30 @@ begin
       if LAtCeiling then
       begin
         if (FConfig.AcquireTimeoutMS <= 0) or (Now >= LDeadline) then
+        begin
+          { [CL5.5 POOLSTATS-1] A wait that ended in saturation is still a wait -
+            record it before raising, so WaitMS reflects it too. }
+          if LWaited then
+          begin
+            FLock.Enter;
+            try
+              RecordWaitLocked(LWaitStart);
+            finally
+              FLock.Leave;
+            end;
+          end;
           raise ENghttp2ClientPool.CreateFmt(
             'Nghttp2ClientPool: no connection available for %s within %d ms ' +
             '(MaxClientsPerKey=%d all in use).',
             [LKey, FConfig.AcquireTimeoutMS, FConfig.MaxClientsPerKey]);
+        end;
+        { [CL5.5 POOLSTATS-1] Mark the wait on the first poll only, so WaitMS
+          measures the whole ceiling wait rather than one poll interval. }
+        if not LWaited then
+        begin
+          LWaited := True;
+          LWaitStart := Now;
+        end;
         // Bounded poll, then retry the lock section, which re-reads real state
         // (a freed slot is always observed within one poll interval). Sleep is
         // SysUtils.Sleep on FPC and the portable TThread.Sleep on Delphi.
@@ -447,6 +510,37 @@ begin
   FLock.Enter;
   try
     Result := CountLocked(True);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+{ [CL5.5 POOLSTATS-1] Caller holds FLock. Fold one completed ceiling wait into
+  the counters. MilliSecondsBetween returns Int64, so a long wait does not wrap. }
+procedure TNghttp2ClientPool.RecordWaitLocked(AWaitStart: TDateTime);
+var
+  LMS: Int64;
+begin
+  LMS := MilliSecondsBetween(Now, AWaitStart);
+  Inc(FStatAcquireWaits);
+  Inc(FStatWaitMS, LMS);
+  if LMS > FStatMaxWaitMS then
+    FStatMaxWaitMS := LMS;
+end;
+
+function TNghttp2ClientPool.Stats: TNghttp2ClientPoolStats;
+begin
+  FLock.Enter;
+  try
+    Result.Total           := FEntries.Count;
+    Result.Idle            := CountLocked(False);
+    Result.InUse           := CountLocked(True);
+    Result.Acquires        := FStatAcquires;
+    Result.AcquireWaits    := FStatAcquireWaits;
+    Result.WaitMS          := FStatWaitMS;
+    Result.MaxWaitMS       := FStatMaxWaitMS;
+    Result.Evictions       := FStatEvictions;
+    Result.ConnectFailures := FStatConnectFailures;
   finally
     FLock.Leave;
   end;
