@@ -8,6 +8,8 @@ request :path:
   /ok          HEADERS 200 + DATA "ok" + END_STREAM     (control: the peer works)
   /rst         HEADERS 200, then RST_STREAM(INTERNAL_ERROR) - the stream is reset
                after the response starts but before it finishes
+  /refused     RST_STREAM(REFUSED_STREAM) with no prior response - the server
+               declares it never processed the stream (RFC 7540 8.1.4: safe to retry)
   /goaway      GOAWAY(last_stream_id=0), then a GRACEFUL close (FIN + drain, so
                the GOAWAY is delivered before any close) - the server declares it
                processed NO stream, so the request is safe to replay
@@ -46,6 +48,12 @@ def respond(conn, stream_id, path):
                                       ('content-type', 'text/plain')])
         conn.reset_stream(stream_id,
                           error_code=h2.errors.ErrorCodes.INTERNAL_ERROR)
+        return 'keep'
+    if path == '/refused':
+        # RST_STREAM(REFUSED_STREAM) with NO prior response: the server declares
+        # it never processed this stream - RFC 7540 8.1.4 "safe to retry".
+        conn.reset_stream(stream_id,
+                          error_code=h2.errors.ErrorCodes.REFUSED_STREAM)
         return 'keep'
     if path == '/goaway':
         # last_stream_id 0 => no stream was processed; the client's request is

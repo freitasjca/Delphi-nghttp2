@@ -39,6 +39,10 @@ REM                                       level reliability: a failed request
 REM                                       on a leased connection leaks no slot,
 REM                                       and a re-Acquire on the same key
 REM                                       yields a USABLE client. SKIPS LOUDLY.)
+REM    4q Nghttp2ClientRetrySafety        build + run   (gates; CL5.5
+REM                                       RETRYSAFE-1: ENghttp2Client.SafeToRetry
+REM                                       True for /refused + /goaway, False for
+REM                                       /rst + /truncated + /abrupt. SKIPS LOUDLY.)
 REM    4c Nghttp2AlpnMismatch             build + run   (gates; the only stage
 REM                                       whose PEER is openssl rather than our
 REM                                       own server. Skips LOUDLY without it.)
@@ -799,6 +803,74 @@ echo -- Nghttp2ClientPoolFailure -----------------------------------------------
 echo    SKIP  Nghttp2ClientPoolFailure.dpr not present
 
 :after_poolfail
+
+REM -- Stage 4q. Retry safety: is a failed request replayable? (CL5.5). -----
+REM For each adverse shape, ENghttp2Client.SafeToRetry must say whether the
+REM server provably did NOT process the request: True for /refused + /goaway
+REM (REFUSED_STREAM), False for /rst + /truncated + /abrupt. Part A (in-process
+REM control) always runs; Part B needs python h2 and SKIPS LOUDLY without it.
+if not exist "Nghttp2ClientRetrySafety.dpr" goto :no_retrysafe
+echo -- Nghttp2ClientRetrySafety ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientRetrySafety.dpr" > "Nghttp2ClientRetrySafety.buildlog" 2>&1
+if errorlevel 1 goto :retrysafe_buildfail
+if not exist "Nghttp2ClientRetrySafety.exe" goto :retrysafe_buildfail
+
+set "RSPY="
+for %%P in (py python) do if not defined RSPY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "RSPY=%%P"
+)
+set "RSARGS="
+set "RSTITLE=NGHTTP2RETRYPEER"
+if not defined RSPY goto :retrysafe_nopeer
+start "!RSTITLE!" /min !RSPY! "client-failure-peer.py" 19333 --lifetime 60
+ping -n 3 127.0.0.1 > nul
+set "RSARGS=peer=19333"
+goto :retrysafe_run
+
+:retrysafe_nopeer
+echo    NOTE  no Python with the h2 package ^(pip install h2^) - Part B will SKIP
+
+:retrysafe_run
+Nghttp2ClientRetrySafety.exe !RSARGS! < nul
+set "RS_RC=!errorlevel!"
+if defined RSPY taskkill /FI "WINDOWTITLE eq !RSTITLE!" /T /F > nul 2>&1
+echo.
+if "!RS_RC!"=="3" goto :retrysafe_skip
+if not "!RS_RC!"=="0" goto :retrysafe_fail
+if not defined RSPY goto :retrysafe_partial
+echo    PASS  Nghttp2ClientRetrySafety - both parts
+goto :after_retrysafe
+
+:retrysafe_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2ClientRetrySafety - Part A only. SKIP Part B: the retry
+echo          classification was NOT exercised by this run
+goto :after_retrysafe
+
+:retrysafe_fail
+echo    FAIL  Nghttp2ClientRetrySafety - !RS_RC!
+set /a FAILED+=1
+goto :after_retrysafe
+
+:retrysafe_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientRetrySafety - libnghttp2 absent; retry classification NOT exercised
+goto :after_retrysafe
+
+:retrysafe_buildfail
+echo    FAIL  Nghttp2ClientRetrySafety did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientRetrySafety.buildlog"
+echo.
+echo    Full log: Nghttp2ClientRetrySafety.buildlog
+set /a FAILED+=1
+goto :after_retrysafe
+
+:no_retrysafe
+echo -- Nghttp2ClientRetrySafety ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientRetrySafety.dpr not present
+
+:after_retrysafe
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM

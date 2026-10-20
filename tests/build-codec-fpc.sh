@@ -44,6 +44,11 @@
 #                                       connection leaks no slot, and a re-Acquire
 #                                       on the same key yields a USABLE client.
 #                                       Reuses client-failure-peer.py; SKIPS LOUDLY.)
+#    4q Nghttp2ClientRetrySafety        build + run   (gates; CL5.5 RETRYSAFE-1 —
+#                                       ENghttp2Client.SafeToRetry: True for
+#                                       /refused + /goaway (REFUSED_STREAM), False
+#                                       for /rst + /truncated + /abrupt. Reuses
+#                                       client-failure-peer.py; SKIPS LOUDLY.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1121,6 +1126,79 @@ else
     echo "  FAIL  Nghttp2ClientPoolFailure.dpr did not compile"
     grep -E "Error|Fatal" "$PFOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $PFOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── retry safety: is a failed request replayable? (CL5.5 RETRYSAFE-1) ─────────
+# For each adverse shape, ENghttp2Client.SafeToRetry must say whether the server
+# provably did NOT process the request: True for /refused + /goaway (REFUSED_
+# STREAM), False for /rst + /truncated + /abrupt (uncertain). Part A (in-process
+# control) always runs; Part B needs python h2 and SKIPS LOUDLY.
+echo
+echo "── retry safety: is a failed request replayable? (CL5.5) ─────────────"
+if [[ ! -f "$HERE/Nghttp2ClientRetrySafety.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientRetrySafety.dpr not present"
+else
+  RSOUT="$OUT/client-retrysafe"
+  mkdir -p "$RSOUT"
+  rm -f "$RSOUT"/*.ppu "$RSOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$RSOUT" -FE"$RSOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientRetrySafety.dpr" > "$RSOUT/build.log" 2>&1 \
+     && [[ -x "$RSOUT/Nghttp2ClientRetrySafety" ]]; then
+
+    RS_PY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then RS_PY="$CAND"; break; fi
+    done
+
+    RS_PEER_PID=""
+    RS_ARGS=""
+    if [[ -n "$RS_PY" ]]; then
+      "$RS_PY" "$HERE/client-failure-peer.py" 19333 --lifetime 60 \
+        > "$RSOUT/peer.log" 2>&1 &
+      RS_PEER_PID=$!
+      for _ in $(seq 1 50); do
+        grep -q '^READY' "$RSOUT/peer.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$RSOUT/peer.log" 2>/dev/null; then
+        RS_ARGS="peer=19333"
+      else
+        echo "  NOTE  the h2 peer did not start - see $RSOUT/peer.log"
+      fi
+    else
+      echo "  NOTE  no python with h2 (set H2_PYTHON, or pip install h2 into"
+      echo "        tools/protogen/.venv) - Part B will SKIP"
+    fi
+
+    timeout 60 "$RSOUT/Nghttp2ClientRetrySafety" $RS_ARGS < /dev/null | sed 's/^/  /'
+    RS_RC=${PIPESTATUS[0]}
+    [[ -n "$RS_PEER_PID" ]] && kill "$RS_PEER_PID" 2>/dev/null
+    wait "$RS_PEER_PID" 2>/dev/null || true
+
+    case "$RS_RC" in
+      0)   if [[ -n "$RS_ARGS" ]]; then
+             echo "  retry safety: PASSED (both parts)"
+           else
+             echo "  retry safety: Part A PASSED - Part B SKIPPED, the retry"
+             echo "        classification was NOT exercised by this run"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - the retry classification was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s (a retry-safety path hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  retry safety"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientRetrySafety.dpr did not compile"
+    grep -E "Error|Fatal" "$RSOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $RSOUT/build.log"
     RC=2
   fi
 fi

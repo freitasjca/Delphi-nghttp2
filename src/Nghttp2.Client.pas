@@ -93,7 +93,20 @@ const
   DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 
 type
-  ENghttp2Client = class(Exception);
+  { [CL5.5 RETRYSAFE-1] SafeToRetry answers ONE question about a failed
+    request: did the server provably NOT process it? It is True only for the
+    signals RFC 7540 §8.1.4 calls safe to replay on a new connection -
+    REFUSED_STREAM, or a GOAWAY whose last_stream_id was below this stream (both
+    surface here as REFUSED_STREAM). It is False (the default) for every other
+    failure - a connection drop, a read timeout, a protocol error, or a reset
+    after the response had begun - because the server may already have acted, so
+    a non-idempotent request must NOT be auto-retried. The flag is about server
+    processing, NOT idempotency or body-replayability: a caller that retries
+    still owns "is this request safe to repeat?" and "can I resend the body?". }
+  ENghttp2Client = class(Exception)
+  public
+    SafeToRetry: Boolean;
+  end;
 
   { GC3 (1.28.0). A request ran out of its time budget (SubmitRequest /
     PumpAll ATimeoutMS) with the peer still connected. A subclass, so every
@@ -145,6 +158,10 @@ type
     InUse:      Boolean;
     Done:       Boolean;
     Error:      string;
+    { [CL5.5 RETRYSAFE-1] Set beside Error. True only when the stream was
+      refused before processing (REFUSED_STREAM); False for every other close,
+      which TakeResponse carries onto ENghttp2Client.SafeToRetry. }
+    SafeToRetry: Boolean;
     Response:   TNghttp2Response;
     ReqBody:    TBytes;      { pulled by ReadRequestBodyCallback }
     ReqBodyPos: Integer;
@@ -540,10 +557,14 @@ begin
       this stream_id — the stream was never processed and is safe to retry on
       a fresh connection. Give a targeted message instead of the generic one. }
     if error_code = HTTP2_REFUSED_STREAM then
+    begin
+      { [CL5.5 RETRYSAFE-1] The one close that is provably safe to replay. }
+      LClient.FStreams[LIdx].SafeToRetry := True;
       LClient.FStreams[LIdx].Error := Format(
         'stream %d was refused (REFUSED_STREAM / error 7): the server sent GOAWAY '
         + 'before processing this stream — retry on a new connection (Reconnect)',
         [stream_id])
+    end
     else
       LClient.FStreams[LIdx].Error := Format(
         'stream %d closed with nghttp2 error code %d - received status=%d, '
@@ -1503,8 +1524,10 @@ end;
   stale response twice and a long run does not accumulate slots. }
 function TNghttp2Client.TakeResponse(AStreamId: Int32): TNghttp2Response;
 var
-  LIdx: Integer;
-  LErr: string;
+  LIdx:  Integer;
+  LErr:  string;
+  LSafe: Boolean;         { [CL5.5 RETRYSAFE-1] }
+  LExc:  ENghttp2Client;  { [CL5.5 RETRYSAFE-1] }
 begin
   LIdx := FindSlot(AStreamId);
   if LIdx < 0 then
@@ -1526,11 +1549,19 @@ begin
 
   Result := FStreams[LIdx].Response;
   LErr   := FStreams[LIdx].Error;
+  LSafe  := FStreams[LIdx].SafeToRetry;   { [CL5.5 RETRYSAFE-1] capture before the wipe }
   FStreams[LIdx].InUse := False;
   FStreams[LIdx] := Default(TNghttp2StreamSlot);
 
   if LErr <> '' then
-    raise ENghttp2Client.Create(LErr);
+  begin
+    { [CL5.5 RETRYSAFE-1] Carry the stream's retry classification onto the
+      exception. A connection drop raised directly by PumpUntilDone never
+      reaches here and keeps the default False (uncertain), which is correct. }
+    LExc := ENghttp2Client.Create(LErr);
+    LExc.SafeToRetry := LSafe;
+    raise LExc;
+  end;
 end;
 
 { [CL4] Explicit reconnect. Disconnects if still connected, clears GOAWAY state,
