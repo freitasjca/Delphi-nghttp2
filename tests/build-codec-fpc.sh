@@ -57,6 +57,12 @@
 #                                       TNghttp2ClientPool.Stats: acquires, ceiling
 #                                       waits + durations, evictions, connect-
 #                                       failures, each off zero. In-process, runs.)
+#    4t Nghttp2ClientStress             build + run   (gates when the peer is up;
+#                                       CL5.5 STRESS-1 — the raw client + pool vs
+#                                       an INDEPENDENT nginx (Docker, h2c): N
+#                                       threads, a 4 MiB flow-controlled body, and
+#                                       nginx GOAWAY (keepalive_requests). Needs
+#                                       Docker; SKIPS LOUDLY without it.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1280,6 +1286,59 @@ else
     echo "  FAIL  Nghttp2ClientPoolObservability.dpr did not compile"
     grep -E "Error|Fatal" "$OBOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $OBOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── 4t · independent-peer stress: nginx (Docker) h2c (CL5.5 STRESS-1) ────────
+# Drive the raw client AND the pool against an INDEPENDENT nginx HTTP/2 server
+# (Docker, h2c) - our own server may not be the sole peer for a concurrency or
+# robustness claim (plans/delphi-nghttp2-client.md, "Validation rules"). The
+# peer (tests/stress/peer.sh) produces concurrency, a 4 MiB flow-controlled body
+# and nginx's own GOAWAY (keepalive_requests). Mid-response RST / abrupt close
+# stay with 4o/4p (python-h2 peer); nginx does not do those deterministically.
+# No Docker -> the stage SKIPS LOUDLY (exit 3), never fails.
+echo
+echo "── independent-peer stress: nginx (Docker) h2c (CL5.5) ───────────────"
+if [[ ! -f "$HERE/Nghttp2ClientStress.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientStress.dpr not present"
+else
+  STOUT="$OUT/client-stress"
+  mkdir -p "$STOUT"
+  rm -f "$STOUT"/*.ppu "$STOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$STOUT" -FE"$STOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientStress.dpr" > "$STOUT/build.log" 2>&1 \
+     && [[ -x "$STOUT/Nghttp2ClientStress" ]]; then
+
+    ST_PORT=19340
+    ST_ARGS=""
+    if bash "$HERE/stress/peer.sh" start "$ST_PORT" > "$STOUT/peer.log" 2>&1 \
+       && grep -q '^READY' "$STOUT/peer.log" 2>/dev/null; then
+      ST_ARGS="peer=$ST_PORT"
+    else
+      echo "  NOTE  independent nginx peer not started (Docker) - stage will SKIP"
+      sed 's/^/        /' "$STOUT/peer.log" 2>/dev/null | head -5
+    fi
+
+    timeout 180 "$STOUT/Nghttp2ClientStress" $ST_ARGS < /dev/null | sed 's/^/  /'
+    ST_RC=${PIPESTATUS[0]}
+    bash "$HERE/stress/peer.sh" stop "$ST_PORT" > /dev/null 2>&1 || true
+
+    case "$ST_RC" in
+      0)   echo "  independent-peer stress: PASSED" ;;
+      3)   echo "  SKIP  no peer / libnghttp2 absent - the stress was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 180s (a stress path hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  independent-peer stress"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientStress.dpr did not compile"
+    grep -E "Error|Fatal" "$STOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $STOUT/build.log"
     RC=2
   fi
 fi

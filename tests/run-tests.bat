@@ -64,6 +64,12 @@ REM                                       POOLSTATS-1: TNghttp2ClientPool.Stats
 REM                                       - acquires, ceiling waits + durations,
 REM                                       evictions, connect-failures, each off
 REM                                       zero. In-process, always runs.)
+REM    4t Nghttp2ClientStress             build + run   (gates when peer up;
+REM                                       CL5.5 STRESS-1: raw client + pool vs an
+REM                                       INDEPENDENT nginx (Docker, h2c) - N
+REM                                       threads, a 4 MiB flow-controlled body,
+REM                                       nginx GOAWAY (keepalive_requests). Needs
+REM                                       Docker; SKIPS LOUDLY without it.)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
@@ -964,6 +970,66 @@ echo -- Nghttp2ClientPoolObservability -----------------------------------------
 echo    SKIP  Nghttp2ClientPoolObservability.dpr not present
 
 :after_poolobs
+
+REM -- Stage 4t. Independent-peer stress: nginx (Docker) h2c (CL5.5). ---
+REM Drive the raw client AND the pool against an INDEPENDENT nginx HTTP/2
+REM server (Docker, h2c) - our own server may not be the sole peer for a
+REM concurrency/robustness claim. stress\peer.ps1 runs the container:
+REM concurrency, a 4 MiB flow-controlled body, nginx GOAWAY (keepalive_
+REM requests). No Docker -> the stage SKIPS LOUDLY, never fails. Mid-response
+REM RST / abrupt close stay with 4o/4p (python-h2 peer); nginx does not do
+REM those deterministically.
+if not exist "Nghttp2ClientStress.dpr" goto :no_stress
+echo -- Nghttp2ClientStress ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientStress.dpr" > "Nghttp2ClientStress.buildlog" 2>&1
+if errorlevel 1 goto :stress_buildfail
+if not exist "Nghttp2ClientStress.exe" goto :stress_buildfail
+
+set "STPORT=19340"
+set "STARGS="
+powershell -NoProfile -ExecutionPolicy Bypass -File "stress\peer.ps1" start !STPORT! > "Nghttp2ClientStress.peer.log" 2>&1
+if errorlevel 1 goto :stress_nopeer
+findstr /B /C:"READY" "Nghttp2ClientStress.peer.log" > nul || goto :stress_nopeer
+set "STARGS=peer=!STPORT!"
+goto :stress_run
+
+:stress_nopeer
+echo    NOTE  independent nginx peer not started ^(Docker^) - stage will SKIP
+type "Nghttp2ClientStress.peer.log"
+
+:stress_run
+Nghttp2ClientStress.exe !STARGS! < nul
+set "ST_RC=!errorlevel!"
+powershell -NoProfile -ExecutionPolicy Bypass -File "stress\peer.ps1" stop !STPORT! > nul 2>&1
+echo.
+if "!ST_RC!"=="3" goto :stress_skip
+if not "!ST_RC!"=="0" goto :stress_fail
+echo    PASS  Nghttp2ClientStress
+goto :after_stress
+
+:stress_fail
+echo    FAIL  Nghttp2ClientStress - !ST_RC!
+set /a FAILED+=1
+goto :after_stress
+
+:stress_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientStress - no peer / libnghttp2 absent; stress NOT exercised
+goto :after_stress
+
+:stress_buildfail
+echo    FAIL  Nghttp2ClientStress did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientStress.buildlog"
+echo.
+echo    Full log: Nghttp2ClientStress.buildlog
+set /a FAILED+=1
+goto :after_stress
+
+:no_stress
+echo -- Nghttp2ClientStress ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientStress.dpr not present
+
+:after_stress
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM
