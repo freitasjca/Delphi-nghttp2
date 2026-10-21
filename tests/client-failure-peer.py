@@ -16,6 +16,11 @@ request :path:
   /truncated   HEADERS 200 + a partial DATA frame WITHOUT END_STREAM, then the
                socket closes under the client (an incomplete body, not a clean end)
   /abrupt      nothing at all - the socket closes before any response byte
+  /hang        HEADERS 200, no END_STREAM, no DATA - the stream stays open so the
+               client can CancelRequest it mid-flight (CL6a). Connection kept open.
+  /rststat     HEADERS 200 + DATA = the number of RST_STREAM frames this peer has
+               received from the client so far (CL6a cancel confirmation on the
+               wire: 0 if the client never actually sent the RST)
 
 The client must, for each, raise rather than hang or return a partial success,
 leave no open stream behind (PendingStreams = 0), and free cleanly.
@@ -35,9 +40,22 @@ import h2.errors
 import h2.events
 
 
-def respond(conn, stream_id, path):
+def respond(conn, stream_id, path, nreset):
     # Returns one of: 'keep' (leave the connection open), 'close' (close it now),
     # 'goaway' (flush the GOAWAY, then close GRACEFULLY - see serve()).
+    # nreset is the count of RST_STREAM frames seen so far (for /rststat).
+    if path == '/hang':
+        # HEADERS 200 but no END_STREAM: the stream stays open for the client
+        # to cancel. The connection stays open so /rststat can be asked after.
+        conn.send_headers(stream_id, [(':status', '200'),
+                                      ('content-type', 'text/plain')])
+        return 'keep'
+    if path == '/rststat':
+        body = str(nreset).encode('ascii')
+        conn.send_headers(stream_id, [(':status', '200'),
+                                      ('content-type', 'text/plain')])
+        conn.send_data(stream_id, body, end_stream=True)
+        return 'keep'
     if path == '/ok':
         conn.send_headers(stream_id, [(':status', '200'),
                                       ('content-type', 'text/plain')])
@@ -76,6 +94,7 @@ def serve(sock):
     conn = h2.connection.H2Connection(config=config)
     conn.initiate_connection()
     sock.sendall(conn.data_to_send())
+    nreset = 0   # [CL6a] RST_STREAM frames received from the client
     while True:
         data = sock.recv(65535)
         if not data:
@@ -84,7 +103,11 @@ def serve(sock):
         for event in conn.receive_data(data):
             if isinstance(event, h2.events.RequestReceived):
                 path = dict(event.headers).get(':path', '')
-                action = respond(conn, event.stream_id, path)
+                action = respond(conn, event.stream_id, path, nreset)
+            elif isinstance(event, h2.events.StreamReset):
+                # [CL6a] the client sent RST_STREAM (e.g. CancelRequest). Count
+                # it so a later /rststat can confirm the cancel reached the wire.
+                nreset += 1
             elif isinstance(event, h2.events.ConnectionTerminated):
                 return
         out = conn.data_to_send()

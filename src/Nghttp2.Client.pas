@@ -162,6 +162,12 @@ type
       refused before processing (REFUSED_STREAM); False for every other close,
       which TakeResponse carries onto ENghttp2Client.SafeToRetry. }
     SafeToRetry: Boolean;
+    { [CL6a] The caller called CancelRequest for this stream: a RST_STREAM
+      (CANCEL) was sent and the slot marked Done with its own Error. Tells
+      OnStreamCloseCb to keep that message when the cancel's own RST comes back
+      as a stream close with error 8, rather than overwriting it with the
+      generic "closed with nghttp2 error code 8". }
+    Cancelled: Boolean;
     Response:   TNghttp2Response;
     ReqBody:    TBytes;      { pulled by ReadRequestBodyCallback }
     ReqBodyPos: Integer;
@@ -323,6 +329,25 @@ type
       AStreamResponse: Boolean = False;
       ADeferred:       Boolean = False): Int32;
     procedure PumpAll(ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS);
+
+    { [CL6a] The cooperative async pump - ONE bounded pass. Sends whatever is
+      queued (BeginRequest submissions, a CancelRequest reset), reads for up to
+      ATimeoutMS, and dispatches the callbacks that advance or complete streams.
+      Returns the number of streams still in flight (PendingStreams): 0 means
+      every submitted stream has completed or been cancelled and can be reaped
+      with TakeResponse. The async model is submit-many-then-pump from ONE
+      thread (the library spins no thread of its own - the single-driver rule):
+
+        for I := 0 to 99 do Ids[I] := C.BeginRequest('GET', P[I], nil, nil);
+        while C.Pump(50) > 0 do ;          // make progress, stay responsive
+        for I := 0 to 99 do R[I] := C.TakeResponse(Ids[I]);
+
+      Unlike PumpAll it does NOT block until every stream finishes, so between
+      passes the caller can CancelRequest an in-flight stream. Loop with your own
+      overall deadline: a vanished peer leaves streams pending that will never
+      complete. }
+    function  Pump(ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS): Integer;
+
     function  TakeResponse(AStreamId: Int32): TNghttp2Response;
     function  PendingStreams: Integer;
 
@@ -403,6 +428,18 @@ type
       DATA+END_STREAM frame. SendChunk raises after this. The receive side
       (ReadChunk / TakeResponse) continues to work. }
     procedure FinishSending(AStreamId: Int32);
+
+    { [CL6a] Cancel one in-flight request. Sends RST_STREAM(CANCEL) for
+      AStreamId and flushes it, so the peer stops and nghttp2 discards any
+      response already in flight for that stream; the slot is marked done with a
+      cancelled error. The response is never delivered: PumpAll no longer waits
+      on this stream, and TakeResponse(AStreamId) raises rather than returning a
+      body. Reap it with TakeResponse like any finished stream (that frees the
+      slot). A no-op if the stream has already completed - the cancel lost the
+      race, so its real result is kept for TakeResponse. Raises if not connected
+      or AStreamId is unknown. Cooperative, like the rest of the client: there is
+      no background thread; the cancel takes effect on this call's flush. }
+    procedure CancelRequest(AStreamId: Int32);
 
     property Connected:       Boolean            read FConnected;
     property Host:            string             read FHost;
@@ -562,7 +599,10 @@ begin
   if LIdx < 0 then Exit(0);
 
   LClient.FStreams[LIdx].Done := True;
-  if error_code <> NGHTTP2_NO_ERROR then
+  { [CL6a] A caller-initiated cancel already set Done + its own Error; the
+    RST we sent comes back here as a close with CANCEL (error 8). Keep it. }
+  if (error_code <> NGHTTP2_NO_ERROR)
+     and (not LClient.FStreams[LIdx].Cancelled) then
   begin
     { [CL4] REFUSED_STREAM means the server's GOAWAY last_stream_id was below
       this stream_id — the stream was never processed and is safe to retry on
@@ -1430,6 +1470,16 @@ begin
   PumpUntilDone(ATimeoutMS);
 end;
 
+{ [CL6a] One bounded pump pass for the async model. See the declaration. The
+  PumpOnce return (received / timed-out / no-more) is deliberately not surfaced:
+  the useful answer to "keep going?" is how many streams are still in flight,
+  which PendingStreams gives directly. }
+function TNghttp2Client.Pump(ATimeoutMS: Integer): Integer;
+begin
+  PumpOnce(ATimeoutMS);
+  Result := PendingStreams;
+end;
+
 { [CL3] One pass of PumpUntilDone's loop body. See the declaration for the
   three return values. Kept beside it deliberately: if that loop changes, this
   must change with it, and two pumps that drift apart would be a defect nothing
@@ -1584,6 +1634,40 @@ begin
     LExc.SafeToRetry := LSafe;
     raise LExc;
   end;
+end;
+
+{ [CL6a] Cancel an in-flight stream: RST_STREAM(CANCEL), then flush so nghttp2
+  closes the stream locally and ignores any response the peer already sent. }
+procedure TNghttp2Client.CancelRequest(AStreamId: Int32);
+const
+  { RFC 7540 §7 error code CANCEL - "the endpoint no longer needs the stream". }
+  HTTP2_CANCEL = 8;
+var
+  LIdx: Integer;
+begin
+  if not FConnected then
+    raise ENghttp2Client.Create('CancelRequest: not connected');
+  LIdx := FindSlot(AStreamId);
+  if LIdx < 0 then
+    raise ENghttp2Client.CreateFmt('no such stream: %d', [AStreamId]);
+
+  { Lost the race: the stream already finished. Leave its result intact so the
+    caller still reaps the real response (or error) with TakeResponse. }
+  if FStreams[LIdx].Done then
+    Exit;
+
+  { Mark cancelled BEFORE the flush: submit_rst_stream makes nghttp2 close the
+    stream and fire OnStreamCloseCb during FlushSession, and the Cancelled flag
+    tells that callback to keep this message rather than the generic one. }
+  FStreams[LIdx].Cancelled := True;
+  FStreams[LIdx].Done      := True;
+  FStreams[LIdx].Error     := Format(
+    'stream %d was cancelled by the caller (CancelRequest)', [AStreamId]);
+
+  { Best effort: a non-zero return means nghttp2 already closed the stream,
+    which is fine - the slot is cancelled either way. flags must be 0. }
+  nghttp2_submit_rst_stream(FSession, 0, AStreamId, HTTP2_CANCEL);
+  FlushSession;
 end;
 
 { [CL4] Explicit reconnect. Disconnects if still connected, clears GOAWAY state,

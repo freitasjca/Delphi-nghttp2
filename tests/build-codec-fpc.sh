@@ -63,6 +63,12 @@
 #                                       threads, a 4 MiB flow-controlled body, and
 #                                       nginx GOAWAY (keepalive_requests). Needs
 #                                       Docker; SKIPS LOUDLY without it.)
+#    4u Nghttp2ClientAsyncCancel        build + run   (gates; CL6a — per-request
+#                                       cancellation + the async Pump. Part A
+#                                       in-process control (cancel stops delivery,
+#                                       no leak); Part B needs python h2 and
+#                                       confirms the RST reached the wire
+#                                       (/rststat). SKIPS Part B LOUDLY.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1339,6 +1345,79 @@ else
     echo "  FAIL  Nghttp2ClientStress.dpr did not compile"
     grep -E "Error|Fatal" "$STOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $STOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── 4u · per-request cancellation + async pump (CL6a) ────────────────────────
+# CancelRequest sends RST_STREAM(CANCEL) for one in-flight stream; the response
+# is never delivered and the slot does not leak. Part A (in-process control)
+# always runs; Part B needs python h2 (client-failure-peer.py /hang + /rststat)
+# and confirms the RST actually reached the wire - it SKIPS LOUDLY without it.
+echo
+echo "── per-request cancellation (CL6a) ───────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientAsyncCancel.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientAsyncCancel.dpr not present"
+else
+  ACOUT="$OUT/client-asynccancel"
+  mkdir -p "$ACOUT"
+  rm -f "$ACOUT"/*.ppu "$ACOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$ACOUT" -FE"$ACOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientAsyncCancel.dpr" > "$ACOUT/build.log" 2>&1 \
+     && [[ -x "$ACOUT/Nghttp2ClientAsyncCancel" ]]; then
+
+    AC_PY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then AC_PY="$CAND"; break; fi
+    done
+
+    AC_PEER_PID=""
+    AC_ARGS=""
+    if [[ -n "$AC_PY" ]]; then
+      "$AC_PY" "$HERE/client-failure-peer.py" 19341 --lifetime 60 \
+        > "$ACOUT/peer.log" 2>&1 &
+      AC_PEER_PID=$!
+      for _ in $(seq 1 50); do
+        grep -q '^READY' "$ACOUT/peer.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$ACOUT/peer.log" 2>/dev/null; then
+        AC_ARGS="peer=19341"
+      else
+        echo "  NOTE  the h2 peer did not start - see $ACOUT/peer.log"
+      fi
+    else
+      echo "  NOTE  no python with h2 (set H2_PYTHON, or pip install h2 into"
+      echo "        tools/protogen/.venv) - Part B will SKIP"
+    fi
+
+    timeout 60 "$ACOUT/Nghttp2ClientAsyncCancel" $AC_ARGS < /dev/null | sed 's/^/  /'
+    AC_RC=${PIPESTATUS[0]}
+    [[ -n "$AC_PEER_PID" ]] && kill "$AC_PEER_PID" 2>/dev/null
+    wait "$AC_PEER_PID" 2>/dev/null || true
+
+    case "$AC_RC" in
+      0)   if [[ -n "$AC_ARGS" ]]; then
+             echo "  per-request cancellation: PASSED (both parts)"
+           else
+             echo "  per-request cancellation: Part A PASSED - Part B SKIPPED, the"
+             echo "        RST-on-the-wire proof was NOT exercised by this run"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - cancellation was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s (a cancellation path hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  per-request cancellation"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientAsyncCancel.dpr did not compile"
+    grep -E "Error|Fatal" "$ACOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $ACOUT/build.log"
     RC=2
   fi
 fi

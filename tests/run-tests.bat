@@ -70,6 +70,11 @@ REM                                       INDEPENDENT nginx (Docker, h2c) - N
 REM                                       threads, a 4 MiB flow-controlled body,
 REM                                       nginx GOAWAY (keepalive_requests). Needs
 REM                                       Docker; SKIPS LOUDLY without it.)
+REM    4u Nghttp2ClientAsyncCancel        build + run   (gates; CL6a -
+REM                                       per-request cancellation + async Pump.
+REM                                       Part A in-process control; Part B needs
+REM                                       Python h2 and confirms the RST reached
+REM                                       the wire. SKIPS Part B LOUDLY.)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
@@ -1030,6 +1035,74 @@ echo -- Nghttp2ClientStress ----------------------------------------------------
 echo    SKIP  Nghttp2ClientStress.dpr not present
 
 :after_stress
+
+REM -- Stage 4u. Per-request cancellation + async pump (CL6a). ---------
+REM CancelRequest sends RST_STREAM(CANCEL); the response is never delivered and
+REM the slot does not leak. Part A (in-process control) always runs; Part B needs
+REM python h2 (client-failure-peer.py /hang + /rststat) and confirms the RST
+REM reached the wire. SKIPS Part B LOUDLY without it.
+if not exist "Nghttp2ClientAsyncCancel.dpr" goto :no_asynccancel
+echo -- Nghttp2ClientAsyncCancel ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientAsyncCancel.dpr" > "Nghttp2ClientAsyncCancel.buildlog" 2>&1
+if errorlevel 1 goto :asynccancel_buildfail
+if not exist "Nghttp2ClientAsyncCancel.exe" goto :asynccancel_buildfail
+
+set "ACPY="
+for %%P in (py python) do if not defined ACPY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "ACPY=%%P"
+)
+set "ACARGS="
+set "ACTITLE=NGHTTP2CANCELPEER"
+if not defined ACPY goto :asynccancel_nopeer
+start "!ACTITLE!" /min !ACPY! "client-failure-peer.py" 19341 --lifetime 60
+ping -n 3 127.0.0.1 > nul
+set "ACARGS=peer=19341"
+goto :asynccancel_run
+
+:asynccancel_nopeer
+echo    NOTE  no Python with the h2 package ^(pip install h2^) - Part B will SKIP
+
+:asynccancel_run
+Nghttp2ClientAsyncCancel.exe !ACARGS! < nul
+set "AC_RC=!errorlevel!"
+if defined ACPY taskkill /FI "WINDOWTITLE eq !ACTITLE!" /T /F > nul 2>&1
+echo.
+if "!AC_RC!"=="3" goto :asynccancel_skip
+if not "!AC_RC!"=="0" goto :asynccancel_fail
+if not defined ACPY goto :asynccancel_partial
+echo    PASS  Nghttp2ClientAsyncCancel - both parts
+goto :after_asynccancel
+
+:asynccancel_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2ClientAsyncCancel - Part A only. SKIP Part B: the
+echo          RST-on-the-wire proof was NOT exercised by this run
+goto :after_asynccancel
+
+:asynccancel_fail
+echo    FAIL  Nghttp2ClientAsyncCancel - !AC_RC!
+set /a FAILED+=1
+goto :after_asynccancel
+
+:asynccancel_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientAsyncCancel - libnghttp2 absent; cancellation NOT exercised
+goto :after_asynccancel
+
+:asynccancel_buildfail
+echo    FAIL  Nghttp2ClientAsyncCancel did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientAsyncCancel.buildlog"
+echo.
+echo    Full log: Nghttp2ClientAsyncCancel.buildlog
+set /a FAILED+=1
+goto :after_asynccancel
+
+:no_asynccancel
+echo -- Nghttp2ClientAsyncCancel ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientAsyncCancel.dpr not present
+
+:after_asynccancel
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM
