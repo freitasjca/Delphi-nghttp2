@@ -75,6 +75,12 @@ REM                                       per-request cancellation + async Pump.
 REM                                       Part A in-process control; Part B needs
 REM                                       Python h2 and confirms the RST reached
 REM                                       the wire. SKIPS Part B LOUDLY.)
+REM    4v Nghttp2ClientAsyncDeadline      build + run   (gates; CL6b -
+REM                                       per-request deadlines. Part A
+REM                                       in-process; Part B needs Python h2
+REM                                       (deadlined /hang times out, /ok
+REM                                       sibling delivers, /rststat confirms
+REM                                       the RST). SKIPS Part B LOUDLY.)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
@@ -1103,6 +1109,74 @@ echo -- Nghttp2ClientAsyncCancel -----------------------------------------------
 echo    SKIP  Nghttp2ClientAsyncCancel.dpr not present
 
 :after_asynccancel
+
+REM -- Stage 4v. Per-request deadlines (CL6b). -------------------------
+REM A per-request deadline RSTs + fails ONLY its own stream when it passes.
+REM Part A (in-process control) always runs; Part B needs python h2
+REM (client-failure-peer.py /hang + /ok + /rststat) for the live-sibling case
+REM and the RST-on-the-wire proof. SKIPS Part B LOUDLY without it.
+if not exist "Nghttp2ClientAsyncDeadline.dpr" goto :no_asyncdeadline
+echo -- Nghttp2ClientAsyncDeadline ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientAsyncDeadline.dpr" > "Nghttp2ClientAsyncDeadline.buildlog" 2>&1
+if errorlevel 1 goto :asyncdeadline_buildfail
+if not exist "Nghttp2ClientAsyncDeadline.exe" goto :asyncdeadline_buildfail
+
+set "ADPY="
+for %%P in (py python) do if not defined ADPY (
+  %%P -c "import h2" > nul 2>&1
+  if not errorlevel 1 set "ADPY=%%P"
+)
+set "ADARGS="
+set "ADTITLE=NGHTTP2DEADLINEPEER"
+if not defined ADPY goto :asyncdeadline_nopeer
+start "!ADTITLE!" /min !ADPY! "client-failure-peer.py" 19342 --lifetime 60
+ping -n 3 127.0.0.1 > nul
+set "ADARGS=peer=19342"
+goto :asyncdeadline_run
+
+:asyncdeadline_nopeer
+echo    NOTE  no Python with the h2 package ^(pip install h2^) - Part B will SKIP
+
+:asyncdeadline_run
+Nghttp2ClientAsyncDeadline.exe !ADARGS! < nul
+set "AD_RC=!errorlevel!"
+if defined ADPY taskkill /FI "WINDOWTITLE eq !ADTITLE!" /T /F > nul 2>&1
+echo.
+if "!AD_RC!"=="3" goto :asyncdeadline_skip
+if not "!AD_RC!"=="0" goto :asyncdeadline_fail
+if not defined ADPY goto :asyncdeadline_partial
+echo    PASS  Nghttp2ClientAsyncDeadline - both parts
+goto :after_asyncdeadline
+
+:asyncdeadline_partial
+set /a SKIPPED+=1
+echo    PASS  Nghttp2ClientAsyncDeadline - Part A only. SKIP Part B: the
+echo          deadline-with-a-live-sibling case was NOT exercised
+goto :after_asyncdeadline
+
+:asyncdeadline_fail
+echo    FAIL  Nghttp2ClientAsyncDeadline - !AD_RC!
+set /a FAILED+=1
+goto :after_asyncdeadline
+
+:asyncdeadline_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientAsyncDeadline - libnghttp2 absent; deadlines NOT exercised
+goto :after_asyncdeadline
+
+:asyncdeadline_buildfail
+echo    FAIL  Nghttp2ClientAsyncDeadline did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientAsyncDeadline.buildlog"
+echo.
+echo    Full log: Nghttp2ClientAsyncDeadline.buildlog
+set /a FAILED+=1
+goto :after_asyncdeadline
+
+:no_asyncdeadline
+echo -- Nghttp2ClientAsyncDeadline ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientAsyncDeadline.dpr not present
+
+:after_asyncdeadline
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM

@@ -168,6 +168,15 @@ type
       as a stream close with error 8, rather than overwriting it with the
       generic "closed with nghttp2 error code 8". }
     Cancelled: Boolean;
+    { [CL6b] Per-request deadline. DeadlineAt is an absolute time (0 = none) set
+      at BeginRequest from ADeadlineMS; the pump RSTs + fails a stream whose
+      deadline passes, leaving the other streams running. TimedOut makes
+      TakeResponse raise ENghttp2Timeout (not plain ENghttp2Client), and sets
+      Cancelled too so OnStreamCloseCb keeps this message. DeadlineMS is kept
+      only for the error text. }
+    TimedOut:   Boolean;
+    DeadlineAt: TDateTime;
+    DeadlineMS: Integer;
     Response:   TNghttp2Response;
     ReqBody:    TBytes;      { pulled by ReadRequestBodyCallback }
     ReqBodyPos: Integer;
@@ -252,6 +261,14 @@ type
     function  AllocSlot(AStreamId: Int32): Integer;
     function  AnyPending: Boolean;
 
+    { [CL6b] Per-request deadlines. FireExpiredDeadlines RSTs + fails every
+      pending stream whose DeadlineAt has passed (returns True if it fired any,
+      so the caller flushes). NearestDeadlineMS bounds a pump read so it does
+      not overshoot the soonest pending deadline - min(ADefault, ms-to-nearest),
+      floored at 1; ADefault unchanged when no stream has a deadline. }
+    function  FireExpiredDeadlines: Boolean;
+    function  NearestDeadlineMS(ADefault: Integer): Integer;
+
     procedure SubmitClientSettings;
     procedure FlushSession;
     procedure PumpUntilDone(ATimeoutMS: Integer);
@@ -320,14 +337,19 @@ type
       failed, so one broken stream does not discard the others. }
     { [CL3] AStreamResponse opts this stream into incremental delivery: the body
       is NOT accumulated into the response, and must be drained with ReadChunk.
-      Default False, so every existing caller is unaffected. }
+      Default False, so every existing caller is unaffected.
+      [CL6b] ADeadlineMS (0 = none, the default) is this ONE stream's deadline:
+      if it passes while the stream is still open, the pump RSTs that stream and
+      fails it (TakeResponse raises ENghttp2Timeout) without disturbing the other
+      in-flight streams - unlike the single whole-batch budget on PumpAll. }
     function  BeginRequest(
       const AMethod:  string;
       const APath:    string;
       const AHeaders: TNghttp2Headers;
       const ABody:    TBytes;
       AStreamResponse: Boolean = False;
-      ADeferred:       Boolean = False): Int32;
+      ADeferred:       Boolean = False;
+      ADeadlineMS:     Integer = 0): Int32;
     procedure PumpAll(ATimeoutMS: Integer = DEFAULT_REQUEST_TIMEOUT_MS);
 
     { [CL6a] The cooperative async pump - ONE bounded pass. Sends whatever is
@@ -1126,6 +1148,63 @@ begin
   Result := Round((Now - AStart) * 86400.0 * 1000.0);
 end;
 
+{ [CL6b] RST + fail every pending stream whose per-request deadline has passed.
+  Reuses CL6a's cancel shape: RST_STREAM(CANCEL) so the stream closes on the
+  wire and nothing leaks, plus Cancelled (OnStreamCloseCb keeps our message) and
+  TimedOut (TakeResponse raises ENghttp2Timeout). Only the expired streams are
+  touched; others keep running. Returns True if any fired, so the caller flushes
+  the RSTs. The RST is best effort - a non-zero return means nghttp2 already
+  closed the stream, which is fine. }
+function TNghttp2Client.FireExpiredDeadlines: Boolean;
+const
+  HTTP2_CANCEL = 8;
+var
+  I:    Integer;
+  LNow: TDateTime;
+begin
+  Result := False;
+  LNow := Now;
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and (not FStreams[I].Done)
+       and (FStreams[I].DeadlineAt <> 0) and (LNow >= FStreams[I].DeadlineAt) then
+    begin
+      FStreams[I].TimedOut  := True;
+      FStreams[I].Cancelled := True;
+      FStreams[I].Done      := True;
+      FStreams[I].Error     := Format(
+        'stream %d exceeded its per-request deadline of %d ms',
+        [FStreams[I].Id, FStreams[I].DeadlineMS]);
+      nghttp2_submit_rst_stream(FSession, 0, FStreams[I].Id, HTTP2_CANCEL);
+      Result := True;
+    end;
+end;
+
+{ [CL6b] The pump must not block past the soonest pending deadline, or that
+  stream would not time out until an unrelated read returned. Returns
+  min(ADefault, ms-to-nearest-pending-deadline), floored at 1 (0 would mean
+  block-indefinitely to DoRead). ADefault unchanged when no stream has one. }
+function TNghttp2Client.NearestDeadlineMS(ADefault: Integer): Integer;
+var
+  I:    Integer;
+  LNow: TDateTime;
+  LMs:  Int64;
+begin
+  Result := ADefault;
+  LNow := Now;
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and (not FStreams[I].Done)
+       and (FStreams[I].DeadlineAt <> 0) then
+    begin
+      LMs := Round((FStreams[I].DeadlineAt - LNow) * 86400.0 * 1000.0);
+      if LMs < 1 then
+        LMs := 1;   { at/just past the deadline: fire next pass, do not block }
+      if LMs < Result then
+        Result := Integer(LMs);
+    end;
+  if Result < 1 then
+    Result := 1;
+end;
+
 procedure TNghttp2Client.FailOpenStreams(const AReason: string);
 var
   I: Integer;
@@ -1151,6 +1230,14 @@ begin
   { MULTISTREAM-1 — run until every open stream has closed, not just one. }
   while AnyPending do
   begin
+    { [CL6b] Fire any per-request deadlines first: those streams become Done
+      (dropped from AnyPending) while the others keep running. If that leaves
+      nothing pending, the batch is finished - do NOT raise the whole-batch
+      timeout below; each timed-out stream carries its own ENghttp2Timeout. }
+    FireExpiredDeadlines;
+    if not AnyPending then
+      Break;
+
     { [CL2c] >= rather than >. With the read now bounded by what remains of the
       budget, an elapsed time of EXACTLY ATimeoutMS left zero to wait on, and
       the old strict > sent us round the loop to spin until the clock ticked
@@ -1179,8 +1266,11 @@ begin
       on this line, so the cast cannot lose anything — but an implicit
       conversion here is a warning on Delphi and a range-check failure with
       $R+, neither of which this container can catch. }
+    { [CL6b] Bound the read by the soonest pending per-request deadline too, so
+      a stream with a short deadline fires promptly even while others (or the
+      batch budget) would wait much longer. }
     LRecvLen := DoRead(@FRecvBuffer[0], Length(FRecvBuffer),
-                       Integer(LRemainingMS), LTimedOut);
+                       NearestDeadlineMS(Integer(LRemainingMS)), LTimedOut);
     if LTimedOut then
       Continue;
     if LRecvLen <= 0 then
@@ -1222,7 +1312,8 @@ function TNghttp2Client.BeginRequest(
   const AHeaders: TNghttp2Headers;
   const ABody:    TBytes;
   AStreamResponse: Boolean;
-  ADeferred:       Boolean): Int32;
+  ADeferred:       Boolean;
+  ADeadlineMS:     Integer): Int32;
 var
   LNvs:         array of Tnghttp2_nv;
   LNames:       array of AnsiString;    // hold refs so PAnsiChar stays valid
@@ -1326,6 +1417,13 @@ begin
   FStreams[LIdx].ReqBodyPos       := 0;
   FStreams[LIdx].Streaming        := AStreamResponse;   { [CL3] }
   FStreams[LIdx].OutboundDeferred := ADeferred;         { [GC5] }
+  { [CL6b] Absolute deadline, computed the DateUtils-free way this unit uses
+    elsewhere (ms as a fraction of a day). 0 leaves DeadlineAt 0 = no deadline. }
+  if ADeadlineMS > 0 then
+  begin
+    FStreams[LIdx].DeadlineMS := ADeadlineMS;
+    FStreams[LIdx].DeadlineAt := Now + ADeadlineMS / (86400.0 * 1000.0);
+  end;
 
   Result := LStreamId;
 end;
@@ -1490,6 +1588,9 @@ var
   LConsumed: NativeInt;
   LTimedOut: Boolean;
 begin
+  { [CL6b] RST any streams whose deadline already passed; FlushSession below
+    sends those resets along with anything else queued. }
+  FireExpiredDeadlines;
   FlushSession;
 
   { Nothing further will arrive — the caller must treat this as end of data
@@ -1497,9 +1598,17 @@ begin
   if nghttp2_session_want_read(FSession) = 0 then
     Exit(-1);
 
-  LRecvLen := DoRead(@FRecvBuffer[0], Length(FRecvBuffer), ATimeoutMS, LTimedOut);
+  { [CL6b] Bound the read by the soonest pending deadline so it fires on time. }
+  LRecvLen := DoRead(@FRecvBuffer[0], Length(FRecvBuffer),
+                     NearestDeadlineMS(ATimeoutMS), LTimedOut);
   if LTimedOut then
+  begin
+    { A per-request deadline may have elapsed during the read; fire it now so a
+      Pump-loop caller sees the stream finish on this pass. }
+    if FireExpiredDeadlines then
+      FlushSession;
     Exit(0);
+  end;
   if LRecvLen <= 0 then
     raise ENghttp2Client.Create('peer closed connection before stream end');
 
@@ -1508,7 +1617,9 @@ begin
     raise ENghttp2Client.CreateFmt('nghttp2_session_mem_recv: %d', [LConsumed]);
 
   { Callbacks fired during mem_recv may have queued WINDOW_UPDATE frames; get
-    them onto the wire now or the peer stalls waiting for window. }
+    them onto the wire now or the peer stalls waiting for window. A deadline may
+    also have elapsed during the read - fire it so its RST flushes here too. }
+  FireExpiredDeadlines;
   FlushSession;
   Result := 1;
 end;
@@ -1569,6 +1680,13 @@ begin
       the final bytes and those bytes must be delivered first. }
     if FStreams[LIdx].Done then
     begin
+      { [CL6b] A per-request deadline closed this streaming stream: that is a
+        timeout, not a clean end, so raise rather than returning 0 (which a
+        reader takes as end-of-stream). }
+      if FStreams[LIdx].TimedOut then
+        raise ENghttp2Timeout.CreateFmt(
+          'stream %d exceeded its per-request deadline of %d ms',
+          [AStreamId, FStreams[LIdx].DeadlineMS]);
       SetLength(ABuffer, 0);
       Exit(0);
     end;
@@ -1600,6 +1718,7 @@ var
   LErr:  string;
   LSafe: Boolean;         { [CL5.5 RETRYSAFE-1] }
   LExc:  ENghttp2Client;  { [CL5.5 RETRYSAFE-1] }
+  LTimedOut: Boolean;     { [CL6b] per-request deadline fired }
 begin
   LIdx := FindSlot(AStreamId);
   if LIdx < 0 then
@@ -1622,11 +1741,22 @@ begin
   Result := FStreams[LIdx].Response;
   LErr   := FStreams[LIdx].Error;
   LSafe  := FStreams[LIdx].SafeToRetry;   { [CL5.5 RETRYSAFE-1] capture before the wipe }
+  LTimedOut := FStreams[LIdx].TimedOut;   { [CL6b] capture before the wipe }
   FStreams[LIdx].InUse := False;
   FStreams[LIdx] := Default(TNghttp2StreamSlot);
 
   if LErr <> '' then
   begin
+    { [CL6b] A fired per-request deadline raises the timeout subclass, so a
+      caller (and the gRPC client, which maps it to 4 DEADLINE_EXCEEDED) can
+      tell "too slow" from any other failure. SafeToRetry stays False: the
+      request was on the wire, so the server may have processed it. }
+    if LTimedOut then
+    begin
+      LExc := ENghttp2Timeout.Create(LErr);
+      LExc.SafeToRetry := LSafe;
+      raise LExc;
+    end;
     { [CL5.5 RETRYSAFE-1] Carry the stream's retry classification onto the
       exception. A connection drop raised directly by PumpUntilDone never
       reaches here and keeps the default False (uncertain), which is correct. }

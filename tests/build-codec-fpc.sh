@@ -69,6 +69,14 @@
 #                                       no leak); Part B needs python h2 and
 #                                       confirms the RST reached the wire
 #                                       (/rststat). SKIPS Part B LOUDLY.)
+#    4v Nghttp2ClientAsyncDeadline      build + run   (gates; CL6b — per-request
+#                                       deadlines. Part A in-process (a deadline
+#                                       fires on a slow stream, returns near the
+#                                       deadline not the sleep; generous/zero do
+#                                       not fire; no leak); Part B needs python h2
+#                                       (a deadlined /hang times out while a /ok
+#                                       sibling delivers; /rststat confirms the
+#                                       RST). SKIPS Part B LOUDLY.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1418,6 +1426,79 @@ else
     echo "  FAIL  Nghttp2ClientAsyncCancel.dpr did not compile"
     grep -E "Error|Fatal" "$ACOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $ACOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── 4v · per-request deadlines (CL6b) ────────────────────────────────────────
+# A per-request deadline RSTs + fails ONLY its own stream when it passes, others
+# keep running. Part A (in-process control) always runs; Part B needs python h2
+# (client-failure-peer.py /hang + /ok + /rststat) for the deadline-with-a-live-
+# sibling case and the RST-on-the-wire proof - it SKIPS LOUDLY without it.
+echo
+echo "── per-request deadlines (CL6b) ──────────────────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientAsyncDeadline.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientAsyncDeadline.dpr not present"
+else
+  ADOUT="$OUT/client-asyncdeadline"
+  mkdir -p "$ADOUT"
+  rm -f "$ADOUT"/*.ppu "$ADOUT"/*.o 2>/dev/null || true
+
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$ADOUT" -FE"$ADOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientAsyncDeadline.dpr" > "$ADOUT/build.log" 2>&1 \
+     && [[ -x "$ADOUT/Nghttp2ClientAsyncDeadline" ]]; then
+
+    AD_PY=""
+    for CAND in "${H2_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+      [[ -z "$CAND" ]] && continue
+      if "$CAND" -c 'import h2' > /dev/null 2>&1; then AD_PY="$CAND"; break; fi
+    done
+
+    AD_PEER_PID=""
+    AD_ARGS=""
+    if [[ -n "$AD_PY" ]]; then
+      "$AD_PY" "$HERE/client-failure-peer.py" 19342 --lifetime 60 \
+        > "$ADOUT/peer.log" 2>&1 &
+      AD_PEER_PID=$!
+      for _ in $(seq 1 50); do
+        grep -q '^READY' "$ADOUT/peer.log" 2>/dev/null && break
+        sleep 0.1
+      done
+      if grep -q '^READY' "$ADOUT/peer.log" 2>/dev/null; then
+        AD_ARGS="peer=19342"
+      else
+        echo "  NOTE  the h2 peer did not start - see $ADOUT/peer.log"
+      fi
+    else
+      echo "  NOTE  no python with h2 (set H2_PYTHON, or pip install h2 into"
+      echo "        tools/protogen/.venv) - Part B will SKIP"
+    fi
+
+    timeout 60 "$ADOUT/Nghttp2ClientAsyncDeadline" $AD_ARGS < /dev/null | sed 's/^/  /'
+    AD_RC=${PIPESTATUS[0]}
+    [[ -n "$AD_PEER_PID" ]] && kill "$AD_PEER_PID" 2>/dev/null
+    wait "$AD_PEER_PID" 2>/dev/null || true
+
+    case "$AD_RC" in
+      0)   if [[ -n "$AD_ARGS" ]]; then
+             echo "  per-request deadlines: PASSED (both parts)"
+           else
+             echo "  per-request deadlines: Part A PASSED - Part B SKIPPED, the"
+             echo "        deadline-with-a-live-sibling case was NOT exercised"
+           fi ;;
+      3)   echo "  SKIP  libnghttp2 absent - deadlines were NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s (a deadline path hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  per-request deadlines"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientAsyncDeadline.dpr did not compile"
+    grep -E "Error|Fatal" "$ADOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $ADOUT/build.log"
     RC=2
   fi
 fi
