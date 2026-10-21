@@ -109,6 +109,7 @@
 #                                                      a BROKEN probe)
 #    4  samples/grpc-server             compile only  (gates)
 #    5  samples/grpc-server, old define compile only  (gates back-compat)
+#    5a samples/async-client (CL8)      compile only  (gates; async API + pool)
 #    6  protogen parser tests (C1)      build + run   (gates)
 #    6b protogen file set (IMPORT-1)    build + run   (gates)
 #    7  protoc oracle (C1b)             run           (gates if protoc is
@@ -1959,6 +1960,39 @@ if [[ -f "$SAMPLE" ]]; then
 else
   echo
   echo "  SKIP  samples/grpc-server not present"
+fi
+
+# ── 5a · samples/async-client — compile only ─────────────────────────────────
+# The CL8 client sample: the async API (BeginRequest + Pump + OnComplete) and
+# the connection pool, in one self-contained program that starts an in-process
+# server and drives TNghttp2Client against it. It is the sample "beyond
+# PingClient" (which is one blocking GET). Compile only, never run: the async
+# path itself already runs under tests/Nghttp2ClientAsync*.dpr, so what this
+# stage adds is that the SAMPLE compiles on both toolchains. A plain HTTP/2
+# client — no gRPC — so no -dNGHTTP2_GRPC_NO_FFI and no libffi concern; the
+# -Fu list and trunk pin are the same hard part the grpc-server stage solved.
+ACSAMPLE="$HERE/../samples/async-client/Nghttp2AsyncClient.dpr"
+if [[ -f "$ACSAMPLE" ]]; then
+  echo
+  echo "── samples/async-client (compile only) ──────────────────────────────"
+  ACOUT="$OUT/sample-asyncclient"
+  mkdir -p "$ACOUT"
+  rm -f "$ACOUT"/*.ppu "$ACOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$ACOUT" -FE"$ACOUT" \
+       -Fu"$SRC" -Fu"$(dirname "$ACSAMPLE")" \
+       $TRUNK_UNIT_PATHS \
+       "$ACSAMPLE" > "$ACOUT/build.log" 2>&1 && [[ -x "$ACOUT/Nghttp2AsyncClient" ]]; then
+    echo "  PASS  Nghttp2AsyncClient.dpr"
+  else
+    echo "  FAIL  Nghttp2AsyncClient.dpr"
+    grep -E "Error|Fatal" "$ACOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $ACOUT/build.log"
+    RC=2
+  fi
+else
+  echo
+  echo "  SKIP  samples/async-client not present"
 fi
 
 # ── 6 · protogen parser (C1) ────────────────────────────────────────────────

@@ -101,6 +101,7 @@ REM                                       against python grpcio (SKIPS LOUDLY).
 REM                                       TLS 1.2/1.3 cipher setters, read
 REM                                       back from OpenSSL. Skips LOUDLY
 REM                                       when OpenSSL is absent.)
+REM    4n samples\async-client (CL8)   compile only  (gates) - async API + pool
 REM    5  ProtogenParserTests             build + run   (gates) - in
 REM                                                     ..\tools\protogen
 REM    6  ProtogenEmitTests               build + run   (gates) - same dir
@@ -1393,6 +1394,35 @@ echo -- Inventory sample (GC7) -------------------------------------------------
 echo    SKIP  samples\inventory not present
 
 :after_inventory
+
+REM -- samples\async-client: the CL8 client sample - the async API (BeginRequest
+REM    + Pump + OnComplete) and the connection pool, self-contained (it starts an
+REM    in-process server). Compile only: the async path itself runs under stages
+REM    4u/4v/4w, so this proves the SAMPLE compiles. Built from its own dir so
+REM    ..\..\src resolves, like the inventory stage.
+if not exist "..\samples\async-client\Nghttp2AsyncClient.dpr" goto :no_asyncsample
+echo -- samples\async-client (compile only) ---------------------------------------------------------------
+pushd "..\samples\async-client"
+"!DCC!" -CC -B -U"..\..\src" "Nghttp2AsyncClient.dpr" > "Nghttp2AsyncClient.buildlog" 2>&1
+if errorlevel 1 goto :asyncsample_buildfail
+if not exist "Nghttp2AsyncClient.exe" goto :asyncsample_buildfail
+popd
+echo    PASS  Nghttp2AsyncClient.dpr ^(compile only^)
+goto :after_asyncsample
+
+:asyncsample_buildfail
+echo    FAIL  Nghttp2AsyncClient did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2AsyncClient.buildlog"
+echo    Full log: samples\async-client\Nghttp2AsyncClient.buildlog
+popd
+set /a FAILED+=1
+goto :after_asyncsample
+
+:no_asyncsample
+echo -- samples\async-client (compile only) ---------------------------------------------------------------
+echo    SKIP  samples\async-client not present
+
+:after_asyncsample
 
 REM -- protogen parser (C1). Lives in ..\tools\protogen, not here, so this is
 REM    the one stage that changes directory. Its units are pure RTL and pull in
