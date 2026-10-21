@@ -81,6 +81,10 @@ REM                                       in-process; Part B needs Python h2
 REM                                       (deadlined /hang times out, /ok
 REM                                       sibling delivers, /rststat confirms
 REM                                       the RST). SKIPS Part B LOUDLY.)
+REM    4w Nghttp2ClientAsyncComplete      build + run   (gates; CL6c -
+REM                                       OnComplete callback + 100 in-flight
+REM                                       from one thread. In-process, always
+REM                                       runs.)
 REM    4i Nghttp2CipherConfig             build + run   (gates) - TLSCIPHER-1
 REM    4j Nghttp2KeyPassword             build + run   (gates) - KEYPW-1
 REM    4k Nghttp2ClientTrailers          build + run   (gates) - GC1
@@ -1177,6 +1181,47 @@ echo -- Nghttp2ClientAsyncDeadline ---------------------------------------------
 echo    SKIP  Nghttp2ClientAsyncDeadline.dpr not present
 
 :after_asyncdeadline
+
+REM -- Stage 4w. Completion callback + 100 in-flight (CL6c). -----------
+REM OnComplete fires once per terminal stream during Pump; 100 in-flight from
+REM one thread, polled and push-style. Entirely in-process (cooperative
+REM dispatch, not protocol), so no python peer and it always runs.
+if not exist "Nghttp2ClientAsyncComplete.dpr" goto :no_asynccomplete
+echo -- Nghttp2ClientAsyncComplete ---------------------------------------------------------------
+"!DCC!" -CC -B -U"..\src" "Nghttp2ClientAsyncComplete.dpr" > "Nghttp2ClientAsyncComplete.buildlog" 2>&1
+if errorlevel 1 goto :asynccomplete_buildfail
+if not exist "Nghttp2ClientAsyncComplete.exe" goto :asynccomplete_buildfail
+Nghttp2ClientAsyncComplete.exe < nul
+set "CO_RC=!errorlevel!"
+echo.
+if "!CO_RC!"=="3" goto :asynccomplete_skip
+if not "!CO_RC!"=="0" goto :asynccomplete_fail
+echo    PASS  Nghttp2ClientAsyncComplete
+goto :after_asynccomplete
+
+:asynccomplete_fail
+echo    FAIL  Nghttp2ClientAsyncComplete - !CO_RC!
+set /a FAILED+=1
+goto :after_asynccomplete
+
+:asynccomplete_skip
+set /a SKIPPED+=1
+echo    SKIP  Nghttp2ClientAsyncComplete - libnghttp2 absent; callback NOT exercised
+goto :after_asynccomplete
+
+:asynccomplete_buildfail
+echo    FAIL  Nghttp2ClientAsyncComplete did not compile
+findstr /C:"Error" /C:"Fatal" "Nghttp2ClientAsyncComplete.buildlog"
+echo.
+echo    Full log: Nghttp2ClientAsyncComplete.buildlog
+set /a FAILED+=1
+goto :after_asynccomplete
+
+:no_asynccomplete
+echo -- Nghttp2ClientAsyncComplete ---------------------------------------------------------------
+echo    SKIP  Nghttp2ClientAsyncComplete.dpr not present
+
+:after_asynccomplete
 
 REM -- Stage 4l. gRPC unary client (GC2, B2 gRPC client plan). -------------
 REM

@@ -177,6 +177,9 @@ type
     TimedOut:   Boolean;
     DeadlineAt: TDateTime;
     DeadlineMS: Integer;
+    { [CL6c] OnComplete has already fired for this (now terminal) stream, so the
+      pump does not fire it again on later passes. }
+    Notified:   Boolean;
     Response:   TNghttp2Response;
     ReqBody:    TBytes;      { pulled by ReadRequestBodyCallback }
     ReqBodyPos: Integer;
@@ -213,6 +216,18 @@ type
     OutboundEOF:      Boolean;
   end;
 
+  TNghttp2Client = class;
+
+  { [CL6c] Fired once, on the pump thread, as each stream reaches a terminal
+    state (completed, errored, cancelled or timed out) during Pump / PumpAll /
+    SubmitRequest. A plain procedure, NOT a reference-to, so the client stays
+    FPC 3.2.2-clean (anonymous methods need trunk); AClient lets it reach back -
+    typically AClient.TakeResponse(AStreamId) to process the result (which
+    raises for a failed/cancelled/timed-out stream), or just to count. The slot
+    is Done but NOT yet reaped when this fires. Do NOT call Pump / PumpAll from
+    it - it already runs inside one; TakeResponse and BeginRequest are fine. }
+  TNghttp2OnComplete = procedure(AClient: TNghttp2Client; AStreamId: Int32);
+
   TNghttp2Client = class
   private
     // NOTE: plain `private` (not `strict private`) is required — the FFI
@@ -239,6 +254,7 @@ type
     // 0 = no timeout; OS TCP retry budget applies (~127 s Linux default).
     // Set before Connect; applies to every (re)connect including auto-reconnect.
     FConnectTimeoutMS: Integer;
+    FOnComplete: TNghttp2OnComplete;   { [CL6c] per-stream completion callback }
 
     { MULTISTREAM-1 — per-stream state, indexed by nghttp2 stream id.
 
@@ -268,6 +284,11 @@ type
       floored at 1; ADefault unchanged when no stream has a deadline. }
     function  FireExpiredDeadlines: Boolean;
     function  NearestDeadlineMS(ADefault: Integer): Integer;
+
+    { [CL6c] Fire OnComplete once for each stream now terminal and not yet
+      notified. Collects the ids first, THEN calls back, so the callback may
+      TakeResponse / BeginRequest (mutating FStreams) without disturbing the walk. }
+    procedure NotifyCompletions;
 
     procedure SubmitClientSettings;
     procedure FlushSession;
@@ -489,6 +510,9 @@ type
     // Set before Connect; applies to every reconnect, including auto-reconnect.
     property ConnectTimeoutMS: Integer read FConnectTimeoutMS
                                        write FConnectTimeoutMS;
+    { [CL6c] Opt-in per-stream completion callback - see TNghttp2OnComplete.
+      nil (default) = no callback; reap with TakeResponse by polling instead. }
+    property OnComplete: TNghttp2OnComplete read FOnComplete write FOnComplete;
   end;
 
   // Convenience — one-shot request without holding a TNghttp2Client. Opens,
@@ -1205,6 +1229,32 @@ begin
     Result := 1;
 end;
 
+{ [CL6c] Fire OnComplete once per newly-terminal stream. Collect the ids under
+  the Notified guard FIRST, then call back - the callback may TakeResponse (frees
+  a slot) or BeginRequest (may grow FStreams), so iterating while calling would
+  be walking an array the callback is mutating. }
+procedure TNghttp2Client.NotifyCompletions;
+var
+  I, LCount: Integer;
+  LIds: array of Int32;
+begin
+  if not Assigned(FOnComplete) then
+    Exit;
+  SetLength(LIds, Length(FStreams));
+  LCount := 0;
+  for I := 0 to High(FStreams) do
+    if FStreams[I].InUse and FStreams[I].Done and (not FStreams[I].Notified) then
+    begin
+      FStreams[I].Notified := True;
+      LIds[LCount] := FStreams[I].Id;
+      Inc(LCount);
+    end;
+  for I := 0 to LCount - 1 do
+    { re-check: an earlier callback may have cleared OnComplete }
+    if Assigned(FOnComplete) then
+      FOnComplete(Self, LIds[I]);
+end;
+
 procedure TNghttp2Client.FailOpenStreams(const AReason: string);
 var
   I: Integer;
@@ -1235,6 +1285,9 @@ begin
       nothing pending, the batch is finished - do NOT raise the whole-batch
       timeout below; each timed-out stream carries its own ENghttp2Timeout. }
     FireExpiredDeadlines;
+    { [CL6c] Fire OnComplete for streams that finished on the previous pass and
+      for any just-expired deadline, before a possible Break below. }
+    NotifyCompletions;
     if not AnyPending then
       Break;
 
@@ -1300,6 +1353,9 @@ begin
   end;
 
   FlushSession;   // final flush of anything callbacks queued
+  { [CL6c] The last pass's completions: the while-condition already exited, so
+    the loop-top NotifyCompletions never ran for them. }
+  NotifyCompletions;
 
   { Per-stream errors are NOT raised here. With several streams in flight, one
     failure must not discard the others' responses — TakeResponse raises for the
@@ -1591,6 +1647,9 @@ begin
   { [CL6b] RST any streams whose deadline already passed; FlushSession below
     sends those resets along with anything else queued. }
   FireExpiredDeadlines;
+  { [CL6c] Fire OnComplete for anything already terminal (a prior pass, or a
+    cancel/deadline between passes) before we might Exit(-1) with no read. }
+  NotifyCompletions;
   FlushSession;
 
   { Nothing further will arrive — the caller must treat this as end of data
@@ -1607,6 +1666,7 @@ begin
       Pump-loop caller sees the stream finish on this pass. }
     if FireExpiredDeadlines then
       FlushSession;
+    NotifyCompletions;   { [CL6c] a deadline may have just made a stream terminal }
     Exit(0);
   end;
   if LRecvLen <= 0 then
@@ -1621,6 +1681,7 @@ begin
     also have elapsed during the read - fire it so its RST flushes here too. }
   FireExpiredDeadlines;
   FlushSession;
+  NotifyCompletions;   { [CL6c] this pass's completions }
   Result := 1;
 end;
 

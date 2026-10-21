@@ -77,6 +77,10 @@
 #                                       (a deadlined /hang times out while a /ok
 #                                       sibling delivers; /rststat confirms the
 #                                       RST). SKIPS Part B LOUDLY.)
+#    4w Nghttp2ClientAsyncComplete      build + run   (gates; CL6c — OnComplete
+#                                       callback + 100 in-flight from one thread.
+#                                       In-process (poll + push + a terminal
+#                                       non-success), always runs.)
 #    4i Nghttp2CipherConfig             build + run   (gates; TLSCIPHER-1 —
 #    4j Nghttp2KeyPassword             build + run   (gates; KEYPW-1 — encrypted keys)
 #    4k Nghttp2ClientTrailers          build + run   (gates; GC1 — Response.Trailers
@@ -1499,6 +1503,43 @@ else
     echo "  FAIL  Nghttp2ClientAsyncDeadline.dpr did not compile"
     grep -E "Error|Fatal" "$ADOUT/build.log" | head -12 | sed 's/^/    /'
     echo "    full log: $ADOUT/build.log"
+    RC=2
+  fi
+fi
+
+# ── 4w · completion callback + 100 in-flight (CL6c) ──────────────────────────
+# OnComplete fires once per terminal stream during Pump; "100 in-flight from one
+# thread" exercised both polled and push-style. Entirely in-process (our own
+# server is the right peer - this is cooperative dispatch, not protocol), so no
+# python peer and it always runs.
+echo
+echo "── completion callback + 100 in-flight (CL6c) ────────────────────────"
+if [[ ! -f "$HERE/Nghttp2ClientAsyncComplete.dpr" ]]; then
+  echo "  SKIP  Nghttp2ClientAsyncComplete.dpr not present"
+else
+  COOUT="$OUT/client-asynccomplete"
+  mkdir -p "$COOUT"
+  rm -f "$COOUT"/*.ppu "$COOUT"/*.o 2>/dev/null || true
+  if "$TRUNK" -MDelphi -O1 \
+       -FU"$COOUT" -FE"$COOUT" \
+       -Fu"$SRC" \
+       $TRUNK_UNIT_PATHS \
+       "$HERE/Nghttp2ClientAsyncComplete.dpr" > "$COOUT/build.log" 2>&1 \
+     && [[ -x "$COOUT/Nghttp2ClientAsyncComplete" ]]; then
+    timeout 60 "$COOUT/Nghttp2ClientAsyncComplete" < /dev/null | sed 's/^/  /'
+    CO_RC=${PIPESTATUS[0]}
+    case "$CO_RC" in
+      0)   echo "  completion callback: PASSED" ;;
+      3)   echo "  SKIP  libnghttp2 absent - completion callback was NOT exercised" ;;
+      124) echo "  FAIL  timed out after 60s (the 100-in-flight pump hung)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      *)   echo "  FAIL  completion callback"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+    esac
+  else
+    echo "  FAIL  Nghttp2ClientAsyncComplete.dpr did not compile"
+    grep -E "Error|Fatal" "$COOUT/build.log" | head -12 | sed 's/^/    /'
+    echo "    full log: $COOUT/build.log"
     RC=2
   fi
 fi
