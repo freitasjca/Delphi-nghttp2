@@ -147,7 +147,7 @@ arrived here in **1.0.0**.
 | **gRPC error replies carry no message — GRPC-STATUSONLY-1** | **✓** (1.28.0 — the dispatcher sent a zero-length MESSAGE before every error trailer (unknown method, decode error, handler exception), so a streaming client saw one empty message and then the error. Now an empty body, then the trailer. Found by the GC6 control run) |
 | **gRPC client streaming and bidi from the client side** | **✓** (1.29.0, GC5 — `BeginStreamingRequest` on `TNghttp2Client`; `IGrpcClientWriterCall` (client-streaming) and `IGrpcBidiStream` (bidi) on `TGrpcChannel`; `protogen --client` now emits typed wrappers for all four RPC shapes. Checked against our own server and a python `grpcio` peer on both compilers — client stream 1000 messages, bidi echo 10 rounds) |
 | **Reusable session pool for high-concurrency clients** | **✓** (CL5 — `TNghttp2ClientPool` in `Nghttp2.Client.Pool`: `Acquire`/`Release` of pooled `TNghttp2Client` connections keyed by scheme+host+port, a `MaxClientsPerKey` ceiling, and idle eviction. Thread-safe — a client is owned by one thread between Acquire and Release, satisfying libnghttp2's one-thread-per-session rule. Gated by `tests/Nghttp2ClientPool.dpr`: 19/19 on Delphi 12 and FPC trunk, including 8 threads × 25 requests with the ceiling never exceeded) |
-| Async client API (non-blocking `SubmitRequest`) | planned — note `BeginRequest`/`PumpAll` already covers concurrency *within* one connection; what remains is not blocking the calling thread at all |
+| **Async client API** — cooperative pump, cancellation, per-request deadlines, completion callback | **✓** (CL6 — single-threaded by design: the library spins no thread of its own (libnghttp2's one-driver rule), so the model is submit-many then pump from one thread, not a background-threaded `SubmitRequest`. `Pump(ms)` is one bounded, non-blocking pass of the session (`while Pump(ms) > 0` → `TakeResponse` each); `CancelRequest` sends RST_STREAM(CANCEL); `BeginRequest(…, ADeadlineMS)` gives one stream its own deadline, failing only it; `OnComplete` is an opt-in per-stream completion callback fired during the pump — a plain procedure, so the client stays FPC 3.2.2-clean. Gated by `tests/Nghttp2ClientAsyncCancel.dpr` (4u), `Nghttp2ClientAsyncDeadline.dpr` (4v) and `Nghttp2ClientAsyncComplete.dpr` (4w), including 100 in-flight from one thread, on Delphi 12 and FPC trunk. See [`doc/client.md`](doc/client.md)) |
 
 ---
 
@@ -568,6 +568,10 @@ only if *that* stream failed — one broken stream does not discard the others.
 **One thread per client.** Concurrency here means multiplexed streams on one
 connection, not a client shared between threads; use separate clients for
 separate connections.
+
+The full client reference — DNS and IPv6, TLS and mTLS, incremental `ReadChunk`,
+the connection pool, and the async pump with cancellation, per-request deadlines
+and a completion callback — is [`doc/client.md`](doc/client.md).
 
 ---
 
