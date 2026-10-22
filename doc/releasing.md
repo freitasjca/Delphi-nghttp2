@@ -34,6 +34,24 @@ the exit status too, so a failing build looks green twice over.
 > features sit on that seam. Green on one compiler is not evidence for the
 > other.
 
+### What CI covers — and what it does not
+
+Since 2026-10-22 a GitHub Actions workflow (`.github/workflows/ci.yml`) compiles
+the **FPC 3.2.2 transport** leg on every push: the two pure-transport samples
+(`PingClient`, `samples/async-client/Nghttp2AsyncClient`) on `ubuntu-24.04`. A
+green check there means the transport stayed **3.2.2-clean** — the one thing
+nothing else runs routinely, since the full suites need FPC trunk. It is **not**
+a substitute for the two gates above: CI runs neither the trunk
+`build-codec-fpc.sh` (no reliable hosted trunk toolchain) nor `run-tests.bat`
+(hosted runners have no Delphi). Treat the Action as a pre-filter; the two
+toolchain gates are still the release gate.
+
+A `delphi-ci.json` at the repo root is a fast Delphi **build** check — Clean +
+Build the library through its samples via `Invoke-DelphiCi` (the
+continuous-delphi framework, DCCBuild engine). Use it for a quick "does it still
+compile on Delphi" before the full `run-tests.bat`; it is a build gate, not a
+test gate, so it does not replace step 1 either.
+
 ### If the generator changed
 
 ```bash
