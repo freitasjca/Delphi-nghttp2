@@ -70,10 +70,22 @@ if ! docker run -d --name "$NAME" -p "${BIND}:${PORT}:${PORT}" \
   exit 3
 fi
 
-# Wait for the published port to accept a TCP connection.
-for _ in $(seq 1 50); do
-  if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
-    exec 3>&- 2>/dev/null || true
+# Wait until nginx is actually SERVING, not merely until Docker's published-port
+# proxy accepts a TCP connection. That proxy accepts BEFORE the container's nginx
+# has started (the script first writes a 4 MiB file and the conf, then execs
+# nginx), so a TCP-only readiness check declared READY too early and the gate's
+# first request failed with "send failed during FlushSession" (0 passed) - a
+# race that Windows usually won and Linux/WSL, with a slower cold start, often
+# lost. Poll a real GET /small until it answers 'ok'. nginx serves HTTP/1.1 on
+# this listener too, so a plain curl is enough; without curl on the host, ask
+# busybox wget INSIDE the container (it hits nginx's own 127.0.0.1:PORT).
+for _ in $(seq 1 100); do
+  if command -v curl >/dev/null 2>&1; then
+    if [ "$(curl -fsS -m 2 "http://127.0.0.1:${PORT}/small" 2>/dev/null)" = "ok" ]; then
+      echo "READY ${PORT}"
+      exit 0
+    fi
+  elif [ "$(docker exec "$NAME" wget -q -O- "http://127.0.0.1:${PORT}/small" 2>/dev/null)" = "ok" ]; then
     echo "READY ${PORT}"
     exit 0
   fi

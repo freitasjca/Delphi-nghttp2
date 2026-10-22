@@ -91,8 +91,15 @@ if (Have 'docker') {
     ) -join $lf
     docker run -d --name $Name -p "127.0.0.1:${Port}:${Port}" $Image sh -c $script | Out-Null
     if ($LASTEXITCODE -eq 0) {
-      for ($i = 0; $i -lt 50; $i++) {
-        if (Reachable $Port) { Write-Host "READY $Port"; exit 0 }
+      # Wait until nginx actually SERVES (GET /small = 'ok'), not merely until
+      # Docker's published port accepts TCP - the proxy accepts before nginx has
+      # started, and a TCP-only check declared READY too early. nginx serves
+      # HTTP/1.1 on this listener too, so Invoke-WebRequest suffices.
+      for ($i = 0; $i -lt 100; $i++) {
+        try {
+          $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/small" -UseBasicParsing -TimeoutSec 2
+          if ($r.Content -eq 'ok') { Write-Host "READY $Port"; exit 0 }
+        } catch { }
         Start-Sleep -Milliseconds 200
       }
       Write-Host 'SKIP: Windows docker peer did not become ready'
