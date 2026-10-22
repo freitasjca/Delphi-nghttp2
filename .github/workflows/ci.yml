@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-24.04     # pinned: 24.04's apt ships FPC 3.2.2
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5    # v5 runs on Node 24 (v4 = deprecated Node 20)
 
       - name: Install FPC 3.2.2
         run: |
