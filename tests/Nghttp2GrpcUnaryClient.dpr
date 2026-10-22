@@ -97,6 +97,7 @@ uses
   Nghttp2.Grpc.Dispatcher,
   Nghttp2.Grpc.Framing,
   Nghttp2.Grpc.Client,
+  Nghttp2.Grpc.Context,
   Nghttp2.OpenSSL,
   Nghttp2.Tls,
   Nghttp2.Client;
@@ -166,6 +167,8 @@ type
     { GC5 bidi streaming: echo each request back immediately. }
     procedure StreamEcho(const AReader: IGrpcStreamReader;
       const AWriter: IGrpcStreamWriter);
+    { CL5.6: reads inbound metadata through the ambient TGrpcCallContext. }
+    procedure Meta(const AReq: TObject; const AResp: TObject);
   end;
 
   { GC2b: what a test client context trusts, and which certificate it shows. }
@@ -284,6 +287,36 @@ begin
   TEchoReply(AResp).num  := TEchoRequest(AReq).num;
 end;
 
+{ CL5.6: a handler reads inbound APPLICATION metadata through the ambient
+  TGrpcCallContext - the only API that reaches it (RegisterService<T>'s
+  signature is frozen by the interface and cannot grow a parameter). text
+  echoes back the one value the gate sends; num encodes the decision-3 filter
+  so it is asserted ON THE WIRE: 1 only when the reserved headers are hidden
+  AND the application header is visible AND Path is reachable, else 0. A nil
+  context (SetCurrent never ran) fails loudly rather than reading as empty. }
+procedure TProbeService.Meta(const AReq: TObject; const AResp: TObject);
+var
+  LCtx: IGrpcCallContext;
+begin
+  LCtx := TGrpcCallContext.Current;
+  if LCtx = nil then
+  begin
+    TEchoReply(AResp).text := '<no-context>';
+    TEchoReply(AResp).num  := 0;
+    Exit;
+  end;
+  TEchoReply(AResp).text := LCtx.Metadata('x-echo-key');
+  if (LCtx.Metadata('content-type') = '') and   // gRPC-reserved, must be hidden
+     (LCtx.Metadata('te') = '') and              // gRPC-reserved, must be hidden
+     (LCtx.Metadata(':path') = '') and           // pseudo-header, must be hidden
+     (LCtx.Metadata('grpc-timeout') = '') and    // grpc-*, must be hidden
+     (LCtx.Path <> '') and                       // path reachable ONLY via Path
+     LCtx.HasMetadata('x-echo-key') then          // application header visible
+    TEchoReply(AResp).num := 1
+  else
+    TEchoReply(AResp).num := 0;
+end;
+
 { GC4: see gctest.proto Count. Raising after K messages makes our dispatcher
   end the stream with 13 and the message - after the K already sent. }
 procedure TProbeService.Count(const ARequest: TObject; const AWriter: IGrpcStreamWriter);
@@ -354,6 +387,21 @@ begin
   end;
   if TGrpcDispatcher.TryDispatch(AStream) then
     Exit;
+  { CL5.6 teeth: a NON-gRPC request reaches here WITHOUT the dispatcher's
+    SetCurrent (the content-type check Exits False before it), so
+    TGrpcCallContext.Current MUST be nil - unless a prior gRPC call on this
+    reused connection thread failed to clear it in its finally. Driven by
+    CL56PartA over Channel.Client on the same connection (one channel = one
+    connection = one inline thread), so this is deterministic. }
+  if AStream.Header[':path'] = '/ambient' then
+  begin
+    AStream.StatusCode := 200;
+    if TGrpcCallContext.Current = nil then
+      AStream.Send(TEncoding.UTF8.GetBytes('nil'))
+    else
+      AStream.Send(TEncoding.UTF8.GetBytes('present:' + TGrpcCallContext.Current.Path));
+    Exit;
+  end;
   AStream.StatusCode := 404;
   AStream.Send(TEncoding.UTF8.GetBytes('not grpc'));
 end;
@@ -917,6 +965,94 @@ begin
   ExpectArgRefused('A binary (-bin) metadata -> EArgumentException (not supported yet)', LOpt);
 end;
 
+{ CL5.6 slice 1, our-client half: our client sends inbound metadata (GC3
+  machinery) and the server's Meta handler reads it back through the ambient
+  TGrpcCallContext. The independent grpcio-client cross-check is a separate
+  harness stage (serve-meta mode + grpc-meta-client.py), not in-process here. }
+procedure CL56PartA(AChannel: TGrpcChannel);
+const
+  UID1 = 'ctx-7f3a-value-1';
+  UID2 = 'ctx-7f3a-value-2';
+  UID3 = 'ctx-7f3a-value-3';
+var
+  LReq:   TEchoRequest;
+  LReply: TEchoReply;
+  LResp:  TNghttp2Response;
+  LBody:  string;
+begin
+  WriteLn;
+  WriteLn('-- A7  CL5.6: server reads inbound metadata via TGrpcCallContext');
+
+  { T1 - the metadata reaches the handler and comes back; the filter holds. }
+  LReq := NewEcho('', 0);
+  try
+    LReply := CallOkOpt(AChannel, 'A CL5.6 Meta echoes the inbound x-echo-key',
+      '/gctest.Probe/Meta', LReq, WithMeta(0, 'x-echo-key', UID1));
+    if LReply <> nil then
+    try
+      Check('A CL5.6: the handler read the metadata value through the context',
+        LReply.text = UID1, Format('got "%s"', [LReply.text]));
+      Check('A CL5.6: reserved headers hidden, app header + Path visible (decision 3)',
+        LReply.num = 1, Format('filter flag %d (0 = a reserved header leaked or the app header/Path was missing)', [LReply.num]));
+    finally
+      LReply.Free;
+    end;
+  finally
+    LReq.Free;
+  end;
+
+  { T2 - two calls in a row on ONE channel: each handler sees ITS OWN value.
+    SetCurrent runs per dispatch, so this guards against cross-call bleed. }
+  LReq := NewEcho('', 0);
+  try
+    LReply := CallOkOpt(AChannel, 'A CL5.6 first of two consecutive calls',
+      '/gctest.Probe/Meta', LReq, WithMeta(0, 'x-echo-key', UID2));
+    if LReply <> nil then
+    try
+      Check('A CL5.6: the first consecutive call sees its own value',
+        LReply.text = UID2, Format('got "%s"', [LReply.text]));
+    finally
+      LReply.Free;
+    end;
+    LReply := CallOkOpt(AChannel, 'A CL5.6 second of two consecutive calls',
+      '/gctest.Probe/Meta', LReq, WithMeta(0, 'x-echo-key', UID3));
+    if LReply <> nil then
+    try
+      Check('A CL5.6: the second consecutive call sees its OWN value, not the first''s',
+        LReply.text = UID3, Format('got "%s"', [LReply.text]));
+    finally
+      LReply.Free;
+    end;
+  finally
+    LReq.Free;
+  end;
+
+  { T3 - the real finally-clear teeth. After a gRPC call, a NON-gRPC GET on the
+    SAME connection (so the SAME inline connection thread that just dispatched)
+    must see Current = nil. A missing ClearCurrent leaves the completed call's
+    context on the thread and the body reads 'present:...'. Deterministic:
+    unary dispatch is inline, and one channel is one connection is one thread. }
+  LReq := NewEcho('', 0);
+  try
+    LReply := CallOkOpt(AChannel, 'A CL5.6 prime the connection thread with a gRPC call',
+      '/gctest.Probe/Meta', LReq, WithMeta(0, 'x-echo-key', UID1));
+    if LReply <> nil then
+      LReply.Free;
+  finally
+    LReq.Free;
+  end;
+  try
+    LResp := AChannel.Client.SubmitRequest('GET', '/ambient', nil, nil);
+    LBody := TEncoding.UTF8.GetString(LResp.Body);
+    Check('A CL5.6: a non-gRPC request on the reused thread sees NO leaked context',
+      LBody = 'nil', Format('status %d body "%s" (expected "nil"; "present:..." means the dispatcher finally did not clear)', [LResp.Status, LBody]));
+  except
+    on E: Exception do
+      Check('A CL5.6: the /ambient probe completed', False,
+        E.ClassName + ': ' + E.Message);
+  end;
+end;
+
 procedure PartA;
 var
   LServer:  TNghttp2Server;
@@ -953,6 +1089,7 @@ begin
       GC4PartA(LChannel);
       StatusOnlyPartA(LChannel);
       GC5PartA(LChannel);
+      CL56PartA(LChannel);
     finally
       LChannel.Free;
     end;
@@ -1468,6 +1605,41 @@ begin
     '127.0.0.1', AMtlsPort, trCa, ccNone, '');
 end;
 
+{ CL5.6 Pass 2: serve ONLY the Meta service, print READY, and stay up for a
+  backstop lifetime (milliseconds) so the harness can run an independent grpcio
+  client (grpc-meta-client.py) against our dispatcher. The harness kills us once
+  the client is done; the lifetime guards against a crashed harness leaving us
+  running. Reuses HandleRequest, so Meta + the /ambient route are both served. }
+procedure ServeMeta(APort, ALifetimeMS: Integer);
+var
+  LServer: TNghttp2Server;
+  LConfig: TNghttp2Config;
+  LTicks:  Integer;
+begin
+  LServer := TNghttp2Server.Create;
+  try
+    LServer.OnRequest             := HandleRequest;
+    LServer.OnShouldStreamInbound := HandleShouldStreamInbound;
+    LConfig               := TNghttp2Config.Default;
+    LConfig.Port          := APort;
+    LConfig.AsyncDispatch := True;
+    LServer.Start(LConfig);
+    WriteLn('READY ', APort);
+    Flush(Output);
+    LTicks := ALifetimeMS div 100;
+    if LTicks < 1 then
+      LTicks := 1;
+    while LTicks > 0 do
+    begin
+      Sleep(100);
+      Dec(LTicks);
+    end;
+    LServer.Stop;
+  finally
+    LServer.Free;
+  end;
+end;
+
 function ArgValue(const AKey: string): string;
 var
   I: Integer;
@@ -1511,6 +1683,8 @@ begin
       TEchoRequest, TEchoReply, GService.Empty);
     TGrpcRegistry.RegisterMethod('/gctest.Probe/Slow',
       TEchoRequest, TEchoReply, GService.Slow);
+    TGrpcRegistry.RegisterMethod('/gctest.Probe/Meta',
+      TEchoRequest, TEchoReply, GService.Meta);
     TGrpcRegistry.RegisterServerStream('/gctest.Probe/Count',
       TEchoRequest, TEchoReply, GService.Count);
     TGrpcRegistry.RegisterClientStream('/gctest.Probe/Collect',
@@ -1518,6 +1692,13 @@ begin
     TGrpcRegistry.RegisterBidiStream('/gctest.Probe/StreamEcho',
       TEchoRequest, TEchoReply, GService.StreamEcho);
     try
+      if PortArg('serve-meta') > 0 then
+        { CL5.6 Pass 2: run ONLY the Meta server so an independent grpcio client
+          can send metadata to OUR dispatcher and verify the echo. No client
+          parts run in this mode. }
+        ServeMeta(PortArg('serve-meta'), StrToIntDef(ArgValue('lifetime'), 30000))
+      else
+      begin
       try
         PartA;
       except
@@ -1592,6 +1773,7 @@ begin
           Skip('Part E: TLS against grpcio',
             'no grpcio-tls=/grpcio-mtls= - run grpc-probe-peer.py with --certs');
         end;
+      end;
       end;
     finally
       TGrpcRegistry.Shutdown;

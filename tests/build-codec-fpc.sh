@@ -1644,6 +1644,63 @@ else
   fi
 fi
 
+# ── 4l-ctx · gRPC server call context, independent grpcio client (CL5.6) ─────
+# CL5.6 Pass 2: our server's Meta handler reads inbound metadata through
+# TGrpcCallContext.Current. Part A (our client -> our server, in-process)
+# already proved the context works; this stage proves our DISPATCHER parses the
+# headers framed by a FOREIGN client. Nghttp2GrpcUnaryClient serve-meta=PORT
+# hosts only the Meta server; grpc-meta-client.py (python grpcio) sends
+# x-echo-key and checks the echo + the decision-3 filter flag. The python
+# client's exit code gates (0 match, 1 mismatch, 2 connect/RPC failure).
+echo
+echo "── gRPC server call context, grpcio client (CL5.6) ───────────────────"
+GMBIN="$OUT/grpc-unary/Nghttp2GrpcUnaryClient"
+if [[ ! -x "$GMBIN" ]]; then
+  echo "  SKIP  Nghttp2GrpcUnaryClient not built (see the GC2 stage above)"
+else
+  GM_GPY=""
+  for CAND in "${GRPC_PYTHON:-}" "$HERE/../tools/protogen/.venv/bin/python" python3; do
+    [[ -z "$CAND" ]] && continue
+    if "$CAND" -c 'import grpc, grpc_tools' > /dev/null 2>&1; then GM_GPY="$CAND"; break; fi
+  done
+  if [[ -z "$GM_GPY" ]]; then
+    echo "  SKIP  no python with grpcio + grpcio-tools - the foreign-client"
+    echo "        cross-check did NOT run (a skip is not a pass). set GRPC_PYTHON."
+  else
+    GMOUT="$OUT/grpc-meta"
+    mkdir -p "$GMOUT"
+    GM_UID="ctx-$$-$RANDOM-$RANDOM"
+    "$GMBIN" serve-meta=19345 lifetime=30000 > "$GMOUT/server.log" 2>&1 &
+    GM_SPID=$!
+    GM_UP=0
+    for _ in $(seq 1 100); do
+      grep -q '^READY' "$GMOUT/server.log" 2>/dev/null && { GM_UP=1; break; }
+      kill -0 "$GM_SPID" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ $GM_UP -ne 1 ]]; then
+      echo "  FAIL  the serve-meta server did not become ready - see $GMOUT/server.log"
+      tail -8 "$GMOUT/server.log" | sed 's/^/    /'
+      [[ $RC -eq 0 ]] && RC=1
+    else
+      "$GM_GPY" "$HERE/grpc-meta-client.py" 19345 "$GM_UID" > "$GMOUT/client.log" 2>&1
+      GM_RC=$?
+      sed 's/^/    /' "$GMOUT/client.log"
+      case "$GM_RC" in
+        0) echo "  server call context (grpcio client): PASSED - our server read a"
+           echo "        foreign client's metadata through TGrpcCallContext" ;;
+        1) echo "  FAIL  the grpcio client saw the WRONG echo (metadata not read, or"
+           echo "        a reserved header leaked) - see $GMOUT/client.log"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+        *) echo "  FAIL  the grpcio client could not complete the call (connect/RPC)"
+           [[ $RC -eq 0 ]] && RC=1 ;;
+      esac
+    fi
+    kill "$GM_SPID" 2>/dev/null
+    wait "$GM_SPID" 2>/dev/null || true
+  fi
+fi
+
 # ── 4m · inventory sample, both halves (GC7, B2 gRPC client plan) ─────────────
 # samples/inventory: the server sample now calls its own three RPCs through the
 # GENERATED client stubs (Sample.Inventory.Client) and checks every answer.

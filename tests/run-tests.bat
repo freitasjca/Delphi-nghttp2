@@ -1313,6 +1313,56 @@ echo    SKIP  Nghttp2GrpcUnaryClient.dpr not present
 
 :after_gunary
 
+REM -- Stage 4l-ctx. gRPC server call context, independent grpcio client (CL5.6). --
+REM
+REM Pass 2: our server's Meta handler reads inbound metadata through
+REM TGrpcCallContext.Current. Part A (our client -> our server) already proved
+REM the context in-process; this proves our DISPATCHER parses headers framed by
+REM a FOREIGN client. Nghttp2GrpcUnaryClient serve-meta=PORT hosts only the Meta
+REM server; grpc-meta-client.py (python grpcio) sends x-echo-key and checks the
+REM echo + the decision-3 filter flag. The python client's exit code gates.
+echo -- Nghttp2GrpcUnaryClient serve-meta (CL5.6) ---------------------------------------------------------------
+if not exist "Nghttp2GrpcUnaryClient.exe" (
+  echo    SKIP  Nghttp2GrpcUnaryClient.exe not built - see the GC2 stage above
+  goto :after_metactx
+)
+set "GMPY="
+for %%P in (py python) do if not defined GMPY (
+  %%P -c "import grpc, grpc_tools" > nul 2>&1
+  if not errorlevel 1 set "GMPY=%%P"
+)
+if not defined GMPY (
+  set /a SKIPPED+=1
+  echo    SKIP  no Python with grpcio + grpcio-tools - the foreign-client cross-check did NOT run
+  goto :after_metactx
+)
+start "NGHTTP2METASRV" /min cmd /c "Nghttp2GrpcUnaryClient.exe serve-meta=19345 lifetime=30000 > Nghttp2GrpcMeta.server.log 2>&1"
+set "GMUP="
+for /l %%I in (1,1,30) do if not defined GMUP (
+  findstr /B /C:"READY" "Nghttp2GrpcMeta.server.log" > nul 2>&1 && set "GMUP=1"
+  if not defined GMUP ping -n 2 127.0.0.1 > nul
+)
+if not defined GMUP (
+  echo    FAIL  the serve-meta server did not become ready
+  if exist "Nghttp2GrpcMeta.server.log" type "Nghttp2GrpcMeta.server.log"
+  taskkill /FI "WINDOWTITLE eq NGHTTP2METASRV" /T /F > nul 2>&1
+  set /a FAILED+=1
+  goto :after_metactx
+)
+set "GMUID=ctx-%RANDOM%-%RANDOM%"
+!GMPY! "grpc-meta-client.py" 19345 "!GMUID!" > "Nghttp2GrpcMeta.client.log" 2>&1
+set "GM_RC=!errorlevel!"
+type "Nghttp2GrpcMeta.client.log"
+taskkill /FI "WINDOWTITLE eq NGHTTP2METASRV" /T /F > nul 2>&1
+echo.
+if "!GM_RC!"=="0" (
+  echo    PASS  server call context grpcio client - our server read a foreign client's metadata
+) else (
+  echo    FAIL  server call context grpcio client - exit !GM_RC!
+  set /a FAILED+=1
+)
+:after_metactx
+
 REM -- Stage 4m. Inventory sample, both halves (GC7, B2 gRPC client plan). ----
 REM
 REM samples\inventory: the server sample calls its own three RPCs through the

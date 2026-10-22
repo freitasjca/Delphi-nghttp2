@@ -125,6 +125,7 @@ uses
   Nghttp2.Protobuf.Rtti,
   Nghttp2.Grpc.Framing,        { GC0 - GrpcUnframeMessage, GrpcEncodeStatusMessage }
   Nghttp2.Grpc.Registry,
+  Nghttp2.Grpc.Context,        { CL5.6 — ambient server-side call context }
   Nghttp2.Grpc.StreamWriter,   { M6a — TGrpcStreamWriter }
   Nghttp2.Grpc.StreamReader;   { M6b — TGrpcStreamReader }
 
@@ -258,6 +259,14 @@ begin
       'method not registered: ' + LPath);
     Exit;
   end;
+
+  // [CL5.6] Ambient call context for the handler: inbound application metadata
+  // now, the deadline in slice 2. Built once the method is known, set for THIS
+  // (worker) thread, and cleared in the finally below so a reused worker never
+  // sees a stale one. One try/finally covers all five handler-invoke paths and
+  // every early Exit between here and the end of the method.
+  TGrpcCallContext.SetCurrent(TGrpcCallContext.Create(AStream, LPath));
+  try
 
   { ── M6b inbound-streaming methods ──────────────────────────────────────
     Handled before the body is touched, and necessarily so: this stream was
@@ -481,6 +490,12 @@ begin
   AStream.AddTrailer('grpc-status',  '0');
   AStream.AddTrailer('grpc-message', 'OK');
   AStream.Send(LFramed);
+
+  finally
+    // [CL5.6] Clear on every path (success or any Exit above): the worker
+    // thread is reused, so a context left set would leak into the next request.
+    TGrpcCallContext.ClearCurrent;
+  end;
 end;
 
 end.
