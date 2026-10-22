@@ -1,0 +1,75 @@
+name: CI
+
+# ============================================================================
+#  Delphi-nghttp2 CI matrix.
+#
+#  Three toolchains are tested; only the first runs on hosted GitHub Actions:
+#
+#    * FPC 3.2.2 (transport)  — THIS workflow. Compiles the transport on the
+#      stable FPC that ships in Ubuntu's apt. This is the one leg nobody runs
+#      by hand, so it is where a "3.2.2-clean" regression would otherwise slip
+#      in: the transport (client, server, pool, socket, TLS, FFI loaders) must
+#      compile on 3.2.2, even though the gRPC/codec/codegen layers need FPC
+#      trunk 3.3.1 for their RTTI/attributes and are NOT built here.
+#
+#    * FPC trunk 3.3.1 (full) — run by hand with tests/build-codec-fpc.sh. Trunk
+#      has no apt package and no reliable hosted-runner install (even TlsLib's
+#      CI does not attempt it), and build-codec-fpc.sh is already run per change,
+#      so CI would only duplicate it. Left as the manual gate.
+#
+#    * Delphi 12 (full)       — run with the continuous-delphi framework via the
+#      repo's delphi-ci.json (`Invoke-DelphiCi`), on a machine that has Delphi
+#      installed (local or a self-hosted Windows runner). Hosted runners have no
+#      Delphi. tests/run-tests.bat remains the full Delphi test gate.
+# ============================================================================
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fpc-322-transport:
+    name: FPC 3.2.2 — transport compiles (3.2.2-clean guarantee)
+    runs-on: ubuntu-24.04     # pinned: 24.04's apt ships FPC 3.2.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FPC 3.2.2
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fpc
+          VER="$(fpc -iV)"
+          echo "fpc version: ${VER}"
+          # Ubuntu's fpc package can ship a stale/blank /etc/fpc.cfg with no unit
+          # search paths (the compiler then cannot find the system unit). Regenerate
+          # it against the installed version's unit directory; harmless if already fine.
+          ARCH="$(uname -m)"
+          BASE="/usr/lib/${ARCH}-linux-gnu/fpc/${VER}"
+          if [ ! -d "${BASE}/units" ]; then BASE="/usr/lib/fpc/${VER}"; fi
+          echo "fpc basepath: ${BASE}"
+          sudo fpcmkcfg -d "basepath=${BASE}" -o /etc/fpc.cfg
+
+      - name: Compile the transport samples (FPC 3.2.2, -MDelphi)
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-fpc-out
+          compile() {
+            echo "== FPC 3.2.2 compile: $1 =="
+            # -Fusrc puts the library units on the unit path; the sample's own dir
+            # is added automatically. No libnghttp2/OpenSSL needed at compile time —
+            # both are loaded dynamically at run time, not linked.
+            fpc -MDelphi -O1 -Fusrc -FU.ci-fpc-out -FE.ci-fpc-out "$1"
+          }
+          compile samples/PingClient.dpr
+          compile samples/async-client/Nghttp2AsyncClient.dpr
+          echo
+          echo "FPC 3.2.2 transport compile: OK (PingClient + Nghttp2AsyncClient)"

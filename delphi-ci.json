@@ -1,0 +1,56 @@
+{
+  "root": ".",
+  "defaults": {
+    "clean": {
+      "level": "standard",
+      "outputLevel": "summary"
+    },
+    "build": {
+      "engine": "DCCBuild",
+      "toolchain": { "version": "Latest" },
+      "platform": "Win64",
+      "configuration": "Release",
+      "verbosity": "normal",
+      "exeOutputDir": ".ci-dcc-out",
+      "dcuOutputDir": ".ci-dcc-out"
+    }
+  },
+  "pipeline": [
+    {
+      "action": "Clean",
+      "jobs": [
+        { "name": "Repo clean", "root": "." }
+      ]
+    },
+    {
+      "action": "Build",
+      "jobs": [
+        {
+          "name": "PingClient (transport client)",
+          "projectFile": "samples/PingClient.dpr",
+          "unitSearchPath": ["src"]
+        },
+        {
+          "name": "AsyncClient sample (async API + pool)",
+          "projectFile": "samples/async-client/Nghttp2AsyncClient.dpr",
+          "unitSearchPath": ["src"]
+        },
+        {
+          "name": "gRPC server sample",
+          "projectFile": "samples/grpc-server/Nghttp2GrpcServer.dpr",
+          "unitSearchPath": ["src", "samples/grpc-server"]
+        },
+        {
+          "name": "Inventory server (gRPC + generated code)",
+          "projectFile": "samples/inventory/Nghttp2InventoryServer.dpr",
+          "unitSearchPath": ["src", "samples/inventory"]
+        },
+        {
+          "name": "Inventory client (generated stubs)",
+          "projectFile": "samples/inventory/Nghttp2InventoryClient.dpr",
+          "unitSearchPath": ["src", "samples/inventory"]
+        }
+      ]
+    }
+  ]
+}
