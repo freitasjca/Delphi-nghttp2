@@ -29,8 +29,11 @@ unit Nghttp2.Grpc.Context;
 //  store is AddOrSetValue-keyed by lower-cased name, so the LAST occurrence of a
 //  duplicated name wins).
 //
-//  Slice 1 is metadata only: the deadline/cancellation members exist but are
-//  inert (HasDeadline=False, etc.). Slice 2 parses grpc-timeout and wires them.
+//  Slice 2 (2026-10-22) wires the deadline: grpc-timeout is parsed into an
+//  absolute deadline; HasDeadline/TimeRemainingMS/Cancelled/ThrowIfCancelled are
+//  live. Cancellation is COOPERATIVE — a handler polls Cancelled or calls
+//  ThrowIfCancelled (which raises EGrpcDeadlineExceeded, mapped to grpc-status 4
+//  by the dispatcher); nothing preempts a handler that ignores the deadline.
 // ============================================================================
 
 interface
@@ -46,6 +49,10 @@ uses
   Nghttp2.Types;
 
 type
+  { CL5.6 slice 2: a handler that calls Ctx.ThrowIfCancelled raises this; the
+    dispatcher maps it to grpc-status 4 DEADLINE_EXCEEDED (HandlerFailureStatus). }
+  EGrpcDeadlineExceeded = class(Exception);
+
   IGrpcCallContext = interface
     ['{7E3C1A52-9B4D-4C8E-A1F6-2D5B0E9C4A77}']
     { Inbound application metadata, case-insensitive. '' if absent OR filtered
@@ -58,7 +65,7 @@ type
     { The request :path (e.g. /pkg.Service/Method). The explicit accessor for
       routing info — pseudo-headers are not reachable through Metadata. }
     function  Path: string;
-    { Deadline / cancellation — INERT in slice 1; slice 2 wires grpc-timeout. }
+    { Deadline / cancellation (slice 2): driven by grpc-timeout, cooperative. }
     function  HasDeadline: Boolean;
     function  TimeRemainingMS: Integer;
     function  Cancelled: Boolean;
@@ -69,6 +76,8 @@ type
   private
     FStream: INghttp2Stream;   // held for the call so Header[] stays readable
     FPath:   string;
+    FHasDeadline:  Boolean;    // CL5.6 slice 2: parsed from grpc-timeout
+    FDeadlineTick: UInt64;     // absolute GetTickCount64 ms; valid iff FHasDeadline
   public
     constructor Create(const AStream: INghttp2Stream; const APath: string);
 
@@ -100,6 +109,41 @@ uses
   System.StrUtils;
 {$IFEND}
 
+{ Decode a gRPC "grpc-timeout" header (value = 1..8 digits, then one unit of
+  H|M|S|m|u|n) to milliseconds. Returns False on absent/malformed input — the
+  caller then treats the call as having no deadline (lenient, per the spec). }
+function ParseGrpcTimeoutMS(const AValue: string; out AMS: Int64): Boolean;
+var
+  LLen, I: Integer;
+  LUnit:   Char;
+  LVal:    Int64;
+begin
+  Result := False;
+  AMS := 0;
+  LLen := Length(AValue);
+  if (LLen < 2) or (LLen > 9) then   // 1..8 digits + exactly one unit char
+    Exit;
+  LVal := 0;
+  for I := 1 to LLen - 1 do
+  begin
+    if (AValue[I] < '0') or (AValue[I] > '9') then
+      Exit;
+    LVal := LVal * 10 + (Ord(AValue[I]) - Ord('0'));
+  end;
+  LUnit := AValue[LLen];
+  case LUnit of
+    'H': AMS := LVal * 3600000;
+    'M': AMS := LVal * 60000;
+    'S': AMS := LVal * 1000;
+    'm': AMS := LVal;
+    'u': AMS := (LVal + 999) div 1000;         // micros -> ms, rounded up
+    'n': AMS := (LVal + 999999) div 1000000;   // nanos -> ms, rounded up
+  else
+    Exit;
+  end;
+  Result := True;
+end;
+
 threadvar
   GCurrentContext: IGrpcCallContext;   // per dispatching thread; cleared in finally
 
@@ -117,10 +161,22 @@ begin
 end;
 
 constructor TGrpcCallContext.Create(const AStream: INghttp2Stream; const APath: string);
+var
+  LTimeoutMS: Int64;
 begin
   inherited Create;
   FStream := AStream;
   FPath   := APath;
+  { CL5.6 slice 2: parse grpc-timeout into an absolute deadline. Absent or
+    malformed leaves FHasDeadline False (no deadline). }
+  if ParseGrpcTimeoutMS(AStream.Header['grpc-timeout'], LTimeoutMS) then
+  begin
+    FHasDeadline  := True;
+    { Monotonic tick, NOT Now: Now is wall-clock (can jump) and the TDateTime +
+      float math fired the deadline immediately on Delphi; integer ms is robust
+      on both compilers. }
+    FDeadlineTick := TThread.GetTickCount64 + UInt64(LTimeoutMS);
+  end;
 end;
 
 function TGrpcCallContext.Metadata(const AName: string): string;
@@ -144,26 +200,46 @@ begin
   Result := FPath;
 end;
 
-// ── deadline / cancellation — inert until slice 2 ───────────────────────────
+// ── deadline / cancellation (CL5.6 slice 2) ─────────────────────────────────
 
 function TGrpcCallContext.HasDeadline: Boolean;
 begin
-  Result := False;
+  Result := FHasDeadline;
 end;
 
 function TGrpcCallContext.TimeRemainingMS: Integer;
+var
+  LNow, LRem: UInt64;
 begin
-  Result := 0;
+  if not FHasDeadline then
+  begin
+    Result := High(Integer);   // no deadline: effectively unbounded
+    Exit;
+  end;
+  LNow := TThread.GetTickCount64;
+  if LNow >= FDeadlineTick then
+    Result := 0                // past the deadline
+  else
+  begin
+    LRem := FDeadlineTick - LNow;
+    if LRem > UInt64(High(Integer)) then
+      Result := High(Integer)
+    else
+      Result := Integer(LRem);
+  end;
 end;
 
 function TGrpcCallContext.Cancelled: Boolean;
 begin
-  Result := False;
+  { Cooperative: the deadline passed. (Slice 2 tracks the deadline only; a peer
+    reset is not folded in here.) }
+  Result := FHasDeadline and (TThread.GetTickCount64 >= FDeadlineTick);
 end;
 
 procedure TGrpcCallContext.ThrowIfCancelled;
 begin
-  // no deadline parsed yet — slice 2 wires grpc-timeout + grpc-status 4
+  if Cancelled then
+    raise EGrpcDeadlineExceeded.Create('deadline exceeded');
 end;
 
 // ── ambient accessor ────────────────────────────────────────────────────────

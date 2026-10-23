@@ -189,6 +189,18 @@ begin
   Result := AError.Message;
 end;
 
+{ CL5.6 slice 2: a handler that calls Ctx.ThrowIfCancelled raises
+  EGrpcDeadlineExceeded; map THAT to 4 DEADLINE_EXCEEDED and every other handler
+  exception to 13. Kept beside HandlerFailureMessage so the five handler-invoke
+  sites share one status rule. (GRPC_STATUS_DEADLINE_EXCEEDED is Framing's.) }
+function HandlerFailureStatus(const AError: Exception): Integer;
+begin
+  if AError is EGrpcDeadlineExceeded then
+    Result := GRPC_STATUS_DEADLINE_EXCEEDED
+  else
+    Result := GRPC_STATUS_INTERNAL;
+end;
+
 { Status trailers for the paths that have already started a response
   (streaming, bidi) and so cannot use SendGrpcStatusOnly. }
 procedure AddStatusTrailers(const AStream: INghttp2Stream; AStatus: Integer;
@@ -294,7 +306,7 @@ begin
         except
           on E: Exception do
           begin
-            AddStatusTrailers(AStream, GRPC_STATUS_INTERNAL,
+            AddStatusTrailers(AStream, HandlerFailureStatus(E),
               HandlerFailureMessage(LPath, E));
           end;
         end;
@@ -316,7 +328,7 @@ begin
       except
         on E: Exception do
         begin
-          SendGrpcStatusOnly(AStream, GRPC_STATUS_INTERNAL,
+          SendGrpcStatusOnly(AStream, HandlerFailureStatus(E),
             HandlerFailureMessage(LPath, E));
           Exit;
         end;
@@ -390,7 +402,7 @@ begin
                 gRPC has for this, and it is why a streaming client must check
                 grpc-status after the last message rather than assuming that
                 receiving data means success. }
-              AddStatusTrailers(AStream, GRPC_STATUS_INTERNAL,
+              AddStatusTrailers(AStream, HandlerFailureStatus(E),
                 HandlerFailureMessage(LPath, E));
             end;
           end;
@@ -415,7 +427,7 @@ begin
           except
             on E: Exception do
             begin
-              SendGrpcStatusOnly(AStream, GRPC_STATUS_INTERNAL,
+              SendGrpcStatusOnly(AStream, HandlerFailureStatus(E),
                 HandlerFailureMessage(LPath, E));
               Exit;
             end;
@@ -451,7 +463,7 @@ begin
           except
             on E: Exception do
             begin
-              SendGrpcStatusOnly(AStream, GRPC_STATUS_INTERNAL,
+              SendGrpcStatusOnly(AStream, HandlerFailureStatus(E),
                 HandlerFailureMessage(LPath, E));
               Exit;
             end;

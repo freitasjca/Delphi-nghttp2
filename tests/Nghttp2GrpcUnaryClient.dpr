@@ -191,6 +191,7 @@ var
   GPass: Integer = 0;
   GFail: Integer = 0;
   GSkip: Integer = 0;
+  GVictimDone: Boolean = False;  // CL5.6 slice 2: did the A8 victim Slow RUN TO THE END?
   GCertDir:  string = '';   // tests/certs-tls, with a trailing delimiter
   GKeypwDir: string = '';   // tests/certs-keypw: an UNRELATED self-signed cert
 
@@ -277,14 +278,38 @@ begin
   // leave every field at its default: a zero-length message on the wire
 end;
 
-{ GC3: sleeps num ms. Our dispatcher ignores grpc-timeout, so this always
-  runs to the end - the client's deadline is the only thing that can stop
-  the call short. }
+{ GC3 + CL5.6 slice 2: sleeps up to num ms, but polls the call's server-side
+  deadline (grpc-timeout) every 10 ms and aborts via ThrowIfCancelled once it
+  passes - the dispatcher then ends the call with grpc-status 4. With NO deadline
+  Cancelled stays False and it runs the full num ms, exactly as the old
+  Sleep(num) did (GC3 relies on that). On completion a uniquely-texted victim
+  call flips GVictimDone, which /slowstat reports - the teeth for A8 (a shared
+  counter would be polluted by a late-finishing no-deadline Slow from GC3). }
 procedure TProbeService.Slow(const AReq: TObject; const AResp: TObject);
+var
+  LCtx:    IGrpcCallContext;
+  LTarget: Integer;
+  LStart:  UInt64;
 begin
-  Sleep(TEchoRequest(AReq).num);
+  LCtx    := TGrpcCallContext.Current;
+  LTarget := TEchoRequest(AReq).num;
+  LStart  := TThread.GetTickCount64;
+  { Poll in small steps, bounded by REAL MONOTONIC elapsed ms (GetTickCount64,
+    not Now which is wall-clock, and not a step count - Windows' coarse Sleep
+    would stretch a step count ~50%). GC3's timing window and the queued GC4
+    calls depend on Slow(num) taking ~num ms. }
+  while (TThread.GetTickCount64 - LStart < UInt64(LTarget)) and
+        not ((LCtx <> nil) and LCtx.Cancelled) do
+    Sleep(5);
+  if LCtx <> nil then
+    LCtx.ThrowIfCancelled;   // raises EGrpcDeadlineExceeded -> dispatcher sends 4
   TEchoReply(AResp).text := 'slept';
-  TEchoReply(AResp).num  := TEchoRequest(AReq).num;
+  TEchoReply(AResp).num  := LTarget;
+  { Only the A8 deadlined victim flips this - its unique request text isolates
+    the teeth from every other Slow completion (GC3's late no-deadline one, A8
+    T1's), which must not register. }
+  if TEchoRequest(AReq).text = 'cl56b-victim' then
+    GVictimDone := True;
 end;
 
 { CL5.6: a handler reads inbound APPLICATION metadata through the ambient
@@ -400,6 +425,19 @@ begin
       AStream.Send(TEncoding.UTF8.GetBytes('nil'))
     else
       AStream.Send(TEncoding.UTF8.GetBytes('present:' + TGrpcCallContext.Current.Path));
+    Exit;
+  end;
+  { CL5.6 slice 2 side channel: did the A8 deadlined VICTIM Slow run to the end?
+    A server that honoured grpc-timeout cut it short, so this stays '0'; that is
+    how A8 tells server-side honouring from the client's own deadline timer. The
+    victim's unique request text keeps other (possibly late) Slow completions out. }
+  if AStream.Header[':path'] = '/slowstat' then
+  begin
+    AStream.StatusCode := 200;
+    if GVictimDone then
+      AStream.Send(TEncoding.UTF8.GetBytes('1'))
+    else
+      AStream.Send(TEncoding.UTF8.GetBytes('0'));
     Exit;
   end;
   AStream.StatusCode := 404;
@@ -1053,6 +1091,87 @@ begin
   end;
 end;
 
+{ CL5.6 slice 2: read the /slowstat side channel over a FRESH connection. A
+  client-deadline-fired gRPC call can leave the gRPC channel's own client
+  disconnected (seen on Linux), and GVictimDone is a process global, so a
+  separate short-lived connection reads it (1 = victim ran to the end, 0 = cut
+  short) on either platform. Never raises: -1 on any failure. }
+function ReadSlowStat: Integer;
+var
+  LC: TNghttp2Client;
+  LR: TNghttp2Response;
+begin
+  Result := -1;
+  try
+    LC := TNghttp2Client.Create;
+    try
+      LC.Connect('127.0.0.1', PORT);
+      LR := LC.SubmitRequest('GET', '/slowstat', nil, nil);
+      Result := StrToIntDef(TEncoding.UTF8.GetString(LR.Body), -1);
+    finally
+      LC.Free;
+    end;
+  except
+    Result := -1;
+  end;
+end;
+
+{ CL5.6 slice 2: the server HONOURS grpc-timeout. Our client sends a deadline
+  (which it ALSO enforces locally), so the status 4 alone cannot tell server
+  from client - the /slowstat side channel is the teeth: it shows the Slow
+  handler was cut short (did NOT run to completion), which only server-side
+  honouring produces. The independent grpcio-client cross-check is a separate
+  harness stage. }
+procedure CL56bPartA(AChannel: TGrpcChannel);
+var
+  LSlow:   TEchoRequest;
+  LReply:  TEchoReply;
+  LAfter:  Integer;
+begin
+  WriteLn;
+  WriteLn('-- A8  CL5.6 slice 2: server honours grpc-timeout (deadline/cancellation)');
+
+  { T1 - a generous deadline does NOT fire: the handler completes, status 0. }
+  LSlow := NewEcho('', 100);
+  try
+    LReply := CallOkOpt(AChannel, 'A CL5.6-2 generous deadline: Slow(100) completes',
+      '/gctest.Probe/Slow', LSlow, Opts(5000));
+    if LReply <> nil then
+    try
+      Check('A CL5.6-2: a generous server deadline does not fire',
+        (LReply.text = 'slept') and (LReply.num = 100),
+        Format('"%s"/%d', [LReply.text, LReply.num]));
+    finally
+      LReply.Free;
+    end;
+  finally
+    LSlow.Free;
+  end;
+
+  { T2 - a short deadline vs a handler longer than it: status 4, AND (the teeth)
+    the server cut the handler short. The victim Slow carries a UNIQUE request
+    text, so only ITS completion flips GVictimDone - no other (possibly late)
+    Slow call can pollute the signal, as a shared counter did (GC3's no-deadline
+    Slow(2000) finishes ~2 s later, orphaned, and used to land in the window).
+    Wait past the handler's own length first: a dispatcher that IGNORED
+    grpc-timeout would by then have run the victim to the end and set the flag
+    (what the mutation control reds). }
+  LSlow := NewEcho('cl56b-victim', 1000);   // runs 1000 ms if NOT cut short
+  try
+    ExpectStatusOpt(AChannel, 'A CL5.6-2 short deadline vs a slow handler -> 4 DEADLINE_EXCEEDED',
+      '/gctest.Probe/Slow', LSlow, Opts(300), GRPC_STATUS_DEADLINE_EXCEEDED);
+  finally
+    LSlow.Free;
+  end;
+
+  Sleep(1300);   // > the victim's 1000 ms: a non-honouring server has completed it by now
+  LAfter := ReadSlowStat;
+  Check('A CL5.6-2: the server cut the handler short (it did NOT run to completion)',
+    LAfter = 0,
+    Format('victim-completed flag = %d (1 = the handler ran to the end = grpc-timeout ignored)',
+      [LAfter]));
+end;
+
 procedure PartA;
 var
   LServer:  TNghttp2Server;
@@ -1090,6 +1209,7 @@ begin
       StatusOnlyPartA(LChannel);
       GC5PartA(LChannel);
       CL56PartA(LChannel);
+      CL56bPartA(LChannel);
     finally
       LChannel.Free;
     end;
