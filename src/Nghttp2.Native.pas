@@ -119,6 +119,14 @@ const
   NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE  = -521;
   NGHTTP2_ERR_CALLBACK_FAILURE           = -902;
   NGHTTP2_ERR_NOMEM                      = -901;
+  NGHTTP2_ERR_FLOODED                    = -904;  // outbound queue / PING/SETTINGS flood
+  NGHTTP2_ERR_TOO_MANY_CONTINUATIONS     = -905;  // CONTINUATION flood (CVE-2024-28182)
+
+  // HTTP/2 error codes (RFC 7540 §7) — used as the GOAWAY / RST_STREAM
+  // error_code. Distinct from the library error codes above; NGHTTP2_NO_ERROR
+  // (0) is shared between the two namespaces.
+  NGHTTP2_PROTOCOL_ERROR                 = $01;
+  NGHTTP2_ENHANCE_YOUR_CALM              = $0B;
 
   // SETTINGS parameter IDs (RFC 7540 §6.5.2)
   NGHTTP2_SETTINGS_HEADER_TABLE_SIZE      = $01;

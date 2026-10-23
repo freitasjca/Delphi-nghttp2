@@ -258,6 +258,11 @@ type
     // rather than a branch inside it — the blocking loop is what every
     // shipped suite exercises and it stays untouched.
     function  WritePhaseNB: TNghttp2PumpStep;
+    // A terminal FeedIncoming (< 0) — e.g. a CONTINUATION/PING flood — is one
+    // nghttp2 does NOT announce itself (it just returns the error). Submit a
+    // GOAWAY before the teardown closes the socket so the peer learns why.
+    // No-op on NGHTTP2_ERR_NOMEM, where allocating a frame is exactly wrong.
+    procedure AbortWithGoaway(AFeedRc: NativeInt);
     // Env-gated state dump — see PumpTrace.
     procedure Trace(const AWhere: string);
     { DRAIN-DIAG-4. Phase marker inside RunOnce, gated like every other drain
@@ -1263,7 +1268,14 @@ begin
       else
       begin
         LFeedRc := FSession.FeedIncoming(@FRecvBuf[0], LRecvLen);
-        if LFeedRc < 0 then Exit(psStop);   // nghttp2 protocol error
+        if LFeedRc < 0 then
+        begin
+          // Terminal condition (flood / NOMEM / callback failure). Announce a
+          // GOAWAY before we drop the socket — nghttp2 does not do it for us on
+          // this path. See AbortWithGoaway.
+          AbortWithGoaway(LFeedRc);
+          Exit(psStop);
+        end;
       end;
     end;
   end
@@ -1355,6 +1367,57 @@ begin
     if LSendLen <= 0 then Break;
     // Send failure: no working socket, so skip the farewell entirely.
     if not DoSendAll(LSendPtr, LSendLen) then Exit(psAbort);
+  end;
+end;
+
+procedure TNghttp2ConnectionPump.AbortWithGoaway(AFeedRc: NativeInt);
+var
+  LCode:    UInt32;
+  LSendPtr: PByte;
+  LSendLen: NativeInt;
+begin
+  { nghttp2 handles ordinary protocol violations internally: it queues its own
+    GOAWAY and FeedIncoming returns >= 0, so the normal write phase sends it. A
+    negative FeedIncoming is a terminal condition, and for the flood family the
+    library sends NOTHING — it simply returns the error (nghttp2_session.c, the
+    max_continuations cap). Without this the peer gets a bare TCP close and
+    never learns the abort reason. This is NOT the graceful-drain GOAWAY of
+    SendFarewell (gated on IsDraining); it is the per-connection abort of a
+    misbehaving peer, which must fire whether or not the server is shutting down.
+
+    NOMEM is the one code we must not act on: submitting a GOAWAY allocates, and
+    we have just been told allocation failed. Close bare. }
+  case AFeedRc of
+    NGHTTP2_ERR_FLOODED,
+    NGHTTP2_ERR_TOO_MANY_CONTINUATIONS:
+      LCode := NGHTTP2_ENHANCE_YOUR_CALM;
+    NGHTTP2_ERR_NOMEM:
+      Exit;
+  else
+    LCode := NGHTTP2_PROTOCOL_ERROR;
+  end;
+
+  { terminate_session enqueues GOAWAY(last good stream id, LCode) and sets the
+    session to ignore further input. It has no fatal-state guard, so it is
+    callable after a flood error — the path by which a server still gets to
+    announce ENHANCE_YOUR_CALM. }
+  FSession.Terminate(LCode);
+
+  { Flush best effort. The blocking thread-per-connection driver sends the
+    GOAWAY in full before the teardown closes the socket. The non-blocking
+    engine holds any remainder in FOutPending and relies on the
+    CONNECTION_LINGER_MS close in the teardown to let it drain. }
+  if FNonBlocking then
+  begin
+    WritePhaseNB;
+    Exit;
+  end;
+
+  while FSession.WantWrite do
+  begin
+    LSendLen := FSession.ExtractOutgoing(LSendPtr);
+    if LSendLen <= 0 then Break;
+    if not DoSendAll(LSendPtr, LSendLen) then Break;
   end;
 end;
 
