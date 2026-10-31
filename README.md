@@ -2,7 +2,9 @@
 
 **Server + client bindings for [libnghttp2](https://nghttp2.org/) in Object Pascal (Delphi + FPC).**
 
-![Delphi-nghttp2](assets/logos/delphi-nghttp2-logo-480x270.png)
+<p align="center">
+  <img src="assets/card/delphi-nghttp2-card.png" alt="Delphi-nghttp2 &mdash; HTTP/2 &amp; gRPC for Delphi and Free Pascal" width="860">
+</p>
 
 [![Delphi](https://img.shields.io/badge/Delphi-10.4%20Sydney+-E62027?style=flat-square&logo=delphi&logoColor=white)](#requirements)
 [![Free Pascal](https://img.shields.io/badge/Free%20Pascal-3.2.2%20%7C%20trunk%203.3.1-0066CC?style=flat-square)](#requirements)
